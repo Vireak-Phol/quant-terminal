@@ -29,6 +29,14 @@ import {
   TimeframeInterval,
 } from "../../lib/klines";
 import { price } from "../../lib/format";
+import {
+  DEFAULT_V74_LAYERS,
+  V74_LAYER_LABELS,
+  drawV74Layers,
+  type V74LayerKey,
+  type V74Layers,
+} from "./v74ChartLayers";
+import type { ChartTf } from "../../types/v74";
 
 export const INTERVAL_SEC_MAP: Record<TimeframeInterval, number> = {
   "1m": 60,
@@ -248,6 +256,10 @@ export interface TradingViewDeepChartProps {
   onToggleWalls?: () => void;
   onToggleZones?: () => void;
   showHeader?: boolean;
+  /** v7.4 engine timeframe whose signals/structure are drawn. */
+  signalTf?: ChartTf;
+  v74Layers?: V74Layers;
+  onToggleV74Layer?: (key: V74LayerKey) => void;
 }
 
 interface InspectedItem {
@@ -269,6 +281,9 @@ export function TradingViewDeepChart({
   onToggleWalls,
   onToggleZones,
   showHeader = false,
+  signalTf = "5m",
+  v74Layers = DEFAULT_V74_LAYERS,
+  onToggleV74Layer,
 }: TradingViewDeepChartProps) {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -312,6 +327,11 @@ export function TradingViewDeepChart({
 
   const showWallsRef = useRef(showWalls);
   showWallsRef.current = showWalls;
+
+  const v74LayersRef = useRef(v74Layers);
+  v74LayersRef.current = v74Layers;
+  const signalTfRef = useRef<ChartTf>(signalTf);
+  signalTfRef.current = signalTf;
 
   const requestRedrawRef = useRef<() => void>(() => {});
   const isInteractingRef = useRef<boolean>(false);
@@ -801,41 +821,26 @@ export function TradingViewDeepChart({
       priceLinesRef.current.push(markLine);
     }
 
-    // Active v7.4 Institutional Signals
-    if (liveBook.v7_signal) {
-      const sig = liveBook.v7_signal;
-      const entryLine = series.createPriceLine({
-        price: sig.entry_price,
-        color: "#fbbf24",
-        lineWidth: 2,
-        lineStyle: LineStyle.Solid,
-        axisLabelVisible: true,
-        title: sig.tier === "TIER_1_A_PLUS" ? "★ A+ ENTRY" : "★ ENTRY",
-      });
-      priceLinesRef.current.push(entryLine);
-
-      const slLine = series.createPriceLine({
-        price: sig.stop_loss,
-        color: "#ef4444",
-        lineWidth: 2,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: "✕ SL",
-      });
-      priceLinesRef.current.push(slLine);
-
-      const tpLine = series.createPriceLine({
-        price: sig.tp1,
-        color: "#10b981",
-        lineWidth: 2,
-        lineStyle: LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: `🎯 TP1 (${sig.risk_reward}R)`,
-      });
-      priceLinesRef.current.push(tpLine);
+    // Active v7.4 trade levels: axis badges only (box + labelled lines drawn by the Trade layer)
+    const v74Active = liveBook.v74?.frames?.[signalTfRef.current]?.active_signal;
+    if (v74LayersRef.current.tradeBox && v74Active && v74Active.status === "open") {
+      const p = v74Active.plan;
+      const mk = (px: number, color: string, title: string) =>
+        series.createPriceLine({
+          price: px,
+          color,
+          lineWidth: 1,
+          lineStyle: LineStyle.Solid,
+          lineVisible: false,
+          axisLabelVisible: true,
+          title,
+        });
+      priceLinesRef.current.push(mk(p.entry, "#fbbf24", "ENTRY"));
+      priceLinesRef.current.push(mk(p.stop, "#ef4444", "SL"));
+      priceLinesRef.current.push(mk(p.tp1, "#10b981", "TP1"));
     }
     requestRedrawRef.current();
-  }, [liveBook]);
+  }, [liveBook, v74Layers, signalTf]);
 
   // 5. Canvas Microstructure Overlays: High-Performance Event-Driven Render Pipeline
   const renderOverlays = useCallback((): boolean => {
@@ -867,6 +872,23 @@ export function TradingViewDeepChart({
     const showZones = showZonesRef.current;
     const showBubbles = showBubblesRef.current;
     const intervalVal = intervalRef.current;
+
+    // --- v7.4 ENGINE LAYERS (drawn first so microstructure bubbles stay on top) ---
+    const v74Frame = liveBook.v74?.frames?.[signalTfRef.current];
+    if (v74Frame) {
+      const xSec = INTERVAL_SEC_MAP[intervalVal] || 300;
+      drawV74Layers(
+        ctx,
+        chart,
+        series,
+        (t: number) => getTimestampXCoordinate(t, chart, candleDataRef.current, xSec),
+        width,
+        height,
+        v74Frame,
+        v74LayersRef.current,
+        liveBook.mid_price,
+      );
+    }
 
     // --- FEATURE A: RESTING LIQUIDITY ZONES (INSTITUTIONAL HEAT DEPTH PROFILE) ---
     if (
@@ -1399,7 +1421,7 @@ export function TradingViewDeepChart({
   // Synchronize on real-time data or toggle state changes
   useEffect(() => {
     requestRedraw();
-  }, [liveBook, showZones, showBubbles, showWalls, interval, requestRedraw]);
+  }, [liveBook, showZones, showBubbles, showWalls, interval, v74Layers, signalTf, requestRedraw]);
 
   const displayCandle = hoverCandle || latestCandle;
   const candleDiff = displayCandle
@@ -1563,6 +1585,31 @@ export function TradingViewDeepChart({
           ref={overlayCanvasRef}
           className="absolute inset-0 pointer-events-none z-10"
         />
+
+        {/* v7.4 layer toggles */}
+        {onToggleV74Layer && (
+          <div
+            className="absolute top-2 left-2 z-20 flex flex-wrap items-center gap-0.5 rounded border border-terminal-border/70 bg-[#090d16]/85 p-0.5 font-mono text-[10px]"
+            role="group"
+            aria-label={`v7.4 chart layers (${signalTf})`}
+          >
+            <span className="px-1 text-terminal-text-dim">v7.4 {signalTf}</span>
+            {(Object.keys(V74_LAYER_LABELS) as V74LayerKey[]).map((k) => (
+              <button
+                key={k}
+                onClick={() => onToggleV74Layer(k)}
+                aria-pressed={v74Layers[k]}
+                className={`px-1.5 py-0.5 rounded font-bold transition-colors ${
+                  v74Layers[k]
+                    ? "bg-terminal-gold/20 text-terminal-gold"
+                    : "text-terminal-text-dim hover:text-terminal-text"
+                }`}
+              >
+                {V74_LAYER_LABELS[k]}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Inspection Tooltip Popup */}
         {inspectedItem && (

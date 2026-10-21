@@ -170,6 +170,7 @@ export class SharedSocket {
   private listeners = new Set<() => void>()
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private closedByUs = false
+  private replyListeners = new Set<(msg: { type: string } & Record<string, unknown>) => void>()
   snapshot: Snapshot = { data: null, connectionState: 'connecting', latencyMs: 0 }
 
   constructor(private url: string, private reconnectMs = 2000) {}
@@ -184,6 +185,14 @@ export class SharedSocket {
   }
 
   getSnapshot = (): Snapshot => this.snapshot
+
+  /** Command replies (`ledger`, `risk_config`, `recorder_status`, …) — not book frames. */
+  onReply(fn: (msg: { type: string } & Record<string, unknown>) => void): () => void {
+    this.replyListeners.add(fn)
+    return () => {
+      this.replyListeners.delete(fn)
+    }
+  }
 
   send(action: string, payload: Record<string, unknown> = {}): boolean {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -213,8 +222,12 @@ export class SharedSocket {
     ws.onmessage = (event: MessageEvent) => {
       try {
         const parsed = JSON.parse(event.data as string)
-        // Only full bookmap frames replace state; command replies are ignored here.
-        if (!parsed || (parsed.type && parsed.type !== 'bookmap_update')) return
+        if (!parsed) return
+        // Command replies go to reply listeners; only full bookmap frames replace state.
+        if (parsed.type && parsed.type !== 'bookmap_update') {
+          this.replyListeners.forEach((l) => l(parsed))
+          return
+        }
         const latencyMs = parsed.timestamp ? Math.max(0, Date.now() - parsed.timestamp) : this.snapshot.latencyMs
         this.emit({ data: parsed as LiveOrderBookData, latencyMs })
       } catch (e) {
@@ -285,5 +298,6 @@ export function useLiveOrderBook(url = DEFAULT_BRIDGE_URL) {
     connectionState: snap.connectionState,
     latencyMs: snap.latencyMs,
     sendCommand,
+    socket,
   }
 }

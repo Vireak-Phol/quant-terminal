@@ -10,6 +10,15 @@ import { V7SignalPanel } from "./components/Dashboard/V7SignalPanel";
 import { DiagnosticsPanel } from "./components/Dashboard/DiagnosticsPanel";
 import { ToastContainer, ToastMessage } from "./components/Shared/Toast";
 import { ErrorBoundary } from "./components/Shared/ErrorBoundary";
+import { newAplusSignals, playChime } from "./lib/alerts";
+import { probabilityView, setupLabel } from "./lib/v74";
+import type { ChartTf } from "./types/v74";
+import {
+  loadLayers,
+  saveLayers,
+  type V74LayerKey,
+  type V74Layers,
+} from "./components/Dashboard/v74ChartLayers";
 
 export default function App() {
   const { prefs, cycleTheme } = usePrefs();
@@ -25,14 +34,27 @@ export default function App() {
   const [showZones, setShowZones] = useState<boolean>(true);
   const [showWalls, setShowWalls] = useState<boolean>(true);
   const [showDomLadder, setShowDomLadder] = useState<boolean>(false);
-  const [showSignals, setShowSignals] = useState<boolean>(false);
+  const [showSignals, setShowSignals] = useState<boolean>(true);
+  const [signalTf, setSignalTf] = useState<ChartTf>("5m");
+  const [v74Layers, setV74Layers] = useState<V74Layers>(loadLayers);
+  const toggleV74Layer = useCallback((k: V74LayerKey) => {
+    setV74Layers((prev) => {
+      const next = { ...prev, [k]: !prev[k] };
+      saveLayers(next);
+      return next;
+    });
+  }, []);
+  const [soundOn, setSoundOn] = useState<boolean>(
+    () => localStorage.getItem("terminal.alertSound") !== "off",
+  );
   const [showDiagnostics, setShowDiagnostics] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
   // Real-time price uptick/downtick pulse
   const [priceFlash, setPriceFlash] = useState<"up" | "down" | null>(null);
   const prevPriceRef = useRef<number>(0);
-  const lastSignalIdRef = useRef<string | null>(null);
+  const seenSignalIds = useRef<Set<string>>(new Set());
+  const firstV74Ref = useRef<boolean>(true);
 
   useEffect(() => {
     if (!liveBook || liveBook.mid_price === 0) return;
@@ -85,24 +107,29 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  // Auto-alert toast when a new Tier-1 A+ setup triggers (minimum 60s cooldown)
-  const lastToastTimeRef = useRef<number>(0);
   useEffect(() => {
-    const sig = liveBook?.v7_signal;
-    if (!sig || sig.tier !== "TIER_1_A_PLUS") return;
-    const now = Date.now();
-    if (
-      sig.id !== lastSignalIdRef.current &&
-      now - lastToastTimeRef.current > 60000
-    ) {
-      lastSignalIdRef.current = sig.id;
-      lastToastTimeRef.current = now;
+    localStorage.setItem("terminal.alertSound", soundOn ? "on" : "off");
+  }, [soundOn]);
+
+  // Toast (+ optional chime) for each new live A+ signal from the v7.4 engine.
+  useEffect(() => {
+    const frame = liveBook?.v74;
+    if (!frame) return;
+    const fresh = newAplusSignals(frame, seenSignalIds.current, firstV74Ref.current);
+    firstV74Ref.current = false;
+    for (const sig of fresh) {
+      const pv = probabilityView(sig.probability);
+      const prob =
+        pv.kind === "measured"
+          ? `win ${pv.headline} (n=${pv.n}, E ${pv.expectancy! >= 0 ? "+" : ""}${pv.expectancy!.toFixed(2)}R)`
+          : "win rate warm-up";
       addToast(
-        `${sig.tier_label}: Entry $${sig.entry_price.toFixed(2)}, SL $${sig.stop_loss.toFixed(2)} (${sig.win_probability}% Win Prob)`,
+        `A+ ${sig.direction} ${sig.tf} · ${setupLabel(sig.setup)} · entry ${price(sig.plan.entry)} SL ${price(sig.plan.stop)} TP1 ${price(sig.plan.tp1)} · ${prob}`,
         sig.direction === "LONG" ? "bull" : "bear",
       );
+      if (soundOn) playChime(sig.direction);
     }
-  }, [liveBook?.v7_signal, addToast]);
+  }, [liveBook?.v74, addToast, soundOn]);
 
   return (
     <div className="h-screen flex flex-col bg-terminal-bg text-terminal-text overflow-hidden font-sans select-none">
@@ -286,6 +313,19 @@ export default function App() {
               <span>★ SIGNALS</span>
             </button>
             <button
+              onClick={() => setSoundOn(!soundOn)}
+              aria-pressed={soundOn}
+              className={`px-2 py-0.5 rounded font-bold transition-all ${
+                soundOn
+                  ? "text-terminal-gold"
+                  : "text-terminal-text-dim hover:text-terminal-text"
+              }`}
+              title={soundOn ? "Mute A+ alert sound" : "Unmute A+ alert sound"}
+              aria-label={soundOn ? "Mute alert sound" : "Unmute alert sound"}
+            >
+              {soundOn ? "🔔" : "🔕"}
+            </button>
+            <button
               onClick={() => setShowDomLadder(!showDomLadder)}
               className={`px-2 py-0.5 rounded font-bold transition-all ${
                 showDomLadder
@@ -363,6 +403,9 @@ export default function App() {
                 showWalls={showWalls}
                 onToggleWalls={() => setShowWalls(!showWalls)}
                 showHeader={false}
+                signalTf={signalTf}
+                v74Layers={v74Layers}
+                onToggleV74Layer={toggleV74Layer}
               />
             )}
 
@@ -381,6 +424,9 @@ export default function App() {
                     showWalls={showWalls}
                     onToggleWalls={() => setShowWalls(!showWalls)}
                     showHeader={false}
+                    signalTf={signalTf}
+                    v74Layers={v74Layers}
+                    onToggleV74Layer={toggleV74Layer}
                   />
                 </div>
                 <div className="w-5/12 h-full min-h-0">
@@ -394,10 +440,9 @@ export default function App() {
           {showSignals && (
             <aside className="w-80 lg:w-96 h-full min-h-0 border-l border-terminal-border bg-terminal-surface/95 shrink-0 z-20 shadow-2xl flex flex-col">
               <V7SignalPanel
-                signal={liveBook?.v7_signal}
-                hopla={liveBook?.hopla}
-                activeFvgs={liveBook?.active_fvgs}
-                midPrice={liveBook?.mid_price}
+                v74={liveBook?.v74}
+                tf={signalTf}
+                onTfChange={setSignalTf}
                 onClose={() => setShowSignals(false)}
               />
             </aside>
