@@ -13,6 +13,8 @@ Capabilities:
 """
 
 import asyncio
+import faulthandler
+import signal
 from collections import deque
 from decimal import Decimal
 import json
@@ -44,6 +46,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 )
 logger = logging.getLogger("TerminalBridge")
+# `kill -USR1 <pid>` dumps all thread stacks to stderr (diagnose stalls without stopping the bridge).
+if hasattr(signal, "SIGUSR1"):
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 SYMBOL = "XAUUSDT"
@@ -331,6 +336,9 @@ async def ws_server_handler(ws):
     logger.info(f"Terminal connected. Active clients: {len(CLIENTS)}")
     try:
         if terminal_state["mid_price"] > 0:
+            # broadcast() skips work while no client is connected, so refresh the
+            # engine frame here or a new client would receive a stale one.
+            refresh_v74_frame()
             await ws.send(json.dumps(terminal_state))
 
         async for raw_msg in ws:

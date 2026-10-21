@@ -104,6 +104,7 @@ class LiveHub:
                     continue
                 intr = [self.one_min[t] for t in range(k.t, k.t + secs, 60) if t in self.one_min]
                 sigs = eng.on_bar(k, intr or None, orderflow=snap, record=True)
+                log.info("closed bar %s %s c=%.2f signals=%d", tf, time.strftime('%H:%M', time.gmtime(k.t)), k.c, len(sigs))
                 for s in sigs:
                     emitted.append(s)
                     if self.on_signal:
@@ -128,7 +129,8 @@ class LiveHub:
                 now = int(time.time())
                 boundary = now - (now % 60)
                 if boundary > last_boundary and now - boundary >= 2:
-                    await loop.run_in_executor(None, self.step)
+                    log.debug("live step @%s", boundary)
+                    await asyncio.wait_for(loop.run_in_executor(None, self.step), timeout=45)
                     last_boundary = boundary
                     self.status, self.error = "live", None
             except asyncio.CancelledError:
