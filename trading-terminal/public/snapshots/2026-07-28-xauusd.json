@@ -1,0 +1,84 @@
+{
+  "date": "2026-07-28",
+  "market": "FOREX",
+  "symbol": "XAUUSD",
+  "meta": {
+    "as_of": "2026-07-28T14:30:00Z",
+    "source": "TradingView Desktop (CDP)",
+    "generator": "OSC-VIP V6.1",
+    "last_price": 3998.20
+  },
+  "v6": {
+    "long_win_prob": 64.0,
+    "short_win_prob": 45.0,
+    "bar_confirmed": true,
+    "killzone": "ny_am",
+    "shock_guard": false,
+    "vol_z": 0.85,
+    "atr": 13.80,
+    "er_val": 0.48,
+    "smpi": 1.10,
+    "htf_trend": "bull"
+  },
+  "big_money_analysis": {
+    "institutional_flow": {
+      "accumulation_score": 64,
+      "distribution_score": 36,
+      "net_institutional_flow": "positive",
+      "large_blocks": [
+        { "time": "09:00", "size": 2200, "side": "buy", "significance": "medium" }
+      ]
+    },
+    "order_flow_imbalance": {
+      "bid_ask_ratio": 1.18,
+      "delta_volume": 1450,
+      "cumulative_delta": "rising",
+      "imbalance_score": 64
+    },
+    "liquidity_clusters": [
+      { "price": 4015.00, "type": "resistance", "strength": "strong", "volume_nodes": 9800 },
+      { "price": 3990.00, "type": "support", "strength": "strong", "volume_nodes": 12400 }
+    ],
+    "professional_positioning": {
+      "put_call_ratio": 0.84,
+      "max_pain": 4000.00,
+      "gamma_exposure": 1100000000,
+      "dealer_positioning": "long_gamma"
+    },
+    "smart_money_concepts": {
+      "market_structure": "bullish",
+      "fair_value_gaps": [
+        { "price_low": 3992.00, "price_high": 3996.00, "status": "unfilled" }
+      ],
+      "order_blocks": [
+        { "price": 3988.00, "type": "bullish", "strength": "strong" }
+      ],
+      "liquidity_sweeps": [
+        { "time": "09:15", "price": 3985.00, "type": "sell_side", "result": "reversal_up" }
+      ]
+    },
+    "session_bias": {
+      "overall_bias": "bullish",
+      "confidence": 64,
+      "key_levels": {
+        "resistance_r1": 4015.00,
+        "resistance_r2": 4030.00,
+        "support_s1": 3990.00,
+        "support_s2": 3975.00
+      },
+      "narrative": "Moderate institutional buying."
+    }
+  },
+  "technical_confluence": {
+    "trend": { "short_term": "bullish", "medium_term": "bullish", "long_term": "bullish" },
+    "momentum": { "rsi": 58.4, "macd": "bullish_cross", "stochastic": 68.0 },
+    "volume_analysis": { "volume_trend": "increasing", "vwap_position": "above", "volume_profile": "Standard distribution" },
+    "support_resistance": { "nearest_support": 3990.00, "nearest_resistance": 4015.00 }
+  },
+  "risk_assessment": {
+    "overall_risk": "moderate",
+    "volatility_regime": "normal",
+    "key_risks": ["Key resistance overhead"],
+    "position_sizing": "standard"
+  }
+}

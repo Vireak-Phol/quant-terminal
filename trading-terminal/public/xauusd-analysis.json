@@ -1,0 +1,90 @@
+{
+  "date": "2026-07-29",
+  "market": "FOREX",
+  "symbol": "XAUUSD",
+  "big_money_analysis": {
+    "institutional_flow": {
+      "accumulation_score": 45,
+      "distribution_score": 55,
+      "net_institutional_flow": "negative",
+      "large_blocks": [
+        { "time": "07:15", "size": 2500, "side": "sell", "significance": "high" },
+        { "time": "08:30", "size": 1800, "side": "sell", "significance": "medium" },
+        { "time": "09:45", "size": 3200, "side": "buy", "significance": "high" },
+        { "time": "11:00", "size": 1500, "side": "sell", "significance": "medium" },
+        { "time": "12:30", "size": 1200, "side": "buy", "significance": "low" },
+        { "time": "14:00", "size": 2100, "side": "sell", "significance": "medium" }
+      ]
+    },
+    "order_flow_imbalance": {
+      "bid_ask_ratio": 0.88,
+      "delta_volume": -1809,
+      "cumulative_delta": "rising",
+      "imbalance_score": 42
+    },
+    "liquidity_clusters": [
+      { "price": 4047.20, "type": "resistance", "strength": "strong", "volume_nodes": 9200 },
+      { "price": 4055.21, "type": "resistance", "strength": "moderate", "volume_nodes": 7800 },
+      { "price": 4081.42, "type": "resistance", "strength": "strong", "volume_nodes": 6500 },
+      { "price": 4027.78, "type": "support", "strength": "moderate", "volume_nodes": 8500 },
+      { "price": 4020.66, "type": "support", "strength": "strong", "volume_nodes": 11000 },
+      { "price": 4011.77, "type": "support", "strength": "strong", "volume_nodes": 9500 },
+      { "price": 4006.25, "type": "support", "strength": "moderate", "volume_nodes": 7200 }
+    ],
+    "professional_positioning": {
+      "put_call_ratio": 0.92,
+      "max_pain": 4035.00,
+      "gamma_exposure": 890000000,
+      "dealer_positioning": "short_gamma"
+    },
+    "smart_money_concepts": {
+      "market_structure": "bearish",
+      "fair_value_gaps": [
+        { "price_low": 4036.14, "price_high": 4038.22, "status": "unfilled" },
+        { "price_low": 4021.10, "price_high": 4023.03, "status": "filled" },
+        { "price_low": 4007.83, "price_high": 4009.52, "status": "unfilled" }
+      ],
+      "order_blocks": [
+        { "price": 4025.09, "type": "bullish", "strength": "strong" },
+        { "price": 4022.08, "type": "bullish", "strength": "strong" },
+        { "price": 4047.20, "type": "bearish", "strength": "moderate" }
+      ],
+      "liquidity_sweeps": [
+        { "time": "09:30", "price": 4030.56, "type": "buy_side", "result": "CHoCH_confirmed" },
+        { "time": "10:45", "price": 4021.72, "type": "buy_side", "result": "CHoCH_confirmed" },
+        { "time": "13:15", "price": 4047.88, "type": "sell_side", "result": "rejection_down" }
+      ]
+    },
+    "session_bias": {
+      "overall_bias": "bearish",
+      "confidence": 58,
+      "key_levels": {
+        "resistance_r1": 4047.20,
+        "resistance_r2": 4055.21,
+        "support_s1": 4027.78,
+        "support_s2": 4020.66
+      },
+      "narrative": "XAUUSD trading near Bear Zone at 4047.20 with CVD turning bearish (CVD↘) and negative bar delta (-1809). Price rejected at 4047.88 and pulling back. Despite positive cumulative delta (28,367), short-term order flow favors sellers. OSC VIP shows no active long/short signals — neutral stance. Key support cluster at 4020-4027 (VWAP + Bull OB zone). Watch for sweep of 4020.66 liquidity before potential reversal. Bearish bias below 4047 with downside targets toward 4020-4027 zone."
+    }
+  },
+  "technical_confluence": {
+    "trend": { "short_term": "bearish", "medium_term": "ranging", "long_term": "bullish" },
+    "momentum": { "rsi": 48, "macd": "bearish_cross", "stochastic": 35 },
+    "volume_analysis": {
+      "volume_trend": "flat",
+      "vwap_position": "above",
+      "volume_profile": "poc_at_4035"
+    },
+    "support_resistance": { "nearest_support": 4027.78, "nearest_resistance": 4047.20 }
+  },
+  "risk_assessment": {
+    "overall_risk": "moderate",
+    "volatility_regime": "normal",
+    "key_risks": [
+      "Gold daily range $44.8 — normal volatility",
+      "Price at Bear Zone 4047 resistance",
+      "OSC VIP with no active signals — indecision"
+    ],
+    "position_sizing": "reduced"
+  }
+}

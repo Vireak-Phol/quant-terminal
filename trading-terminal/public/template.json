@@ -1,0 +1,174 @@
+{
+  "_README": "Trading Terminal V2 Daily Analysis Snapshot Template. All top-level v2 fields (meta, v6, watchlist, micro, positioning_detail, calendar) are optional.",
+  "date": "2026-07-29",
+  "market": "FOREX",
+  "symbol": "XAUUSD",
+  "meta": {
+    "as_of": "2026-07-29T14:30:00Z",
+    "source": "TradingView Desktop (CDP)",
+    "generator": "OSC-VIP V6.1 / REG-V6",
+    "revision": 1,
+    "timeframe": "15m",
+    "last_price": 4032.50
+  },
+  "v6": {
+    "long_win_prob": 71.5,
+    "short_win_prob": 42.0,
+    "bar_confirmed": true,
+    "killzone": "ny_am",
+    "shock_guard": false,
+    "vol_z": 1.25,
+    "atr": 14.50,
+    "er_val": 0.52,
+    "smpi": 1.85,
+    "htf_trend": "bull",
+    "vwap_z": 0.85,
+    "reg_v6": {
+      "unicorn": true,
+      "reg_ob": true,
+      "rpd": false,
+      "sweep": true
+    }
+  },
+  "big_money_analysis": {
+    "institutional_flow": {
+      "accumulation_score": 68,
+      "distribution_score": 32,
+      "net_institutional_flow": "positive",
+      "large_blocks": [
+        {
+          "time": "09:30",
+          "size": 2500,
+          "side": "buy",
+          "significance": "high"
+        }
+      ]
+    },
+    "order_flow_imbalance": {
+      "bid_ask_ratio": 1.35,
+      "delta_volume": 3450,
+      "cumulative_delta": "rising",
+      "imbalance_score": 68
+    },
+    "liquidity_clusters": [
+      {
+        "price": 4055.00,
+        "type": "resistance",
+        "strength": "strong",
+        "volume_nodes": 12500
+      },
+      {
+        "price": 4020.00,
+        "type": "support",
+        "strength": "strong",
+        "volume_nodes": 11200
+      }
+    ],
+    "professional_positioning": {
+      "put_call_ratio": 0.78,
+      "max_pain": 4030.00,
+      "gamma_exposure": 1420000000,
+      "dealer_positioning": "long_gamma"
+    },
+    "smart_money_concepts": {
+      "market_structure": "bullish",
+      "fair_value_gaps": [
+        {
+          "price_low": 4022.00,
+          "price_high": 4026.50,
+          "status": "unfilled"
+        }
+      ],
+      "order_blocks": [
+        {
+          "price": 4025.00,
+          "type": "bullish",
+          "strength": "strong"
+        }
+      ],
+      "liquidity_sweeps": [
+        {
+          "time": "08:45",
+          "price": 4019.50,
+          "type": "sell_side",
+          "result": "reversal_up"
+        }
+      ]
+    },
+    "session_bias": {
+      "overall_bias": "bullish",
+      "confidence": 72,
+      "key_levels": {
+        "resistance_r1": 4045.00,
+        "resistance_r2": 4060.00,
+        "support_s1": 4020.00,
+        "support_s2": 4005.00
+      },
+      "narrative": "Institutional accumulation in NY AM session."
+    }
+  },
+  "technical_confluence": {
+    "trend": {
+      "short_term": "bullish",
+      "medium_term": "bullish",
+      "long_term": "bullish"
+    },
+    "momentum": {
+      "rsi": 64.2,
+      "macd": "bullish_cross",
+      "stochastic": 78.5
+    },
+    "volume_analysis": {
+      "volume_trend": "increasing",
+      "vwap_position": "above",
+      "volume_profile": "High volume node building at 4032.50."
+    },
+    "support_resistance": {
+      "nearest_support": 4020.00,
+      "nearest_resistance": 4045.00
+    }
+  },
+  "risk_assessment": {
+    "overall_risk": "low",
+    "volatility_regime": "normal",
+    "key_risks": [
+      "FOMC rate decision scheduled in 2 days"
+    ],
+    "position_sizing": "standard"
+  },
+  "micro": {
+    "cvd_series": [
+      { "t": "09:30", "cvd": 850, "delta": 850, "price": 4026.80 }
+    ],
+    "dom": [
+      { "price": 4033.00, "bid_size": 35, "ask_size": 15 }
+    ]
+  },
+  "positioning_detail": {
+    "gex_by_strike": [
+      { "strike": 4030, "gex": 680000000 }
+    ],
+    "zero_gamma": 4048.00
+  },
+  "watchlist": [
+    {
+      "symbol": "XAUUSD",
+      "market": "FOREX",
+      "bias": "bullish",
+      "confidence": 72,
+      "imbalance": 68,
+      "change_pct": 0.85,
+      "last": 4032.50,
+      "v6": { "long_win_prob": 71.5, "short_win_prob": 42.0 },
+      "history": [52, 58, 64, 72]
+    }
+  ],
+  "calendar": [
+    {
+      "time": "14:30",
+      "event": "US Core CPI (MoM)",
+      "impact": "high",
+      "currency": "USD"
+    }
+  ]
+}

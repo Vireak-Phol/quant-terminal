@@ -1,0 +1,1911 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════════════════
+// OSC-VIP v7.4 INSTITUTIONAL — Single-Slot Model-Score & Microstructure Engine
+// ════════════════════════════════════════════════════════════════════════════════════════
+// Merges Overlay Structural Price Action (SMC CHoCH, Liquidity, FVG)
+// with Sub-pane Microstructure Math & Oscillator Visuals (VWAP Z, SMPI Pressure, Cornish-Fisher Z,
+// Kaufman ER, Shock Guard, SNR, N_eff, Signal Ledger, Model-Score HUD).
+//
+// Features a manually weighted evidence model that produces a heuristic score
+// from 0-100%, arbitrating conflicting signals into:
+//  - Tier 1: A+ Harmonized Execution (Bright Label + ATR SL/TP, Model Score >= 65%)
+//  - Tier 2: Structural Only (Configurable Shapes/Labels, Model Score 50-65%)
+//  - Tier 3: Trap Risk / Friction Warning (Dimmed Gray "⚠️ TRAP", Model Score < 50%)
+//
+// New in v7.4:
+//  - Dedicated Structure Long / Short toggles, styling, and alert conditions.
+//  - LuxAlgo-style Volume Delta Candles rendered on Solid Conviction bars with normal candle fallback.
+// ════════════════════════════════════════════════════════════════════════════════════════
+indicator("OSC-VIP v7.4 Institutional", shorttitle="OSC-VIP-v7.4", overlay=false, 
+     max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=2000, precision=4)
+
+// ════════════════════════════════════════════════════════════════
+// 1. MASTER CONTROLS & BAYESIAN ENGINE INPUTS
+// ════════════════════════════════════════════════════════════════
+grp_master = "🎛️ Master Controls & Repaint Protection"
+bool confirmedOnly       = input.bool(true, "🔒 Confirmed-Only Signals", group=grp_master, tooltip="When enabled, structural events, persistent setup state, drawings, and alerts are committed only after the chart bar closes. Continuous oscillator values may still develop intrabar.")
+bool barConfirmed        = confirmedOnly ? barstate.isconfirmed : true
+
+bool enableFVG           = input.bool(true, "Enable FVG Engine", group=grp_master, tooltip="Calculates Fair Value Gaps for signal probability scoring and box drawing.")
+bool enableSMC           = input.bool(true, "Enable SMC (Order Blocks & CHoCH)", group=grp_master, tooltip="Calculates Order Blocks and CHoCH for signal probability scoring.")
+bool enableLiquidity     = input.bool(true, "Enable Liquidity Zones", group=grp_master)
+bool enableBarColoring   = input.bool(true, "Enable Bar Coloring / Conviction Candles", group=grp_master, tooltip="Enables conviction candle styling or footprint opacity coloring.")
+string barColorMode      = input.string("Solid Conviction (Volume Delta)", "Bar Color Mode", options=["Solid Conviction (Volume Delta)", "Smart Money Opacity Fade", "Solid Conviction (Classic)", "Disabled"], group=grp_master, tooltip="Solid Conviction (Volume Delta): Renders LuxAlgo-style Volume Delta candles on high-conviction bars while keeping normal candles otherwise.")
+float barColorMinProb    = input.float(45.0, "Opacity Fade: Min Win Prob to Colour", minval=0.0, maxval=100.0, step=1.0, group=grp_master, tooltip="Bars below this modelled win probability are left uncoloured in Opacity Fade mode.")
+string masterTheme       = input.string("Institutional", "Master Theme", options=["Institutional", "Modern Mint", "Deep Sea", "Monochrome", "Neon Cyber"], group=grp_master)
+
+grp_shock = "⚡ Shock & Macro Trend Protection"
+bool  useShockGuard      = input.bool(true,  "Enable Macro Shock Guard", group=grp_shock, tooltip="Mutes signals during extreme ATR volatility spikes (e.g. CPI news, FOMC candles).")
+float shockAtrMult       = input.float(3.0,  "Shock ATR Multiplier", step=0.1, group=grp_shock)
+int   shockCooldown      = input.int(15,     "Shock Cooldown (Bars)", group=grp_shock)
+bool  useHtfTrendFilter  = input.bool(true,  "Enable HTF Trend Guard (4H 200 EMA)", group=grp_shock, tooltip="Weights signals according to 4H 200 EMA macro trend direction.")
+bool  showShockBg        = input.bool(true,  "Show Shock Guard Visual Shading", group=grp_shock)
+
+grp_indep = "⚖️ Signal Independence & Equicorrelation"
+bool  showIndep          = input.bool(true,  "Enable Equicorrelation N_eff Readout", group=grp_indep, tooltip="Exposes manufactured confluence by calculating effective independent votes (N_eff) from driver correlation.")
+int   corrWindow         = input.int(100,    "Driver Correlation Window", minval=20, maxval=250, group=grp_indep, tooltip="Bars used to estimate driver pairwise correlation (capped at 250 for history safety).")
+
+grp_bayes = "🧠 Heuristic Scoring & Conflict Engine"
+bool  enableBayesEngine  = input.bool(true, "Enable Log-Odds Model Score", group=grp_bayes, tooltip="Combines manually weighted evidence in log-odds space. This is a heuristic model score, not a statistically calibrated win probability.")
+float baseWinRatePrior   = input.float(0.50, "Base Model-Score Prior", minval=0.30, maxval=0.70, step=0.05, group=grp_bayes)
+float minAplusWinProb    = input.float(65.0, "Min Model Score for A+ Signal", minval=50.0, maxval=85.0, step=2.5, group=grp_bayes)
+float aPlusOffsetATR     = input.float(0.8, "A+ Signal Label Offset (x ATR)", minval=0.5, maxval=5.0, step=0.1, group=grp_bayes, tooltip="Distance of A+ signal shape & label away from candle wick (in ATR multiples). Set to 1.5 - 2.5 to avoid overlapping with REG-v7-1 bubbles.")
+int   signalCooldown     = input.int(3, "Signal Cooldown (Bars)", minval=1, maxval=20, group=grp_bayes, tooltip="Minimum bars required between consecutive signals to prevent signal cluster noise.")
+string signalDisplayMode = input.string("Panel (Triangles)", "A+ Signal Display Mode", options=["Panel (Triangles)", "Main Chart (Labels)", "Both", "Disabled"], group=grp_bayes, tooltip="Panel (Triangles): Renders sleek triangle markers inside the oscillator sub-pane. Main Chart (Labels): Renders A+ labels on price candles.")
+string structDisplayMode = input.string("Panel (Diamonds)", "Tier-2 Structural Display Mode", options=["Panel (Diamonds)", "Main Chart (Diamonds)", "Both", "Disabled"], group=grp_bayes, tooltip="Panel (Diamonds): Renders subtle diamond markers in the oscillator sub-pane for Tier-2 (50-65%) setups.")
+
+bool  showBayesHud       = input.bool(true, "Show Bayesian HUD Dashboard", group=grp_bayes)
+string hudPosition       = input.string("Top Right", "HUD Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_bayes)
+string hudMode           = input.string("Normal", "HUD Detail Level", options=["Small", "Normal", "Large"], group=grp_bayes, tooltip="Small: Buy & Sell model scores | Normal: High-score setup & core info | Large: Full current table")
+string hudSize           = input.string("Small", "HUD Text Size", options=["Small", "Normal", "Large"], group=grp_bayes)
+
+grp_vdc = "🕯️ Volume Delta Candles Settings (LuxAlgo Style)"
+string vdcScope          = input.string("Conviction Bars Only", "Volume Delta Scope", options=["Conviction Bars Only", "All Bars (When Mode Active)"], group=grp_vdc, tooltip="Conviction Bars Only: Replaces candle with Volume Delta Candle only during high-conviction events. All Bars: Renders all candles in Volume Delta style when mode is selected.")
+string vdcTick           = input.string('LTF', 'Data from: ', options=['Ticks', 'LTF'], group=grp_vdc)
+string vdcRes            = input.timeframe('1', 'LTF Timeframe', group=grp_vdc, tooltip="Data from: 'LTF'\nAuto: 'Disabled'")
+bool   vdcAuto           = input.bool(true, '', inline='vdc_auto', group=grp_vdc)
+int    vdcMlt            = input.int(1500, ' Auto Multiplier', inline='vdc_auto', group=grp_vdc, tooltip="current TF divided by x\n\nData from: 'LTF'\nAuto: 'Enabled'")
+bool   vdcPrem           = input.bool(false, 'TradingView Premium Plan', group=grp_vdc)
+color  vdcColUp          = input.color(#089981, 'Up (Bullish +Delta)', inline='vdcu', group=grp_vdc)
+color  vdcColUp_         = input.color(#f23645, 'Up - (Bullish -Delta)', inline='vdcu', group=grp_vdc, tooltip='Up -\n-> bullish candle and - Delta')
+color  vdcColDn          = input.color(#f23645, 'Down (Bearish -Delta)', inline='vdcd', group=grp_vdc)
+color  vdcColDn_         = input.color(#089981, 'Down + (Bearish +Delta)', inline='vdcd', group=grp_vdc, tooltip='Down +\n-> bearish candle and + Delta')
+string vdcOption         = input.string('full bar', 'Display Mode', options=['half bar', 'full bar'], group=grp_vdc)
+bool   vdcShowVpoc       = input.bool(true, 'Show Candle VPOC Line', inline='vdc_vpoc', group=grp_vdc, tooltip='Renders horizontal Point of Control (VPOC) line across candle.')
+color  vdcVpocCol        = input.color(#ffffff, '', inline='vdc_vpoc', group=grp_vdc)
+bool   vdcDot            = input.bool(false, 'Show Previous Max Volume Price', inline='vdc_dot', group=grp_vdc)
+string vdcDotSize        = input.string(size.small, '', options=[size.tiny, size.small, size.normal, size.large], inline='vdc_dot', group=grp_vdc)
+color  vdcDotCol         = input.color(#ffd700, '', inline='vdc_dot', group=grp_vdc)
+bool   vdcShowTab        = input.bool(false, 'Show Resolution Table', group=grp_vdc)
+color  vdcTabCol         = input.color(#b2b5beaa, 'Table Text Color', group=grp_vdc)
+string vdcSizeT          = input.string(size.tiny, 'Table Size', group=grp_vdc, options=[size.tiny, size.small, size.normal, size.large])
+bool   vdcShowD          = input.bool(false, 'Show Volume/Delta Info Details', group=grp_vdc)
+
+grp_inst = "🎯 Institutional Features (FVG & Performance)"
+bool  showFvgBoxes       = input.bool(false, "Render FVG Boxes", group=grp_inst)
+int   maxFvgBoxes        = input.int(10,     "Max Active FVG Boxes", minval=3, maxval=50, group=grp_inst)
+bool  trackPerformance   = input.bool(true,  "Track A+ Performance (Wilson CI)", group=grp_inst)
+int   aplusHorizon       = input.int(20,     "A+ Evaluation Horizon (Bars)", minval=5, maxval=200, group=grp_inst)
+
+grp_osc = "⚡ Microstructure & Oscillator Settings"
+string vwapModeInput     = input.string("Rolling (Bars)", "VWAP Mode", options=["Rolling (Bars)", "Daily", "Weekly", "Anchored Session"], group=grp_osc)
+int    rollingVwapBars   = input.int(24, "Rolling VWAP Period", minval=5, maxval=200, group=grp_osc)
+int    zScoreWindow      = input.int(40, "Z-Score Window", minval=10, maxval=200, group=grp_osc)
+bool   useCFexpansion    = input.bool(true, "Cornish-Fisher Skew/Kurtosis Guard", group=grp_osc)
+int    kaufmanErLen      = input.int(100, "Regime Kaufman ER Window", minval=30, maxval=300, group=grp_osc)
+float  erTrendThresh     = input.float(0.45, "ER Trending Threshold", minval=0.20, maxval=0.80, step=0.05, group=grp_osc)
+float  erRangeThresh     = input.float(0.20, "ER Ranging Threshold", minval=0.05, maxval=0.40, step=0.05, group=grp_osc)
+
+grp_vis_osc = "⚡ Sub-Pane Oscillator Visuals"
+bool   showVwapHist      = input.bool(true,  "Show VWAP Dev Z Line", group=grp_vis_osc)
+bool   showSmpi          = input.bool(true,  "Show Pressure Index Columns", group=grp_vis_osc)
+bool   showStdBands      = input.bool(true,  "Show Sigma Bands (±1σ, ±2σ)", group=grp_vis_osc)
+bool   showConvHist      = input.bool(false, "Show Net Conviction Area", group=grp_vis_osc)
+bool   showOfpArea       = input.bool(false, "Show OFP Slope Z Line", group=grp_vis_osc)
+
+grp_micro = "🔬 Lower-TF Flow Proxies"
+bool  useVpinFilter      = input.bool(true,  "Enable VPIN-Like Imbalance Proxy", group=grp_micro, tooltip="Uses lower-timeframe OHLCV allocation; it is not trade-classified VPIN.")
+float vpinToxicThresh    = input.float(0.85, "Imbalance Proxy Threshold", minval=0.50, maxval=0.99, step=0.01, group=grp_micro)
+int   vpinBuckets        = input.int(15,     "Rolling Imbalance Window", minval=5, maxval=100, group=grp_micro)
+
+bool  useDxyDecouple     = input.bool(true,  "Enable DXY Dealer-Hedging Proxy", group=grp_micro)
+string dxySym            = input.string("TVC:DXY", "Correlated Index Symbol", group=grp_micro)
+int   dxyCorrWin         = input.int(50,     "DXY Correlation Window", minval=10, maxval=200, group=grp_micro)
+float dxyDecoupleThresh  = input.float(-0.30, "Decouple Trigger (corr rises above)", minval=-0.90, maxval=0.50, step=0.05, group=grp_micro)
+
+bool  useSessionStops    = input.bool(true,  "Enable Session-Adjusted Vol Stops", group=grp_micro)
+int   sessionVolWin      = input.int(100,    "Session Variance Window", minval=20, maxval=500, group=grp_micro)
+float sessionSlMult      = input.float(1.5,  "Session SL Multiplier (x session σ)", minval=0.5, maxval=5.0, step=0.1, group=grp_micro)
+float sessionTp1Mult     = input.float(2.0,  "Session TP1 Multiplier (x session σ)", minval=0.5, maxval=10.0, step=0.1, group=grp_micro)
+float sessionTp2Mult     = input.float(3.5,  "Session TP2 Multiplier (x session σ)", minval=0.5, maxval=15.0, step=0.1, group=grp_micro)
+
+bool  useQueueDepletion  = input.bool(true,  "Enable CVD Divergence Proxy", group=grp_micro, tooltip="Infers flow divergence from lower-timeframe OHLCV; no order-book queue depth is available.")
+int   cvdDivLookback     = input.int(8,      "CVD Divergence Lookback (bars)", minval=2, maxval=30, group=grp_micro)
+
+grp_kz = "🕒 Session Killzones"
+bool   useKillzoneFilter = input.bool(true, "Restrict Signals to Active Killzones", group=grp_kz)
+bool   showKzBg          = input.bool(true, "Killzone Background Shading", group=grp_kz)
+string kzTz              = input.string("America/New_York", "Timezone", options=["America/New_York", "UTC", "Europe/London", "Asia/Tokyo"], group=grp_kz)
+string kzLondon          = input.session("0200-0500", "London Killzone", group=grp_kz)
+string kzNyAm            = input.session("0830-1100", "NY AM Killzone", group=grp_kz)
+bool   useAsiaKz         = input.bool(true, "Enable Asia Session Killzone", group=grp_kz)
+string kzAsia            = input.session("2000-0000", "Asia Killzone", group=grp_kz)
+string kzLondonFix       = input.session("1000-1100", "London Fix Killzone (10-11 NY)", group=grp_kz, tooltip="$30B+ daily gold fix flows. Highest intraday XAUUSD volume window.")
+
+// ════════════════════════════════════════════════════════════════
+// 1b. PROBABILITY CALIBRATION INPUTS
+// ════════════════════════════════════════════════════════════════
+grp_cal = "🎯 Probability Calibration Layer"
+bool useLedgerBridge     = input.bool(true,  "Enable Empirical Calibration Bridge", group=grp_cal, tooltip="Dynamically disciplines structural prior weights (w_loc) using self-contained rolling win rate of structural setups.")
+bool useDynamicThreshold = input.bool(true,  "Dynamic A+ Threshold (Vol/Session Adaptive)", group=grp_cal, tooltip="Lowers threshold during Fix/high vol, raises it during quiet periods.")
+bool useRiskProxy        = input.bool(true,  "Enable VIX Risk-Off Proxy", group=grp_cal, tooltip="Gold behaves differently when VIX > 25 (safe haven bid).")
+string vixSym            = input.string("TVC:VIX", "Risk Proxy Symbol (VIX)", group=grp_cal)
+bool useAsianBreakout    = input.bool(true,  "Enable Asian Range → London Breakout Score", group=grp_cal, tooltip="Scores London breakout quality against Asian range.")
+bool useTemporalDecay    = input.bool(true,  "Signal Temporal Decay (8-bar half-life)", group=grp_cal, tooltip="Stale setups lose model-score weight.")
+bool useRetestMode       = input.bool(false, "Retest Entry Mode (FVG/OB + CVD Confirm)", group=grp_cal, tooltip="Only enter on a fresh, non-mitigated retest, not breakout. Takes fewer, higher-quality trades.")
+int  retestMaxAge        = input.int(40, "Retest Zone Max Age (Bars)", minval=1, maxval=500, group=grp_cal, tooltip="Retest zones expire after this many bars unless refreshed by a new confirmed FVG or OB.")
+bool useLiqTrap          = input.bool(true,  "Liquidity Trap Reversal Detection", group=grp_cal, tooltip="Detects false breakouts and flips them into high-probability reversals.")
+bool useEqs              = input.bool(true,  "Execution Quality Score (Meta-Filter)", group=grp_cal, tooltip="Adjusts win probability based on execution conditions (session, shock, toxicity).")
+
+
+
+// ════════════════════════════════════════════════════════════════
+// 1c. LIQUIDITY VACUUM ENGINE INPUTS
+// ════════════════════════════════════════════════════════════════
+// A "vacuum" is an UNTRADED price pocket the market must traverse to reach resting
+// liquidity — equal highs/lows, an unfilled FVG, or the displacement void left by an
+// impulse. Banks do not seek liquidity where volume has already been accepted; they
+// seek the thin air *in front of* the stop pool, because price accelerates through it.
+G_VAC = "🌀 Liquidity Vacuum (Big-Player Seek Zones)"
+bool  vacEnable      = input.bool(true,  "Enable Vacuum Engine", group=G_VAC, tooltip="Detect untraded price pockets (equal highs/lows, unfilled FVGs, displacement voids) where institutional players seek liquidity before reversal.")
+bool  vacShowZones   = input.bool(true,  "Show Vacuum Zones (price)", group=G_VAC, tooltip="Price-projected vacuum boxes + magnet line, drawn on the main chart from this sub-pane via force_overlay.")
+bool  vacShowOsc     = input.bool(true,  "Show Vacuum Oscillator Band", group=G_VAC, tooltip="Sub-pane ±1 plot of signed vacuum pressure / magnet direction.")
+int   vacPivotLen    = input.int(5,      "Vacuum Pivot Length", minval=2, maxval=20, group=G_VAC)
+float vacClustTolAtr = input.float(0.30, "Equal High/Low Tolerance (x ATR)", minval=0.05, step=0.05, group=G_VAC, tooltip="Two pivots within this distance count as one clustered stop pool (a stronger vacuum magnet).")
+int   vacLookback    = input.int(150,    "Vacuum Lookback (bars)", minval=30, maxval=500, group=G_VAC)
+int   vacDispLen     = input.int(3,      "Displacement Candle Window", minval=2, maxval=6, group=G_VAC, tooltip="Bars that must hold an impulse imbalance for it to register as a displacement void.")
+float vacFvgMinAtr   = input.float(0.20, "Vacuum FVG Min Size (x ATR)", minval=0.05, step=0.05, group=G_VAC, tooltip="Minimum gap to register as a vacuum void. Gold 5m/15m: ~0.2x ATR.")
+float vacProxAtr     = input.float(1.5,  "Magnet Proximity (x ATR)", minval=0.25, step=0.25, group=G_VAC, tooltip="A vacuum within this distance of price is an ACTIVE magnet pulling price toward it.")
+int   vacMaxZones    = input.int(3,      "Max Active Vacuum Zones / side", minval=1, maxval=6, group=G_VAC, tooltip="Caps box usage on the free tier.")
+
+// ════════════════════════════════════════════════════════════════
+// 1d. HOPLA 3-97 GOLDBACH REJECTION BLOCKS & DEALING RANGES
+// ════════════════════════════════════════════════════════════════
+G_HOPLA = "📐 Hopla 3-97 Rejection Blocks (PO3 Ranges)"
+bool   hoplaEnable     = input.bool(true,  "Enable Hopla 3-97 Lines", group=G_HOPLA, tooltip="Renders Power-of-Three (PO3) Goldbach dealing range 3% discount and 97% premium rejection boundaries on the main chart via force_overlay.")
+int    hoplaRange      = input.int(27,     "PO3 Range Size", options=[3, 9, 27, 81, 243, 729], group=G_HOPLA, tooltip="Base range dimension (in points). Gold scalping: 27 points default, 81 for session macro.")
+int    hoplaMultiplier = input.int(1,      "Range Multiplier", minval=1, maxval=10, group=G_HOPLA)
+int    hoplaBoxesShow  = input.int(1,      "Dealing Boxes Above/Below", minval=0, maxval=2, group=G_HOPLA, tooltip="0: Current box only, 1: Current + 1 above & 1 below.")
+color  hoplaCol3       = input.color(#00B4D8, "3% Line Color (Discount)", inline="h3", group=G_HOPLA)
+color  hoplaCol97      = input.color(#FF3B30, "97% Line Color (Premium)", inline="h97", group=G_HOPLA)
+bool   hoplaShowLabels = input.bool(true,  "Show 3-97 Level Labels", group=G_HOPLA)
+
+// ════════════════════════════════════════════════════════════════
+// 2. THEME COLOR PALETTE & HELPER FUNCTIONS
+// ════════════════════════════════════════════════════════════════
+f_getPalette(string theme) =>
+    color c_bull = #00B4D8
+    color c_bear = #FF3B30
+    color c_neut = #787B86
+    color c_acc  = #FFD700
+    color c_card = #0D1117
+    if theme == "Institutional"
+        c_bull := #00B4D8
+        c_bear := #FF3B30
+        c_neut := #787B86
+        c_acc  := #FFD700
+        c_card := #0D1117
+    else if theme == "Modern Mint"
+        c_bull := #00E676
+        c_bear := #FF1744
+        c_neut := #80CBC4
+        c_acc  := #651FFF
+        c_card := #0A1917
+    else if theme == "Deep Sea"
+        c_bull := #00BCD4
+        c_bear := #FF5252
+        c_neut := #546E7A
+        c_acc  := #00E5FF
+        c_card := #08121E
+    else if theme == "Monochrome"
+        c_bull := #D1D4DC
+        c_bear := #50535E
+        c_neut := #848E9C
+        c_acc  := #FFFFFF
+        c_card := #131722
+    else if theme == "Neon Cyber"
+        c_bull := #00FF00
+        c_bear := #FF0055
+        c_neut := #363A45
+        c_acc  := #F000FF
+        c_card := #0B0014
+    [c_bull, c_bear, c_neut, c_acc, c_card]
+
+[u_bull, u_bear, u_neut, u_acc, u_card] = f_getPalette(masterTheme)
+
+// Dynamic VWAP Z Gradient Color Calculator (Theme Adaptive)
+f_getVwapColor(float z, color c_b, color c_r, color c_n) =>
+    if z >= 2.5
+        color.new(c_b, 0)
+    else if z >= 1.5
+        color.new(c_b, 20)
+    else if z >= 0.5
+        color.new(c_b, 35)
+    else if z >= -0.5
+        color.new(c_n, 45)
+    else if z >= -1.5
+        color.new(c_r, 35)
+    else if z >= -2.5
+        color.new(c_r, 20)
+    else
+        color.new(c_r, 0)
+
+// Visual Telemetry Progress Meter Generator
+f_meter(float val, float minV, float maxV, int numBlocks) =>
+    float clamped = math.max(minV, math.min(maxV, nz(val, minV)))
+    float ratio = maxV > minV ? (clamped - minV) / (maxV - minV) : 0.0
+    int filled = math.round(ratio * float(numBlocks))
+    string res = "["
+    if numBlocks > 0
+        for i = 1 to numBlocks
+            res += i <= filled ? "█" : "░"
+    res += "]"
+    res
+
+// Z-Score Outlier Clamping Helper
+f_clampZ(float x) => math.max(math.min(nz(x), 5.0), -5.0)
+
+// Clipped Correlation Helper (bounds each pair to ±0.95)
+f_clipCorr(float a, float b, int len) =>
+    math.max(math.min(nz(ta.correlation(a, b, len)), 0.95), -0.95)
+
+// Wilson 95% Score Interval for Performance Tracker
+f_lgWilson(float w, float t) =>
+    float lo = 0.0
+    float hi = 0.0
+    if t > 0
+        float z = 1.96
+        float phat = w / t
+        float denom = 1.0 + z * z / t
+        float center = (phat + z * z / (2.0 * t)) / denom
+        float margin = z * math.sqrt(math.max(phat * (1.0 - phat) / t + z * z / (4.0 * t * t), 0.0)) / denom
+        lo := math.max((center - margin) * 100.0, 0.0)
+        hi := math.min((center + margin) * 100.0, 100.0)
+    [lo, hi]
+
+// ════════════════════════════════════════════════════════════════
+// 3. EMBEDDED MICROSTRUCTURE & OSCILLATOR CALCULATIONS
+// ════════════════════════════════════════════════════════════════
+float atr14    = ta.atr(14)
+float atr100   = ta.atr(100)
+float priceRef = hlc3
+float volRef   = math.max(nz(volume), 1e-10)
+
+// Macro Shock Guard
+bool  isShockBar = ta.tr(true) > (atr100 * shockAtrMult)
+var int lastShockBar = -999
+if isShockBar and barConfirmed
+    lastShockBar := bar_index
+
+int  barsSinceShock   = bar_index - lastShockBar
+bool shockGuardHard   = useShockGuard and barsSinceShock <= 3
+bool shockGuardSoft   = useShockGuard and barsSinceShock > 3 and barsSinceShock <= shockCooldown
+bool shockGuardActive = shockGuardHard   // used for HUD status & visual shading
+
+// HTF 200 EMA Trend Guard & 4H Structure Extension: use prior closed 4H values on every chart bar.
+[htfEma200, htfSwingHigh, htfSwingLow, htfAtr] = request.security(syminfo.tickerid, "240", [ta.ema(close, 200)[1], ta.highest(high, 50)[1], ta.lowest(low, 50)[1], ta.atr(14)[1]], lookahead=barmerge.lookahead_on)
+bool  htfBullTrend = close > htfEma200
+bool  htfBearTrend = close < htfEma200
+float htfSwingMid  = (nz(htfSwingHigh, high) + nz(htfSwingLow, low)) / 2.0
+float htfExtension = nz(htfAtr, atr14) > 0 ? (close - htfSwingMid) / nz(htfAtr, atr14) : 0.0
+
+// VWAP Mode Dynamic Reset & Calculation
+bool isDailyVwap   = vwapModeInput == "Daily"
+bool isWeeklyVwap  = vwapModeInput == "Weekly"
+bool isAnchored    = vwapModeInput == "Anchored Session"
+bool isRollingBars = vwapModeInput == "Rolling (Bars)"
+
+var float sumPV_cum = 0.0
+var float sumV_cum  = 0.0
+
+bool newVwapPeriod = false
+if isDailyVwap or isAnchored
+    newVwapPeriod := ta.change(time("D")) != 0
+else if isWeeklyVwap
+    newVwapPeriod := ta.change(time("W")) != 0
+
+if newVwapPeriod or bar_index == 0
+    sumPV_cum := priceRef * volRef
+    sumV_cum  := volRef
+else
+    sumPV_cum := sumPV_cum + priceRef * volRef
+    sumV_cum  := sumV_cum + volRef
+
+float sumPV_roll = math.sum(priceRef * volRef, rollingVwapBars)
+float sumV_roll  = math.sum(volRef, rollingVwapBars)
+
+float vwapVal = isRollingBars ? (sumV_roll != 0 ? sumPV_roll / sumV_roll : hlc3) : (sumV_cum != 0 ? sumPV_cum / sumV_cum : hlc3)
+
+// Cornish-Fisher Z-Score
+float residAbs  = priceRef - vwapVal
+float vwapMu    = ta.sma(residAbs, zScoreWindow)
+float vwapSdRaw = ta.stdev(residAbs, zScoreWindow)
+float vwapSd    = math.max(vwapSdRaw, 0.20 * atr14)
+
+// Fast O(1) Central Moments for Cornish-Fisher Expansion (Vectorized in C++)
+f_skew_kurtosis(float src, int len) =>
+    float m1 = ta.sma(src, len)
+    float m2 = ta.sma(src * src, len)
+    float m3 = ta.sma(src * src * src, len)
+    float m4 = ta.sma(src * src * src * src, len)
+    float var_ = math.max(m2 - m1 * m1, 0.0)
+    float s3 = m3 - 3.0 * m1 * m2 + 2.0 * m1 * m1 * m1
+    float s4 = m4 - 4.0 * m1 * m3 + 6.0 * m1 * m1 * m2 - 3.0 * m1 * m1 * m1 * m1
+    float skew = var_ > 0.0 ? s3 / math.pow(var_, 1.5) : 0.0
+    float kurt = var_ > 0.0 ? s4 / (var_ * var_) : 3.0
+    [skew, kurt]
+
+[residSkew, residKurt] = if useCFexpansion
+    f_skew_kurtosis(residAbs, zScoreWindow)
+else
+    [0.0, 3.0]
+float rawZ = vwapSd != 0 ? (residAbs - vwapMu) / vwapSd : 0.0
+
+float cfRaw  = rawZ + (rawZ*rawZ - 1)*residSkew/6.0 + (rawZ*rawZ*rawZ - 3*rawZ)*(residKurt-3)/24.0 - (2*rawZ*rawZ*rawZ - 5*rawZ)*residSkew*residSkew/36.0
+float cfDeriv = 1.0 + (2*rawZ)*residSkew/6.0 + (3*rawZ*rawZ - 3)*(residKurt-3)/24.0 - (6*rawZ*rawZ - 5)*residSkew*residSkew/36.0
+bool  cfValid = cfDeriv > 0 and math.abs(cfRaw) < 8.0
+float vwapZ   = f_clampZ((useCFexpansion and cfValid) ? cfRaw : rawZ)
+
+// Lower-Timeframe Micro-Tick Order Flow Proxy Engine
+upAndDownVolume() =>
+    float rng = high - low
+    float mid = (high + low) / 2.0
+    float lr  = rng > 0 ? (close - mid) / (rng / 2.0) : 0.0
+    math.max(math.min(lr, 1.0), -1.0) * volRef
+
+string ofpLowerTF = timeframe.isintraday ? "1" : "60"
+diffVolArray = request.security_lower_tf(syminfo.tickerid, ofpLowerTF, upAndDownVolume())
+
+float lastVol = not na(diffVolArray) and array.size(diffVolArray) > 0 ? array.sum(diffVolArray) : 0.0
+bool ltfDataValid = not na(diffVolArray) and array.size(diffVolArray) > 0
+var float cumulLastVol = 0.0
+bool anchorChange = timeframe.change("240") or (not na(lastVol) and na(lastVol[1]))
+float cumulOpenVol = anchorChange ? 0.0 : cumulLastVol[1]
+cumulLastVol := cumulOpenVol + nz(lastVol)
+
+float ofpSlope   = cumulLastVol - nz(cumulLastVol[3])
+float ofpSlopeMu = ta.sma(ofpSlope, zScoreWindow)
+float ofpSlopeSd = ta.stdev(ofpSlope, zScoreWindow)
+float ofpSlopeZ  = f_clampZ(ofpSlopeSd != 0 ? (ofpSlope - ofpSlopeMu) / ofpSlopeSd : 0.0)
+
+// VPIN-like rolling lower-TF volume-imbalance proxy (not trade-classified VPIN)
+f_splitFlow(arr) =>
+    float buy = 0.0
+    float sell = 0.0
+    if not na(arr)
+        int sz = array.size(arr)
+        if sz > 0
+            for i = 0 to sz - 1
+                float x = nz(array.get(arr, i))
+                if x > 0
+                    buy += x
+                else
+                    sell -= x
+    [buy, sell]
+
+[barBuyVol, barSellVol] = f_splitFlow(diffVolArray)
+float rollBuy   = math.sum(barBuyVol,  vpinBuckets)
+float rollSell  = math.sum(barSellVol, vpinBuckets)
+float rollGross = rollBuy + rollSell
+bool  ltfVolumeValid = ltfDataValid and (barBuyVol + barSellVol) > 0
+bool  lowerTfDataOk  = ltfVolumeValid
+float vpinProxy = ltfVolumeValid and rollGross > 0 ? math.min(math.abs(rollBuy - rollSell) / rollGross, 1.0) : na
+bool  toxicFlow = useVpinFilter and ltfVolumeValid and not na(vpinProxy) and vpinProxy > vpinToxicThresh
+bool  toxicBuySide  = toxicFlow and rollBuy > rollSell
+bool  toxicSellSide = toxicFlow and rollSell > rollBuy
+
+// CVD flow-divergence proxy (not order-book queue depth)
+float cvdSlope   = cumulLastVol - nz(cumulLastVol[cvdDivLookback])
+float priceSlope = close - nz(close[cvdDivLookback])
+float cvdSlopeSd = ta.stdev(cvdSlope, zScoreWindow)
+float cvdSlopeZ  = f_clampZ(cvdSlopeSd != 0 ? cvdSlope / cvdSlopeSd : 0.0)
+bool  cvdFlat        = math.abs(cvdSlopeZ) < 0.5
+bool  cvdConsumeUp   = priceSlope > 0 and (cvdSlopeZ < 0 or cvdFlat)
+bool  cvdConsumeDn   = priceSlope < 0 and (cvdSlopeZ > 0 or cvdFlat)
+bool  cvdDefendUp    = priceSlope < 0 and cvdSlopeZ > 0.5
+bool  cvdDefendDn    = priceSlope > 0 and cvdSlopeZ < -0.5
+bool  cvdFade        = useQueueDepletion and (cvdConsumeUp or cvdConsumeDn)
+bool  cvdDefend      = useQueueDepletion and (cvdDefendUp or cvdDefendDn)
+
+// Extended CVD Divergence Matrix (20-bar institutional window)
+float cvdSlopeLong    = cumulLastVol - nz(cumulLastVol[20])
+float priceSlopeLong  = close - nz(close[20])
+float cvdSlopeLongSd  = ta.stdev(cvdSlopeLong, zScoreWindow)
+float cvdSlopeLongZ   = f_clampZ(cvdSlopeLongSd != 0 ? cvdSlopeLong / cvdSlopeLongSd : 0.0)
+bool  cvdLongFadeUp   = priceSlopeLong > 0 and cvdSlopeLongZ < -0.3
+bool  cvdLongFadeDn   = priceSlopeLong < 0 and cvdSlopeLongZ >  0.3
+
+// DXY Dealer-Hedging Decoupling Proxy
+float dxyClose = useDxyDecouple ? request.security(dxySym, timeframe.period, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : na
+float dxyCorrRaw = ta.correlation(close, dxyClose, dxyCorrWin)
+float dxyCorr  = (useDxyDecouple and not na(dxyClose)) ? dxyCorrRaw : na
+bool  dxyDecoupled = useDxyDecouple and not na(dxyCorr) and dxyCorr > dxyDecoupleThresh
+
+// VIX Risk-Off Proxy
+float vixClose = useRiskProxy ? request.security(vixSym, timeframe.period, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off) : na
+bool riskOff = useRiskProxy and not na(vixClose) and vixClose > 25.0
+bool riskOn  = useRiskProxy and not na(vixClose) and vixClose < 18.0
+
+// Absorption & Volatility
+float candleRng = high - low
+float volMu  = ta.sma(volRef, zScoreWindow)
+float volSd  = ta.stdev(volRef, zScoreWindow)
+float volZ   = f_clampZ(volSd != 0 ? (volRef - volMu) / volSd : 0.0)
+float rngMu  = ta.sma(candleRng, zScoreWindow)
+float rngSd  = ta.stdev(candleRng, zScoreWindow)
+float rngZ   = f_clampZ(rngSd != 0 ? (candleRng - rngMu) / rngSd : 0.0)
+float absScore = volZ - rngZ
+bool  isAbsorption = absScore > 1.5 and volZ > 1.0
+bool  isCompressionDefend = volZ > 1.5 and rngZ < 0.0
+
+bool  singleBarIceberg = (volZ > 1.2 and rngZ < 0.2) or isCompressionDefend
+int   accumCount = int(math.sum(singleBarIceberg ? 1 : 0, 5))
+bool  isIcebergAccumulation    = accumCount >= 2
+bool  isAccumulationPersistent = accumCount >= 3
+bool  isAccumulating = isIcebergAccumulation
+
+// Kaufman Efficiency Ratio (Regime Detector)
+float netMove = math.abs(close - nz(close[kaufmanErLen], close))
+float path    = math.sum(math.abs(close - nz(close[1])), kaufmanErLen)
+float erVal   = path > 0 ? netMove / path : 0.0
+bool trendingRegime = erVal > erTrendThresh
+bool rangingRegime  = erVal < erRangeThresh
+
+// Smart Money Pressure Index (SMPI) & SNR Proxy
+float smpiRaw = 0.40 * ofpSlopeZ + 0.30 * (isAbsorption ? (ofpSlopeZ > 0 ? 1.5 : -1.5) : 0.0) + 0.30 * (close > open ? 1.0 : -1.0)
+float smpi = math.max(math.min(ta.ema(smpiRaw, 3), 3.0), -3.0)
+float smpiSlope = smpi - nz(smpi[1])
+float snrProxy  = math.abs(smpi) / math.max(ta.stdev(smpi, 20), 0.1)
+
+// Session Killzone Filter
+string selTz = kzTz
+bool inLondonKz    = not na(time(timeframe.period, kzLondon, selTz))
+bool inNyAmKz      = not na(time(timeframe.period, kzNyAm, selTz))
+bool inAsiaKz      = useAsiaKz and not na(time(timeframe.period, kzAsia, selTz))
+bool inLondonFixKz = not na(time(timeframe.period, kzLondonFix, selTz))
+bool activeKillzone = not useKillzoneFilter or (inLondonKz or inNyAmKz or inAsiaKz or inLondonFixKz)
+bool kzConfirmed    = activeKillzone and (volZ > 0.0)
+bool inFixKz = inLondonFixKz
+
+bool dealerHedgingFlow = dxyDecoupled and activeKillzone
+
+// Asian Range → London Breakout Quality
+var float asianHigh  = na
+var float asianLow   = na
+var float asianMid   = na
+var float asianRange = na
+
+if inAsiaKz
+    asianHigh := math.max(high, nz(asianHigh, high))
+    asianLow  := math.min(low,  nz(asianLow,  low))
+else if inLondonKz and not inLondonKz[1]
+    asianRange := nz(asianHigh, close) - nz(asianLow, close)
+    asianMid   := (nz(asianHigh, close) + nz(asianLow, close)) / 2.0
+    asianHigh  := na
+    asianLow   := na
+
+float londonMove       = inLondonKz and not na(asianMid) ? math.abs(close - asianMid) : 0.0
+float breakoutQuality  = (asianRange > 0 and inLondonKz) ? londonMove / asianRange : 0.0
+bool  highQualityBreakout = useAsianBreakout and breakoutQuality > 0.5 and volZ > 1.0
+
+// Session-Empirical Volatility
+float barRet = ta.change(close)
+float rollRetVol = ta.stdev(barRet, sessionVolWin)
+var float londonVolState = na
+var float nyVolState     = na
+var float asiaVolState   = na
+if inLondonKz
+    londonVolState := rollRetVol
+if inNyAmKz
+    nyVolState := rollRetVol
+if inAsiaKz
+    asiaVolState := rollRetVol
+float sessionVol = inLondonKz ? londonVolState : inNyAmKz ? nyVolState : inAsiaKz ? asiaVolState : na
+sessionVol := nz(sessionVol, nz(londonVolState, nz(nyVolState, nz(asiaVolState, atr14))))
+
+// ════════════════════════════════════════════════════════════════
+// 4. STRUCTURAL OVERLAY ENGINES (SMC, FVG, Liquidity)
+// ════════════════════════════════════════════════════════════════
+
+// A. Market Structure (Swings & CHoCH)
+int swingLen = 5
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastHigh = na
+var float lastLow  = na
+var int trendDir   = 0
+
+if not na(ph)
+    lastHigh := ph
+if not na(pl)
+    lastLow := pl
+
+float xHigh = nz(lastHigh, 1e10)
+float xLow  = nz(lastLow, -1e10)
+bool crossHigh = ta.crossover(close, xHigh)
+bool crossLow  = ta.crossunder(close, xLow)
+bool chochBull = enableSMC and not na(lastHigh) and crossHigh
+bool chochBear = enableSMC and not na(lastLow)  and crossLow
+
+if barConfirmed and chochBull
+    trendDir := 1
+if barConfirmed and chochBear
+    trendDir := -1
+
+// B. FVG Detection & Coordinates Wiring
+bool fvgBull = enableFVG and (low > high[2]) and (close[1] > high[2])
+bool fvgBear = enableFVG and (high < low[2])  and (close[1] < low[2])
+bool fvgDisplacedBull = fvgBull and (candleRng >= 0.7 * atr14) and (volZ >= 0.3) and (ofpSlopeZ >= 0)
+bool fvgDisplacedBear = fvgBear and (candleRng >= 0.7 * atr14) and (volZ >= 0.3) and (ofpSlopeZ <= 0)
+
+float fvgTopBull = fvgBull ? low : na
+float fvgBotBull = fvgBull ? high[2] : na
+float fvgTopBear = fvgBear ? low[2] : na
+float fvgBotBear = fvgBear ? high : na
+
+// C. Order Blocks (OB)
+var int lastObBullBar = -999
+var int lastObBearBar = -999
+
+bool obCooldownBullOk = (bar_index - lastObBullBar) >= 8
+bool obCooldownBearOk = (bar_index - lastObBearBar) >= 8
+
+bool obBullRaw = enableSMC and (close > high[1]) and (close[1] < open[1])
+bool obBearRaw = enableSMC and (close < low[1])  and (close[1] > open[1])
+
+bool obBull = obBullRaw and obCooldownBullOk
+bool obBear = obBearRaw and obCooldownBearOk
+
+if barConfirmed and obBull
+    lastObBullBar := bar_index
+if barConfirmed and obBear
+    lastObBearBar := bar_index
+
+// D. Liquidity Sweeps
+float lowest20      = ta.lowest(low, 20)[1]
+float highest20     = ta.highest(high, 20)[1]
+float liqBodySize   = math.abs(close - open)
+float liqLowerWick  = math.min(open, close) - low
+float liqUpperWick  = high - math.max(open, close)
+float liqRng        = math.max(high - low, atr14 * 0.1)
+bool liqSweepBull = enableLiquidity and barConfirmed and (low < lowest20) and (close > open) and
+     (liqBodySize < liqRng * 0.5) and (liqLowerWick > liqBodySize * 0.8)
+bool liqSweepBear = enableLiquidity and barConfirmed and (high > highest20) and (close < open) and
+     (liqBodySize < liqRng * 0.5) and (liqUpperWick > liqBodySize * 0.8)
+
+// Retest Tracking with age and structural invalidation
+var float lastBullObTop  = na
+var float lastBullObBot  = na
+var float lastBearObTop  = na
+var float lastBearObBot  = na
+var float lastBullFvgTop = na
+var float lastBullFvgBot = na
+var float lastBearFvgTop = na
+var float lastBearFvgBot = na
+var int lastBullObCreated  = na
+var int lastBearObCreated  = na
+var int lastBullFvgCreated = na
+var int lastBearFvgCreated = na
+
+if barConfirmed and obBull
+    lastBullObTop := high[1]
+    lastBullObBot := low[1]
+    lastBullObCreated := bar_index
+if barConfirmed and obBear
+    lastBearObTop := high[1]
+    lastBearObBot := low[1]
+    lastBearObCreated := bar_index
+if barConfirmed and fvgBull
+    lastBullFvgTop := fvgTopBull
+    lastBullFvgBot := fvgBotBull
+    lastBullFvgCreated := bar_index
+if barConfirmed and fvgBear
+    lastBearFvgTop := fvgTopBear
+    lastBearFvgBot := fvgBotBear
+    lastBearFvgCreated := bar_index
+
+if barConfirmed
+    if not na(lastBullObBot) and (close < lastBullObBot or bar_index - lastBullObCreated > retestMaxAge)
+        lastBullObTop := na
+        lastBullObBot := na
+        lastBullObCreated := na
+    if not na(lastBearObTop) and (close > lastBearObTop or bar_index - lastBearObCreated > retestMaxAge)
+        lastBearObTop := na
+        lastBearObBot := na
+        lastBearObCreated := na
+    if not na(lastBullFvgBot) and (close < lastBullFvgBot or bar_index - lastBullFvgCreated > retestMaxAge)
+        lastBullFvgTop := na
+        lastBullFvgBot := na
+        lastBullFvgCreated := na
+    if not na(lastBearFvgTop) and (close > lastBearFvgTop or bar_index - lastBearFvgCreated > retestMaxAge)
+        lastBearFvgTop := na
+        lastBearFvgBot := na
+        lastBearFvgCreated := na
+
+bool bullObFresh  = not na(lastBullObCreated) and bar_index > lastBullObCreated and bar_index - lastBullObCreated <= retestMaxAge
+bool bearObFresh  = not na(lastBearObCreated) and bar_index > lastBearObCreated and bar_index - lastBearObCreated <= retestMaxAge
+bool bullFvgFresh = not na(lastBullFvgCreated) and bar_index > lastBullFvgCreated and bar_index - lastBullFvgCreated <= retestMaxAge
+bool bearFvgFresh = not na(lastBearFvgCreated) and bar_index > lastBearFvgCreated and bar_index - lastBearFvgCreated <= retestMaxAge
+bool inBullObZone  = useRetestMode and bullObFresh and low <= lastBullObTop and high >= lastBullObBot
+bool inBearObZone  = useRetestMode and bearObFresh and high >= lastBearObBot and low <= lastBearObTop
+bool inBullFvgZone = useRetestMode and bullFvgFresh and low <= lastBullFvgTop and high >= lastBullFvgBot
+bool inBearFvgZone = useRetestMode and bearFvgFresh and high >= lastBearFvgBot and low <= lastBearFvgTop
+
+bool bullRetest = useRetestMode and (inBullObZone or inBullFvgZone) and smpiSlope > 0 and cvdSlopeZ > 0
+bool bearRetest = useRetestMode and (inBearObZone or inBearFvgZone) and smpiSlope < 0 and cvdSlopeZ < 0
+
+// Liquidity Trap Reversal
+bool liqTrapBull = useLiqTrap and enableLiquidity and liqSweepBear[1] and
+     close > open and close > (high + low) / 2 and ofpSlopeZ > 0.5 and smpi > 0
+bool liqTrapBear = useLiqTrap and enableLiquidity and liqSweepBull[1] and
+     close < open and close < (high + low) / 2 and ofpSlopeZ < -0.5 and smpi < 0
+
+
+
+// ════════════════════════════════════════════════════════════════
+// 4b. LIQUIDITY VACUUM ENGINE  — where big players seek liquidity before reversal
+// ════════════════════════════════════════════════════════════════
+// A vacuum = an UNTRADED pocket (no volume acceptance) sitting in front of resting
+// stops. Price accelerates through it because there are no fills to slow it. Three
+// sources, each confirmed-data only (no repaint — a pivot is registered swingLen bars
+// after it forms, exactly like REG):
+//   1. Equal highs / equal lows       -> clustered stop pools (strongest magnet)
+//   2. Unmitigated FVGs               -> single-session voids (medium)
+//   3. Displacement voids             -> multi-bar impulse gaps (weakest)
+// Bars that CLOSE back through a pocket consume it (fills rest there, vacuum dies).
+// Consumption is tracked by re-scanning bars since pocket birth; a pocket whose entire
+// span has been closed through is dead and dropped.
+// ──────────────────────────────────────────────────────────────
+var array<float> vacHiPr   = array.new<float>()   // pocket price (magnet level)
+var array<int>   vacHiBr   = array.new<int>()     // birth bar
+var array<float> vacHiTop  = array.new<float>()   // zone top
+var array<float> vacHiBot  = array.new<float>()   // zone bottom
+var array<int>   vacHiStr  = array.new<int>()     // base strength 1-3 (source type)
+var array<box>   vacHiBox  = array.new<box>()
+
+var array<float> vacLoPr   = array.new<float>()
+var array<int>   vacLoBr   = array.new<int>()
+var array<float> vacLoTop  = array.new<float>()
+var array<float> vacLoBot  = array.new<float>()
+var array<int>   vacLoStr  = array.new<int>()
+var array<box>   vacLoBox  = array.new<box>()
+
+// Wick-scan consumption scan (pivot-confirmed birth bar => [vacPivotLen] back is safe).
+f_vacFillPct(float pTop, float pBot, int birth) =>
+    int n = math.min(bar_index - birth, 250)
+    int tot = 0
+    int filled = 0
+    if n >= 1
+        for i = 0 to n - 1
+            tot += 1
+            if low[i] <= pTop and high[i] >= pBot
+                filled += 1
+    tot > 0 ? float(filled) / float(tot) : 0.0
+
+f_vacAdd(bool isHi, float price, float pTop, float pBot, int strg) =>
+    array<float> pr  = isHi ? vacHiPr  : vacLoPr
+    array<int>   br  = isHi ? vacHiBr  : vacLoBr
+    array<float> tp  = isHi ? vacHiTop : vacLoTop
+    array<float> bt  = isHi ? vacHiBot : vacLoBot
+    array<int>   st  = isHi ? vacHiStr : vacLoStr
+    array<box>   bx  = isHi ? vacHiBox : vacLoBox
+    // dedupe against an existing live pocket on the same level
+    bool dup = false
+    int npr = array.size(pr)
+    if npr > 0
+        for i = npr - 1 to 0
+            if math.abs(array.get(pr, i) - price) <= atr14 * vacClustTolAtr
+                dup := true
+                if strg > array.get(st, i)
+                    array.set(st, i, strg)
+                break
+    if not dup
+        box b = na
+        if vacShowZones
+            color zc = strg == 3 ? #FF5252 : strg == 2 ? #FFA726 : #8B9BB4
+            b := box.new(bar_index, pTop, bar_index + 10, pBot, border_color=color.new(zc, 50), bgcolor=color.new(zc, 88), border_width=1, border_style=line.style_dashed, force_overlay=true)
+        array.push(pr, price)
+        array.push(br, bar_index)
+        array.push(tp, pTop)
+        array.push(bt, pBot)
+        array.push(st, strg)
+        array.push(bx, b)
+
+f_vacPrune(bool isHi) =>
+    array<float> pr  = isHi ? vacHiPr  : vacLoPr
+    array<int>   br  = isHi ? vacHiBr  : vacLoBr
+    array<float> tp  = isHi ? vacHiTop : vacLoTop
+    array<float> bt  = isHi ? vacHiBot : vacLoBot
+    array<int>   st  = isHi ? vacHiStr : vacLoStr
+    array<box>   bx  = isHi ? vacHiBox : vacLoBox
+    int npr = array.size(pr)
+    if npr > 0
+        for i = npr - 1 to 0
+            float p  = array.get(pr, i)
+            float pT = array.get(tp, i)
+            float pB = array.get(bt, i)
+            int   bb = array.get(br, i)
+            // fully closed through (consumed) or too old
+            bool dead = (isHi ? close > pT : close < pB) or (bar_index - bb) > vacLookback or f_vacFillPct(pT, pB, bb) >= 0.85
+            if dead
+                box.delete(array.get(bx, i))
+                array.remove(pr, i)
+                array.remove(br, i)
+                array.remove(tp, i)
+                array.remove(bt, i)
+                array.remove(st, i)
+                array.remove(bx, i)
+    // cap count (drop weakest = lowest strength, tie -> oldest)
+    while array.size(pr) > vacMaxZones
+        int weak = 0
+        for i = 1 to array.size(pr) - 1
+            bool w = array.get(st, i) < array.get(st, weak) or (array.get(st, i) == array.get(st, weak) and array.get(br, i) < array.get(br, weak))
+            if w
+                weak := i
+        box.delete(array.get(bx, weak))
+        array.remove(pr, weak)
+        array.remove(br, weak)
+        array.remove(tp, weak)
+        array.remove(bt, weak)
+        array.remove(st, weak)
+        array.remove(bx, weak)
+
+// Keep the right edge of live vacuum zones trailing price.
+f_vacExtend() =>
+    if barstate.islast
+        if array.size(vacHiBox) > 0
+            for i = 0 to array.size(vacHiBox) - 1
+                box b = array.get(vacHiBox, i)
+                if not na(b)
+                    box.set_right(b, bar_index + 10)
+        if array.size(vacLoBox) > 0
+            for i = 0 to array.size(vacLoBox) - 1
+                box b = array.get(vacLoBox, i)
+                if not na(b)
+                    box.set_right(b, bar_index + 10)
+
+// Persistent swing stores (avoid calling ta.pivot* inside a loop, which is illegal).
+var array<float> vacSwingHiPr = array.new<float>()
+var array<int>   vacSwingHiBr = array.new<int>()
+var array<float> vacSwingLoPr = array.new<float>()
+var array<int>   vacSwingLoBr = array.new<int>()
+f_pushVacSwing(array<float> pr, array<int> br, float p) =>
+    array.push(pr, p)
+    array.push(br, bar_index)
+    if array.size(pr) > 40
+        array.shift(pr)
+        array.shift(br)
+// Bars since a stored swing was consumed (close through its level).
+f_vacCleanSwing(array<float> pr, array<int> br, bool isHi) =>
+    if array.size(pr) > 0
+        for i = array.size(pr) - 1 to 0
+            bool gone = (bar_index - array.get(br, i)) > vacLookback or (isHi ? close > array.get(pr, i) : close < array.get(pr, i))
+            if gone
+                array.remove(pr, i)
+                array.remove(br, i)
+// Count how many live stored swings sit within cluster tolerance of `pivot`.
+f_vacClusterCount(array<float> pr, float pivot) =>
+    int c = 0
+    if array.size(pr) > 0
+        for i = 0 to array.size(pr) - 1
+            if math.abs(array.get(pr, i) - pivot) <= atr14 * vacClustTolAtr
+                c += 1
+    c
+
+if vacEnable and barConfirmed
+    f_vacCleanSwing(vacSwingHiPr, vacSwingHiBr, true)
+    f_vacCleanSwing(vacSwingLoPr, vacSwingLoBr, false)
+    // 1. Equal highs / lows (clustered stop pools)
+    float phv = ta.pivothigh(high, vacPivotLen, vacPivotLen)
+    float plv = ta.pivotlow(low, vacPivotLen, vacPivotLen)
+    if not na(phv)
+        f_pushVacSwing(vacSwingHiPr, vacSwingHiBr, phv)
+        if f_vacClusterCount(vacSwingHiPr, phv) >= 2
+            f_vacAdd(true, phv, phv + atr14 * 0.15, phv - atr14 * 0.15, 3)
+    if not na(plv)
+        f_pushVacSwing(vacSwingLoPr, vacSwingLoBr, plv)
+        if f_vacClusterCount(vacSwingLoPr, plv) >= 2
+            f_vacAdd(false, plv, plv + atr14 * 0.15, plv - atr14 * 0.15, 3)
+    // 2. Unmitigated FVGs (single-bar voids)
+    float fvgMin = atr14 * vacFvgMinAtr
+    if (low - high[2]) > fvgMin
+        f_vacAdd(false, (low + high[2]) / 2, low, high[2], 2)
+    if (low[2] - high) > fvgMin
+        f_vacAdd(true, (low[2] + high) / 2, low[2], high, 2)
+    // 3. Displacement voids (multi-bar impulse gap = prior window top vs current low)
+    if vacDispLen >= 2
+        float spanH1 = ta.highest(high[vacDispLen], vacDispLen)
+        float spanL1 = ta.lowest(low[vacDispLen], vacDispLen)
+        if (low - spanH1) > atr14 * 0.3
+            f_vacAdd(false, (low + spanH1) / 2, low, spanH1, 1)
+        if (spanL1 - high) > atr14 * 0.3
+            f_vacAdd(true, (spanL1 + high) / 2, spanL1, high, 1)
+
+f_vacPrune(true)
+f_vacPrune(false)
+f_vacExtend()
+
+// Nearest live magnet each side + distance & effective strength (source x proximity).
+var float vacAbovePr = na
+var float vacBelowPr = na
+var float vacAboveStr = 0.0
+var float vacBelowStr = 0.0
+var float vacAboveD = na
+var float vacBelowD = na
+if barstate.islast or barConfirmed
+    vacAbovePr := na
+    vacBelowPr := na
+    vacAboveStr := 0.0
+    vacBelowStr := 0.0
+    float bdA = 1e10
+    float bdB = 1e10
+    if array.size(vacHiPr) > 0
+        for i = 0 to array.size(vacHiPr) - 1
+            float p = array.get(vacHiPr, i)
+            if p > close
+                float d = p - close
+                if d < bdA
+                    bdA := d
+                    vacAbovePr := p
+    if array.size(vacLoPr) > 0
+        for i = 0 to array.size(vacLoPr) - 1
+            float p = array.get(vacLoPr, i)
+            if p < close
+                float d = close - p
+                if d < bdB
+                    bdB := d
+                    vacBelowPr := p
+    vacAboveD := bdA == 1e10 ? na : bdA
+    vacBelowD := bdB == 1e10 ? na : bdB
+    if not na(vacAboveD)
+        float prox = math.exp(-vacAboveD / (atr14 * vacProxAtr))
+        vacAboveStr := 3.0 * prox
+    if not na(vacBelowD)
+        float prox = math.exp(-vacBelowD / (atr14 * vacProxAtr))
+        vacBelowStr := 3.0 * prox
+
+// Magnet pull: where the nearest ACTIVE vacuum sits (the direction price seeks).
+bool vacMagnetUp   = not na(vacAbovePr) and (na(vacBelowPr) or vacAboveD <= vacBelowD)
+bool vacMagnetDown = not na(vacBelowPr) and (na(vacAbovePr) or vacBelowD < vacAboveD)
+bool vacActive     = vacMagnetUp or vacMagnetDown
+// A+ execution: a SHORT is magnet-aligned when an active vacuum sits ABOVE (price must
+// travel up to reach the buy-side pool) AND a bearish structure event just fired.
+bool vacAlignBear = vacMagnetUp   and (fvgBear or obBear or liqSweepBear or chochBear)
+bool vacAlignBull = vacMagnetDown and (fvgBull or obBull or liqSweepBull or chochBull)
+// Anti-edge: structure signal pointing INTO the magnet = fighting the fill flow.
+bool vacAntiBear  = vacMagnetDown and (fvgBear or obBear or liqSweepBear or chochBear)
+bool vacAntiBull  = vacMagnetUp   and (fvgBull or obBull or liqSweepBull or chochBull)
+
+// ── Hopla 3-97 Dealing Range Calculations ──────────────────────
+float hSize          = float(hoplaRange * hoplaMultiplier)
+float rLow           = hSize > 0 ? math.floor(close / hSize) * hSize : close
+float rHigh          = rLow + hSize
+float hopla3Price    = rLow + 0.03 * hSize
+float hopla97Price   = rLow + 0.97 * hSize
+bool  inHoplaDiscount= close <= hopla3Price
+bool  inHoplaPremium = close >= hopla97Price
+bool  nearHopla3     = math.abs(close - hopla3Price) <= (atr14 * 0.5)
+bool  nearHopla97    = math.abs(close - hopla97Price) <= (atr14 * 0.5)
+
+// Confluence: Hopla Rejection Block + Active VAC Magnet
+bool hoplaVacLongAlign  = (inHoplaDiscount or nearHopla3)  and not na(vacAbovePr)
+bool hoplaVacShortAlign = (inHoplaPremium  or nearHopla97) and not na(vacBelowPr)
+
+// ════════════════════════════════════════════════════════════════
+// 5. BAYESIAN SCORING & EQUICORRELATION N_eff ENGINE
+// ════════════════════════════════════════════════════════════════
+bool minHistOk = bar_index >= math.max(zScoreWindow, kaufmanErLen, corrWindow)
+
+// Active Agreeing Factors (k) — structural count
+int kBull = (fvgBull ? 1 : 0) + (obBull ? 1 : 0) + (liqSweepBull ? 1 : 0) + (chochBull ? 1 : 0) + (smpi > 0 ? 1 : 0)
+int kBear = (fvgBear ? 1 : 0) + (obBear ? 1 : 0) + (liqSweepBear ? 1 : 0) + (chochBear ? 1 : 0) + (smpi < 0 ? 1 : 0)
+int kActive = math.max(kBull, kBear)
+
+float dHtf = atr14 > 0 ? (close - htfEma200) / atr14 : 0.0
+float dStruct = (fvgBull ? 1 : 0) + (obBull ? 1 : 0) + (liqSweepBull ? 1 : 0) + (chochBull ? 1 : 0) - ((fvgBear ? 1 : 0) + (obBear ? 1 : 0) + (liqSweepBear ? 1 : 0) + (chochBear ? 1 : 0))
+
+// N_eff with Clipped Correlation (Optimized: calculated when kActive > 1 or on last bar for HUD)
+var float rBar = 0.0
+bool needCorr = showIndep or kActive > 1 or barstate.islast
+if needCorr
+    float rSum = 0.0
+    rSum += f_clipCorr(ofpSlopeZ, vwapZ,    corrWindow)
+    rSum += f_clipCorr(ofpSlopeZ, smpi,     corrWindow)
+    rSum += f_clipCorr(ofpSlopeZ, dHtf,     corrWindow)
+    rSum += f_clipCorr(ofpSlopeZ, erVal,    corrWindow)
+    rSum += f_clipCorr(ofpSlopeZ, dStruct,  corrWindow)
+    rSum += f_clipCorr(vwapZ,     smpi,     corrWindow)
+    rSum += f_clipCorr(vwapZ,     dHtf,     corrWindow)
+    rSum += f_clipCorr(vwapZ,     erVal,    corrWindow)
+    rSum += f_clipCorr(vwapZ,     dStruct,  corrWindow)
+    rSum += f_clipCorr(smpi,      dHtf,     corrWindow)
+    rSum += f_clipCorr(smpi,      erVal,    corrWindow)
+    rSum += f_clipCorr(smpi,      dStruct,  corrWindow)
+    rSum += f_clipCorr(dHtf,      erVal,    corrWindow)
+    rSum += f_clipCorr(dHtf,      dStruct,  corrWindow)
+    rSum += f_clipCorr(erVal,     dStruct,  corrWindow)
+    rBar := math.max(math.min(rSum / 15.0, 0.95), 0.0)
+
+float nEff = kActive > 0 ? kActive / (1.0 + (kActive - 1) * rBar) : 0.0
+
+// Regime-Dependent Bayesian Prior
+float effectivePrior = trendingRegime ? math.min(baseWinRatePrior + 0.05, 0.65) :
+                       rangingRegime  ? math.max(baseWinRatePrior - 0.03, 0.40) :
+                       baseWinRatePrior
+float priorLogOdds = math.log(effectivePrior / (1.0 - effectivePrior))
+
+// ════════════════════════════════════════════════════════════════
+// 4b. WP-B1.4 — SELF-CONTAINED EMPIRICAL CALIBRATION BRIDGE
+// ════════════════════════════════════════════════════════════════
+type OscSignalRecord
+    string sigType
+    int    entryBar
+    float  entryPrice
+    int    direction
+    float  stopPrice
+    float  riskPerUnit
+    int    horizon
+    int    barsElapsed
+    bool   closed
+    bool   win
+
+var array<OscSignalRecord> oscLedger = array.new<OscSignalRecord>()
+var array<OscSignalRecord> oscOpenLedger = array.new<OscSignalRecord>()
+
+f_oscLedgerRecord(string sigType, float entryPrice, int direction, float stopPrice) =>
+    float rFloor = math.max(atr14 * 0.5, syminfo.mintick * 10)
+    float stop = stopPrice
+    bool wrongSide = not na(stop) and (direction == 1 ? stop >= entryPrice : stop <= entryPrice)
+    float r = wrongSide ? float(na) : math.abs(entryPrice - stop)
+    if na(r) or r <= 0
+        r := math.max(atr14 * 1.5, rFloor)
+        stop := direction == 1 ? entryPrice - r : entryPrice + r
+    else if r < rFloor
+        r := rFloor
+        stop := direction == 1 ? entryPrice - r : entryPrice + r
+    OscSignalRecord rec = OscSignalRecord.new(sigType, bar_index, entryPrice, direction, stop, r, 20, 0, false, false)
+    array.push(oscLedger, rec)
+    array.push(oscOpenLedger, rec)
+
+f_oscLedgerUpdate() =>
+    if array.size(oscOpenLedger) > 0
+        for i = array.size(oscOpenLedger) - 1 to 0
+            OscSignalRecord rec = array.get(oscOpenLedger, i)
+            rec.barsElapsed += 1
+            bool stopTouched = rec.direction == 1 ? low <= rec.stopPrice : high >= rec.stopPrice
+            if stopTouched
+                rec.closed := true
+                rec.win := false
+                array.remove(oscOpenLedger, i)
+            else if rec.barsElapsed >= rec.horizon
+                float pnl = rec.direction == 1 ? close - rec.entryPrice : rec.entryPrice - close
+                rec.win := pnl > 0
+                rec.closed := true
+                array.remove(oscOpenLedger, i)
+
+f_oscCalStats(string sigType) =>
+    int wins = 0
+    int total = 0
+    if array.size(oscLedger) > 0
+        for i = array.size(oscLedger) - 1 to 0
+            OscSignalRecord rec = array.get(oscLedger, i)
+            if rec.sigType == sigType and rec.closed
+                total += 1
+                if rec.win
+                    wins += 1
+                if total >= 50
+                    break
+    float smoothedRate = total > 0 ? ((wins + 2.0) / (total + 4.0)) * 100.0 : 50.0
+    [smoothedRate, total]
+
+f_oscLedgerPrune() =>
+    while array.size(oscLedger) > 250
+        array.shift(oscLedger)
+
+if barConfirmed
+    f_oscLedgerUpdate()
+    f_oscLedgerPrune()
+    if fvgBull
+        f_oscLedgerRecord("FVG_Bull", close, 1, nz(fvgBotBull, low - atr14))
+    if fvgBear
+        f_oscLedgerRecord("FVG_Bear", close, -1, nz(fvgTopBear, high + atr14))
+    if obBull
+        f_oscLedgerRecord("OB_Bull", close, 1, low[1])
+    if obBear
+        f_oscLedgerRecord("OB_Bear", close, -1, high[1])
+    if liqSweepBull
+        f_oscLedgerRecord("LIQ_Bull", close, 1, low)
+    if liqSweepBear
+        f_oscLedgerRecord("LIQ_Bear", close, -1, high)
+    if chochBull
+        f_oscLedgerRecord("CH_Bull", close, 1, low - atr14)
+    if chochBear
+        f_oscLedgerRecord("CH_Bear", close, -1, high + atr14)
+
+// Setup Signals — includes Liquidity Trap
+bool hasBullSetup = fvgBull or obBull or liqSweepBull or chochBull or liqTrapBull
+bool hasBearSetup = fvgBear or obBear or liqSweepBear or chochBear or liqTrapBear
+
+// Signal Temporal Decay (8-bar linear half-life)
+var int lastBullSetupBar = -999
+var int lastBearSetupBar = -999
+if hasBullSetup
+    lastBullSetupBar := bar_index
+if hasBearSetup
+    lastBearSetupBar := bar_index
+
+float bullFreshness = useTemporalDecay ? math.max(0.0, 1.0 - float(bar_index - lastBullSetupBar) / 8.0) : 1.0
+float bearFreshness = useTemporalDecay ? math.max(0.0, 1.0 - float(bar_index - lastBearSetupBar) / 8.0) : 1.0
+
+// Evaluate Bayesian Weights
+f_calcBayesianScore(bool isLong) =>
+    if not enableBayesEngine
+        bool hasSetup = isLong ? (fvgBull or obBull or liqSweepBull or chochBull or liqTrapBull) : (fvgBear or obBear or liqSweepBear or chochBear or liqTrapBear)
+        hasSetup ? 68.0 : 40.0
+    else
+        float w_loc     = 0.0
+        float w_vwap    = 0.0
+        float w_press   = 0.0
+        float w_reg     = 0.0
+        float w_sess    = 0.0
+        float w_iceberg = 0.0
+        float w_htf     = 0.0
+        float w_vpin    = 0.0
+        float w_dxy     = 0.0
+        float w_queue   = 0.0
+        float w_shock   = 0.0
+        float w_vwapDiv = 0.0
+        float w_volDiv  = 0.0
+        float w_vix     = 0.0
+        float w_asian   = 0.0
+        float w_decay   = 0.0
+        float w_retest  = 0.0
+        float w_trap    = 0.0
+        float w_vac     = 0.0
+
+        float indepScale = kActive > 1 ? (nEff / float(kActive)) : 1.0
+
+        if isLong
+            float baseLoc = (fvgDisplacedBull or obBull or liqSweepBull) ? 0.85 : fvgBull ? 0.65 : chochBull ? 0.50 : -0.30
+            float bridgeMult = 1.0
+            if useLedgerBridge
+                string primaryType = fvgBull ? "FVG_Bull" : obBull ? "OB_Bull" : liqSweepBull ? "LIQ_Bull" : chochBull ? "CH_Bull" : ""
+                if primaryType != ""
+                    [typeWinRate, typeN] = f_oscCalStats(primaryType)
+                    if typeN >= 15
+                        bridgeMult := math.max(0.5, math.min(1.5, 0.5 + typeWinRate / 100.0))
+            w_loc     := baseLoc * bridgeMult
+            w_vwap    := (vwapZ <= -1.7 and vwapZ >= -3.2) ? 0.80 : (vwapZ >= 2.0) ? -1.40 : 0.20
+            w_press   := (smpiSlope > 0 and smpi > -0.5) ? (0.65 + 0.15 * math.min(snrProxy, 2.0)) : (smpiSlope < 0) ? -0.70 : 0.0
+            w_reg     := (trendingRegime and trendDir == 1) ? 0.55 : (rangingRegime and vwapZ <= -1.5) ? 0.45 : -0.20
+            float htfBase = htfBullTrend ? 0.40 : -0.50
+            w_htf     := useHtfTrendFilter ? htfBase * (math.abs(htfExtension) > 2.0 ? 0.5 : 1.0) : 0.0
+            w_sess    := kzConfirmed ? 0.50 : activeKillzone ? 0.15 : -0.50
+            w_iceberg := (isAccumulationPersistent and ofpSlopeZ >= 0) ? 0.40 : (isIcebergAccumulation and ofpSlopeZ >= 0) ? 0.30 : 0.0
+            w_vpin    := toxicSellSide ? -0.90 : 0.0
+            w_dxy     := dealerHedgingFlow ? 0.35 : 0.0
+            w_queue   := cvdDefendUp ? 0.45 : cvdConsumeUp ? -0.55 : 0.0
+            w_shock   := shockGuardSoft ? -0.35 : 0.0
+            w_vwapDiv := cvdLongFadeUp ? -0.25 : 0.0
+            w_volDiv  := 0.0
+            w_vix     := riskOff ? 0.50 : riskOn ? -0.20 : 0.0
+            w_asian   := useAsianBreakout and highQualityBreakout and close > nz(asianMid, close) ? 0.35 : 0.0
+            w_decay   := useTemporalDecay ? (bullFreshness - 1.0) * 0.15 : 0.0
+            w_retest  := useRetestMode and bullRetest ? 0.30 : useRetestMode and (inBullObZone or inBullFvgZone) ? -0.20 : 0.0
+            w_trap    := useLiqTrap and liqTrapBull ? 0.90 : 0.0
+            // Vacuum: aligned entry (bull struct + void BELOW = big player fills bids into
+            // the void before the markup) gets a real boost; fighting the magnet costs.
+            w_vac     := vacEnable ? (vacAlignBull ? 0.55 : vacAntiBull ? -0.45 : 0.0) : 0.0
+        else
+            float baseLoc = (fvgDisplacedBear or obBear or liqSweepBear) ? 0.85 : fvgBear ? 0.65 : chochBear ? 0.50 : -0.30
+            float bridgeMult = 1.0
+            if useLedgerBridge
+                string primaryType = fvgBear ? "FVG_Bear" : obBear ? "OB_Bear" : liqSweepBear ? "LIQ_Bear" : chochBear ? "CH_Bear" : ""
+                if primaryType != ""
+                    [typeWinRate, typeN] = f_oscCalStats(primaryType)
+                    if typeN >= 15
+                        bridgeMult := math.max(0.5, math.min(1.5, 0.5 + typeWinRate / 100.0))
+            w_loc     := baseLoc * bridgeMult
+            w_vwap    := (vwapZ >= 1.7 and vwapZ <= 3.2) ? 0.80 : (vwapZ <= -2.0) ? -1.40 : 0.20
+            w_press   := (smpiSlope < 0 and smpi < 0.5) ? (0.65 + 0.15 * math.min(snrProxy, 2.0)) : (smpiSlope > 0) ? -0.70 : 0.0
+            w_reg     := (trendingRegime and trendDir == -1) ? 0.55 : (rangingRegime and vwapZ >= 1.5) ? 0.45 : -0.20
+            float htfBase = htfBearTrend ? 0.40 : -0.50
+            w_htf     := useHtfTrendFilter ? htfBase * (math.abs(htfExtension) > 2.0 ? 0.5 : 1.0) : 0.0
+            w_sess    := kzConfirmed ? 0.50 : activeKillzone ? 0.15 : -0.50
+            w_iceberg := (isAccumulationPersistent and ofpSlopeZ <= 0) ? 0.40 : (isIcebergAccumulation and ofpSlopeZ <= 0) ? 0.30 : 0.0
+            w_vpin    := toxicBuySide ? -0.90 : 0.0
+            w_dxy     := dealerHedgingFlow ? 0.35 : 0.0
+            w_queue   := cvdDefendDn ? 0.45 : cvdConsumeDn ? -0.55 : 0.0
+            w_shock   := shockGuardSoft ? -0.35 : 0.0
+            w_vwapDiv := cvdLongFadeDn ? -0.25 : 0.0
+            w_volDiv  := 0.0
+            w_vix     := riskOff ? -0.50 : riskOn ? 0.20 : 0.0
+            w_asian   := useAsianBreakout and highQualityBreakout and close < nz(asianMid, close) ? 0.35 : 0.0
+            w_decay   := useTemporalDecay ? (bearFreshness - 1.0) * 0.15 : 0.0
+            w_retest  := useRetestMode and bearRetest ? 0.30 : useRetestMode and (inBearObZone or inBearFvgZone) ? -0.20 : 0.0
+            w_trap    := useLiqTrap and liqTrapBear ? 0.90 : 0.0
+            w_vac     := vacEnable ? (vacAlignBear ? 0.55 : vacAntiBear ? -0.45 : 0.0) : 0.0
+
+        float rawLogOdds  = priorLogOdds + w_loc + w_vwap + w_press + w_reg + w_htf + w_sess + w_iceberg + w_vpin + w_dxy + w_queue + w_shock + w_vwapDiv + w_volDiv + w_vix + w_asian + w_decay + w_retest + w_trap + w_vac
+        float postLogOdds = priorLogOdds + (rawLogOdds - priorLogOdds) * indepScale
+        float winProb     = 1.0 / (1.0 + math.exp(-postLogOdds))
+        winProb * 100.0
+
+float longWinProb  = minHistOk ? f_calcBayesianScore(true)  : 50.0
+float shortWinProb = minHistOk ? f_calcBayesianScore(false) : 50.0
+
+// Signal Spacing Cooldown Tracker
+var int lastAplusBullBar = -999
+var int lastAplusBearBar = -999
+
+bool cooldownBullOk = (bar_index - lastAplusBullBar) >= signalCooldown
+bool cooldownBearOk = (bar_index - lastAplusBearBar) >= signalCooldown
+
+// Execution Quality Score (EQS) — Meta-Probability Adjuster
+float eqs = 1.0
+if useEqs
+    eqs := eqs * (activeKillzone ? 1.0  : 0.88)
+    eqs := eqs * (shockGuardHard ? 0.65 : shockGuardSoft ? 0.88 : 1.0)
+    eqs := eqs * (toxicFlow ? 0.75 : 1.0)
+    eqs := eqs * (lowerTfDataOk ? 1.0  : 0.92)
+    eqs := eqs * (isAccumulating ? 1.12 : 1.0)
+
+float adjLongProb  = useEqs ? math.min(longWinProb  * eqs, 99.0) : longWinProb
+float adjShortProb = useEqs ? math.min(shortWinProb * eqs, 99.0) : shortWinProb
+
+// Dynamic A+ Threshold (vol/session/risk adaptive)
+float volRegime = ta.stdev(close, 20) / math.max(ta.sma(ta.stdev(close, 20), 100), 0.0001)
+float dynamicMinProb = minAplusWinProb
+if useDynamicThreshold
+    dynamicMinProb := minAplusWinProb + (inFixKz ? -3.0 : 0.0) + (volRegime > 1.3 ? -4.0 : volRegime < 0.7 ? 3.0 : 0.0) + (riskOff ? -2.0 : 0.0)
+dynamicMinProb := math.max(math.min(dynamicMinProb, 80.0), 50.0)
+
+// 3-Tier Signal Classification
+bool volGate = volZ > 0.0
+bool longNoConflict  = adjShortProb < 55.0
+bool shortNoConflict = adjLongProb  < 55.0
+
+bool aPlusBullRaw = minHistOk and barConfirmed and hasBullSetup and (adjLongProb  >= dynamicMinProb) and activeKillzone and not shockGuardHard and volGate and longNoConflict
+bool aPlusBearRaw = minHistOk and barConfirmed and hasBearSetup and (adjShortProb >= dynamicMinProb) and activeKillzone and not shockGuardHard and volGate and shortNoConflict
+
+// Retest gate: A+ requires retest unless it is a CHoCH or liqTrap
+bool aPlusBull = aPlusBullRaw and cooldownBullOk and (not useRetestMode or bullRetest or liqTrapBull or chochBull)
+bool aPlusBear = aPlusBearRaw and cooldownBearOk and (not useRetestMode or bearRetest or liqTrapBear or chochBear)
+
+if aPlusBull
+    lastAplusBullBar := bar_index
+if aPlusBear
+    lastAplusBearBar := bar_index
+
+// Tier 2: Structural Signals (v7.4 configurable)
+bool structBull = minHistOk and barConfirmed and hasBullSetup and (adjLongProb  >= 50.0 and adjLongProb  < dynamicMinProb) and not shockGuardHard
+bool structBear = minHistOk and barConfirmed and hasBearSetup and (adjShortProb >= 50.0 and adjShortProb < dynamicMinProb) and not shockGuardHard
+
+bool trapBull   = minHistOk and barConfirmed and hasBullSetup and (adjLongProb  < 50.0)
+bool trapBear   = minHistOk and barConfirmed and hasBearSetup and (adjShortProb < 50.0)
+
+// ════════════════════════════════════════════════════════════════
+// 6. INSTITUTIONAL EXECUTION FEATURES (FVG Boxes & Performance)
+// ════════════════════════════════════════════════════════════════
+
+// FVG Zone Renderer & Mitigation Tracker
+var box[] activeFvgBoxes = array.new_box()
+
+if showFvgBoxes and barConfirmed and (fvgBull or fvgBear)
+    color boxCol = fvgBull ? color.new(u_bull, 85) : color.new(u_bear, 85)
+    color borderCol = fvgBull ? u_bull : u_bear
+    float topVal = fvgBull ? fvgTopBull : fvgTopBear
+    float botVal = fvgBull ? fvgBotBull : fvgBotBear
+    box b = box.new(left=bar_index - 2, top=topVal, right=bar_index + 20, bottom=botVal, bgcolor=boxCol, border_color=borderCol, border_style=line.style_dotted, force_overlay=true)
+    array.push(activeFvgBoxes, b)
+    if array.size(activeFvgBoxes) > maxFvgBoxes
+        box oldB = array.shift(activeFvgBoxes)
+        box.delete(oldB)
+
+// Mitigation Check
+if array.size(activeFvgBoxes) > 0
+    for i = array.size(activeFvgBoxes) - 1 to 0
+        box b = array.get(activeFvgBoxes, i)
+        float top = box.get_top(b)
+        float bot = box.get_bottom(b)
+        if high >= bot and low <= top
+            box.set_bgcolor(b, color.new(color.gray, 95))
+            box.set_border_color(b, color.new(color.gray, 80))
+
+// Performance Tracker (Wilson CI)
+type AplusTrade
+    float entry
+    float tp
+    float sl
+    float risk
+    int   openedBar
+    bool  isBull
+
+var array<AplusTrade> aplusOpen = array.new<AplusTrade>()
+var int   totalAplusSignals = 0
+var int   resolvedAplus     = 0
+var int   winAplusSignals   = 0
+var int   timeoutAplus      = 0
+var float aplusSumR         = 0.0
+
+if trackPerformance and (aPlusBull or aPlusBear)
+    totalAplusSignals += 1
+    bool sigIsBull = aPlusBull
+    float sigStopUnit = useSessionStops ? sessionVol : atr14
+    float sigRisk  = (useSessionStops ? sessionSlMult  : 1.5) * sigStopUnit
+    float sigTp    = (useSessionStops ? sessionTp1Mult : 2.0) * sigStopUnit
+    array.push(aplusOpen, AplusTrade.new(
+         close,
+         sigIsBull ? close + sigTp   : close - sigTp,
+         sigIsBull ? close - sigRisk : close + sigRisk,
+         sigRisk,
+         bar_index,
+         sigIsBull))
+
+if trackPerformance and array.size(aplusOpen) > 0
+    for i = array.size(aplusOpen) - 1 to 0
+        AplusTrade t = array.get(aplusOpen, i)
+        if bar_index <= t.openedBar
+            continue
+        bool slHit = t.isBull ? (low <= t.sl) : (high >= t.sl)
+        bool tpHit = t.isBull ? (high >= t.tp) : (low <= t.tp)
+        if slHit
+            resolvedAplus += 1
+            aplusSumR     += -1.0
+            array.remove(aplusOpen, i)
+        else if tpHit
+            resolvedAplus   += 1
+            winAplusSignals += 1
+            aplusSumR       += (t.isBull ? t.tp - t.entry : t.entry - t.tp) / t.risk
+            array.remove(aplusOpen, i)
+        else if bar_index >= t.openedBar + aplusHorizon
+            float pnl = t.isBull ? close - t.entry : t.entry - close
+            float timeoutR = pnl / t.risk
+            timeoutAplus += 1
+            resolvedAplus += 1
+            if timeoutR > 0
+                winAplusSignals += 1
+            aplusSumR += timeoutR
+            array.remove(aplusOpen, i)
+
+[wilsonLo, wilsonHi] = f_lgWilson(float(winAplusSignals), float(resolvedAplus))
+float aplusExpectancyR = resolvedAplus > 0 ? aplusSumR / float(resolvedAplus) : na
+float beSlMult = useSessionStops ? sessionSlMult  : 1.5
+float beTpMult = useSessionStops ? sessionTp1Mult : 2.0
+float aplusBreakeven = beSlMult / (beSlMult + beTpMult) * 100.0
+
+// Alert Conditions
+alertcondition(aPlusBull, title="A+ Long Signal", message="OSC-VIP v7.4: A+ Long Signal on {{ticker}} ({{interval}})")
+alertcondition(aPlusBear, title="A+ Short Signal", message="OSC-VIP v7.4: A+ Short Signal on {{ticker}} ({{interval}})")
+alertcondition(structBull, title="Structural Long Signal", message="OSC-VIP v7.4: Structural Long Signal on {{ticker}} ({{interval}})")
+alertcondition(structBear, title="Structural Short Signal", message="OSC-VIP v7.4: Structural Short Signal on {{ticker}} ({{interval}})")
+alertcondition(shockGuardActive and not shockGuardActive[1], title="Shock Guard Activated", message="OSC-VIP v7.4: Extreme Volatility Shock Guard Activated on {{ticker}}")
+alertcondition(trapBull or trapBear, title="Trap Warning", message="OSC-VIP v7.4: Trap Risk Warning Detected on {{ticker}}")
+alertcondition(toxicFlow, title="Toxic Flow (Imbalance Proxy)", message="OSC-VIP v7.4: Lower-TF volume-imbalance proxy exceeded threshold on {{ticker}} ({{interval}})")
+// Liquidity Vacuum confluence alerts (confirmed-bar only, no repaint)
+alertcondition(vacAlignBull, title="Vacuum Bull Confluence", message="OSC-VIP v7.4: Bullish structure firing INTO downside vacuum magnet on {{ticker}} ({{interval}})")
+alertcondition(vacAlignBear, title="Vacuum Bear Confluence", message="OSC-VIP v7.4: Bearish structure firing INTO upside vacuum magnet on {{ticker}} ({{interval}})")
+
+// ════════════════════════════════════════════════════════════════
+// 7. VISUAL OVERLAY RENDERING & SIGNALS
+// ════════════════════════════════════════════════════════════════
+// A+ Execution Signals (Panel Triangles & Chart Labels)
+bool showPanelBull = aPlusBull and (signalDisplayMode == "Panel (Triangles)" or signalDisplayMode == "Both")
+bool showPanelBear = aPlusBear and (signalDisplayMode == "Panel (Triangles)" or signalDisplayMode == "Both")
+bool showChartBull = aPlusBull and (signalDisplayMode == "Main Chart (Labels)" or signalDisplayMode == "Both")
+bool showChartBear = aPlusBear and (signalDisplayMode == "Main Chart (Labels)" or signalDisplayMode == "Both")
+
+plotshape(showPanelBull, title="A+ Long (Panel Triangle)",  style=shape.triangleup,   location=location.bottom, color=color.new(u_bull, 0), size=size.tiny, force_overlay=false)
+plotshape(showPanelBear, title="A+ Short (Panel Triangle)", style=shape.triangledown, location=location.top,    color=color.new(u_bear, 0), size=size.tiny, force_overlay=false)
+
+// Tier 2 Structural Signals (Panel Diamonds & Chart Diamonds)
+bool showPanelStructBull = structBull and (structDisplayMode == "Panel (Diamonds)" or structDisplayMode == "Both")
+bool showPanelStructBear = structBear and (structDisplayMode == "Panel (Diamonds)" or structDisplayMode == "Both")
+bool showChartStructBull = structBull and (structDisplayMode == "Main Chart (Diamonds)" or structDisplayMode == "Both")
+bool showChartStructBear = structBear and (structDisplayMode == "Main Chart (Diamonds)" or structDisplayMode == "Both")
+
+plotshape(showPanelStructBull, title="Structural Long (Panel Diamond)",  style=shape.diamond, location=location.bottom, color=color.new(u_bull, 40), size=size.tiny, force_overlay=false)
+plotshape(showPanelStructBear, title="Structural Short (Panel Diamond)", style=shape.diamond, location=location.top,    color=color.new(u_bear, 40), size=size.tiny, force_overlay=false)
+
+float bullSignalY = low  - atr14 * aPlusOffsetATR
+float bearSignalY = high + atr14 * aPlusOffsetATR
+
+if showChartBull
+    label.new(x=bar_index, y=bullSignalY, text="▲ A+ " + str.tostring(adjLongProb, "#.#") + "%", yloc=yloc.price, color=color.new(u_bull, 15), textcolor=color.white, style=label.style_label_up, size=size.small, force_overlay=true)
+
+if showChartBear
+    label.new(x=bar_index, y=bearSignalY, text="▼ A+ " + str.tostring(adjShortProb, "#.#") + "%", yloc=yloc.price, color=color.new(u_bear, 15), textcolor=color.white, style=label.style_label_down, size=size.small, force_overlay=true)
+
+if showChartStructBull
+    label.new(x=bar_index, y=bullSignalY, text="◇ " + str.tostring(adjLongProb, "#.#") + "%", yloc=yloc.price, color=color.new(color.white, 100), textcolor=color.new(u_bull, 20), style=label.style_none, size=size.tiny, force_overlay=true)
+
+if showChartStructBear
+    label.new(x=bar_index, y=bearSignalY, text="◇ " + str.tostring(adjShortProb, "#.#") + "%", yloc=yloc.price, color=color.new(color.white, 100), textcolor=color.new(u_bear, 20), style=label.style_none, size=size.tiny, force_overlay=true)
+
+// Trap Warnings (Rendered as overlay labels to keep plot count within 64 limit)
+if trapBull
+    label.new(x=bar_index, y=low, yloc=yloc.belowbar, text="✖", color=color.new(color.white, 100), textcolor=u_neut, style=label.style_none, size=size.tiny, force_overlay=true)
+if trapBear
+    label.new(x=bar_index, y=high, yloc=yloc.abovebar, text="✖", color=color.new(color.white, 100), textcolor=u_neut, style=label.style_none, size=size.tiny, force_overlay=true)
+
+// Liquidity Trap Reversal Labels
+if useLiqTrap and liqTrapBull and barConfirmed
+    label.new(x=bar_index, y=low, yloc=yloc.belowbar, text="TRAP↑", color=color.new(#00FF88, 0), textcolor=color.black, style=label.style_label_up, size=size.tiny, force_overlay=true)
+if useLiqTrap and liqTrapBear and barConfirmed
+    label.new(x=bar_index, y=high, yloc=yloc.abovebar, text="TRAP↓", color=color.new(#FF0055, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny, force_overlay=true)
+
+// Background Shading (Clean Emergency & Retest Handling)
+bgcolor(showShockBg and shockGuardActive ? color.new(u_bear, 88) : na, title="Shock Guard Alert Background")
+color retestBgCol = useRetestMode ? (bullRetest ? color.new(u_bull, 92) : bearRetest ? color.new(u_bear, 92) : na) : na
+bgcolor(retestBgCol, title="Retest Zone Background")
+
+// LTF Data Warning Label
+var label ltfWarningLabel = na
+if barstate.islast
+    if not ltfVolumeValid
+        if na(ltfWarningLabel)
+            ltfWarningLabel := label.new(bar_index, close, "⚠️ NO LTF DATA\nImbalance/CVD proxies disabled",
+                style=label.style_label_left, color=color.new(color.orange, 20),
+                textcolor=color.white, size=size.small, force_overlay=true)
+        else
+            label.set_xy(ltfWarningLabel, bar_index, close)
+    else if not na(ltfWarningLabel)
+        label.delete(ltfWarningLabel)
+        ltfWarningLabel := na
+
+// ════════════════════════════════════════════════════════════════
+// 7b. LUXALGO-STYLE VOLUME DELTA CANDLE & CONVICTION ENGINE
+// ════════════════════════════════════════════════════════════════
+// Smart Money Conviction Footprints
+float cBody     = math.abs(close - open)
+float uWick     = high - math.max(open, close)
+float lWick     = math.min(open, close) - low
+bool  bullWickRejection = lWick > (cBody * 0.7)
+bool  bearWickRejection = uWick > (cBody * 0.7)
+
+float bodyAvg   = ta.sma(cBody, 20)
+bool  bigBody   = cBody > bodyAvg * 1.5
+float closeLoc  = candleRng > 0 ? (close - (high + low) / 2.0) / (candleRng / 2.0) : 0.0
+
+bool  bullEngulf = bigBody and close > open and close >= high[1] and open <= close[1] and close > close[1]
+bool  bearEngulf = bigBody and close < open and close <= low[1]  and open >= close[1] and close < close[1]
+
+bool  absBullFoot = isAbsorption and (closeLoc > 0.25 or bullWickRejection) and ofpSlope >= 0
+bool  absBearFoot = isAbsorption and (closeLoc < -0.25 or bearWickRejection) and ofpSlope <= 0
+
+bool  isConvictionBar = aPlusBull or aPlusBear or absBullFoot or (bullEngulf and closeLoc > 0) or absBearFoot or (bearEngulf and closeLoc < 0) or isCompressionDefend or isIcebergAccumulation
+
+// Volume Delta Candle UDT & Execution
+type VdcBin
+    varip float p
+    varip float v
+
+varip float  vdcVolBl = na
+varip float  vdcVolBr = na
+varip VdcBin vdcMaxBl = VdcBin.new(na, 0)
+varip VdcBin vdcMaxBr = VdcBin.new(na, 0)
+varip float  vdcVl    = na
+varip float  vdcCl    = na
+varip float  vdcDfP   = na
+varip float  vdcDfV   = na
+varip bool   vdcTicksAvailable = false
+
+var table vdcTab = na
+
+color VDC_INV = color.new(na, na)
+color VDC_CFG = chart.fg_color
+bool isVdcTick = vdcTick == 'Ticks'
+bool isVdcLTF  = vdcTick == 'LTF'
+
+// Ticks Execution
+if isVdcTick
+    if barstate.isnew
+        vdcMaxBl.v := 0, vdcMaxBr.v := 0
+        vdcCl      := open,   vdcDfP := 0
+        vdcVl      := volume, vdcDfV := 0
+        vdcVolBl   := 0, vdcVolBr := 0
+    else
+        vdcDfP := close  - vdcCl
+        vdcDfV := volume - vdcVl
+        switch
+            vdcDfP > 0 =>
+                vdcVolBl += vdcDfV
+                if vdcDfV > vdcMaxBl.v
+                    vdcMaxBl.v := vdcDfV, vdcMaxBl.p := close
+            vdcDfP < 0 =>
+                vdcVolBr += vdcDfV
+                if vdcDfV > vdcMaxBr.v
+                    vdcMaxBr.v := vdcDfV, vdcMaxBr.p := close
+        vdcCl := close
+        vdcVl := volume
+
+// LTF Execution
+tfS_vdc  = timeframe.in_seconds(vdcRes)
+tfC_vdc  = timeframe.in_seconds(timeframe.period)
+rs_vdc   = vdcAuto ? tfC_vdc / vdcMlt : tfS_vdc
+rs_vdc  := vdcPrem ? rs_vdc : math.max(60, rs_vdc)
+calcVdcRes = timeframe.from_seconds(math.min(tfC_vdc, rs_vdc))
+
+[bV_vdc, sV_vdc, _, tV_vdc, aCl_vdc] = request.security_lower_tf(
+  syminfo.tickerid, calcVdcRes,
+  [  close >  open ? volume : 0
+   , close <  open ? volume : 0
+   , close == open ? volume : 0
+   , volume
+   , close
+  ])
+
+// Volume Delta Candle Rendering for Solid Conviction
+bool isVdcActive = enableBarColoring and (barColorMode == "Solid Conviction (Volume Delta)") and (vdcScope == "All Bars (When Mode Active)" or isConvictionBar)
+
+float vdcMaxV = na
+float vdcBVmax = na
+float vdcSVmax = na
+
+if isVdcLTF and isVdcActive
+    vdcBVmax := bV_vdc.max()
+    vdcSVmax := sV_vdc.max()
+    indices_vdc = (vdcBVmax > vdcSVmax ? bV_vdc : sV_vdc).sort_indices(order.descending)
+    vdcMaxV := indices_vdc.size() > 0 ? aCl_vdc.get(indices_vdc.first()) : na
+else if isVdcTick and isVdcActive
+    if vdcMaxBl.v != 0 or vdcMaxBr.v != 0
+        vdcMaxV := vdcMaxBl.v > vdcMaxBr.v ? vdcMaxBl.p : vdcMaxBr.p
+
+if not vdcTicksAvailable and vdcVolBl > 0
+    vdcTicksAvailable := true
+
+bool vdcIsAllowed = isVdcTick ? vdcTicksAvailable : tV_vdc.size() > 0
+
+float ltf_Vup_vdc = bV_vdc.sum()
+float ltf_Vdn_vdc = sV_vdc.sum()
+
+float vdcBullV = isVdcTick ? vdcVolBl : ltf_Vup_vdc
+float vdcBearV = isVdcTick ? vdcVolBr : ltf_Vdn_vdc
+
+float vdcAbsRange = math.abs(open  - close)
+float vdcMinOC    = math.min(open  , close)
+float vdcMaxOC    = math.max(open  , close)
+float vdcAvgOC    = math.avg(open  , close)
+float vdcVolTotal = vdcBullV + vdcBearV
+float vdcDelta    = vdcBullV - vdcBearV
+
+float vdcNorm  = volume != 0 ? vdcDelta / volume : 0.0
+float vdcANorm = math.abs(vdcNorm)
+bool  vdcPos   = vdcNorm >= 0
+
+float vdcBase  = na
+float vdcValue = na
+vdcValue := vdcOption == 'half bar' ? vdcAvgOC + vdcNorm * vdcAbsRange / 2.0 : vdcPos ? vdcMinOC + vdcANorm * vdcAbsRange : vdcMaxOC - vdcANorm * vdcAbsRange
+vdcBase  := vdcOption == 'half bar' ? vdcAvgOC                               : vdcPos ? vdcMinOC                          : vdcMaxOC
+
+color vdcCss  = close > open ? vdcColUp : close < open ? vdcColDn : VDC_CFG
+color vdcCssD = color.new(vdcNorm > 0 ? (close > open ? vdcColUp : vdcColDn_) : (close < open ? vdcColDn : vdcColUp_), 50)
+
+plotcandle(isVdcActive ? open : na, isVdcActive ? high : na, isVdcActive ? low : na, isVdcActive ? close : na, color = chart.bg_color, wickcolor = vdcCss, bordercolor = vdcCss, force_overlay = true, display = display.all - display.status_line)
+plotcandle(isVdcActive ? vdcBase : na, isVdcActive ? vdcBase : na, isVdcActive ? vdcValue : na, isVdcActive ? vdcValue : na, color = vdcCssD, wickcolor = na, bordercolor = na, force_overlay = true, display = display.all - display.status_line)
+// Candle VPOC (Point of Control) Full-Width Horizontal Bar
+plotcandle(isVdcActive and vdcShowVpoc ? vdcMaxV : na, isVdcActive and vdcShowVpoc ? vdcMaxV : na, isVdcActive and vdcShowVpoc ? vdcMaxV : na, isVdcActive and vdcShowVpoc ? vdcMaxV : na, color = vdcVpocCol, wickcolor = vdcVpocCol, bordercolor = vdcVpocCol, force_overlay = true, display = display.all - display.status_line)
+
+// Previous Max Volume Price (VPOC) Dot
+var label vdcDotLabel = na
+if isVdcActive and vdcDot and not na(vdcMaxV[1])
+    if barstate.isnew
+        vdcDotLabel := label.new(bar_index, vdcMaxV[1], text = "●", color = color.new(color.white, 100), textcolor = vdcDotCol, style = label.style_none, size = vdcDotSize, force_overlay = true)
+    else if not na(vdcDotLabel)
+        label.set_xy(vdcDotLabel, bar_index, vdcMaxV[1])
+        label.set_textcolor(vdcDotLabel, vdcDotCol)
+        label.set_size(vdcDotLabel, vdcDotSize)
+
+// Bar Coloring Resolution
+color nativeBarCol = na
+
+if enableBarColoring
+    if isVdcActive
+        nativeBarCol := chart.bg_color
+    else if barColorMode == "Smart Money Opacity Fade"
+        float activeProb = math.max(longWinProb, shortWinProb)
+        if activeProb >= barColorMinProb
+            int opacity = activeProb >= minAplusWinProb ? 0 : activeProb >= 55.0 ? 25 : 50
+            nativeBarCol := smpi >= 0 ? color.new(u_bull, opacity) : color.new(u_bear, opacity)
+        else
+            nativeBarCol := na
+    else if barColorMode == "Solid Conviction (Classic)"
+        if aPlusBull
+            nativeBarCol := color.new(u_bull, 0)
+        else if aPlusBear
+            nativeBarCol := color.new(u_bear, 0)
+        else if absBullFoot or (bullEngulf and closeLoc > 0)
+            nativeBarCol := color.new(#00FF88, 0)
+        else if absBearFoot or (bearEngulf and closeLoc < 0)
+            nativeBarCol := color.new(#FF0055, 0)
+        else if isCompressionDefend or isIcebergAccumulation
+            nativeBarCol := ofpSlope <= 0 ? color.new(u_bull, 20) : color.new(u_acc, 20)
+        else
+            nativeBarCol := na
+
+barcolor(nativeBarCol, title="Smart Money / Conviction Bar Color")
+
+// Details Info Label
+if vdcIsAllowed and vdcShowD and barConfirmed
+    string vdcVolStr  = str.tostring(vdcVolTotal, format.volume)
+    string vdcDeltStr = str.tostring(vdcDelta,    format.volume)
+    string vdcPercStr = str.tostring(vdcNorm * 100.0, format.percent)
+    label.new(bar_index, high, color = VDC_INV, textcolor = VDC_CFG, size = size.small,
+      text = str.format("Volume: {0}\nDelta: {1}\n%: {2}", vdcVolStr, vdcDeltStr, vdcPercStr), force_overlay = true)
+
+// Timeframe Table
+if vdcShowTab and isVdcLTF
+    if barstate.isfirst
+        vdcTab := table.new(position.bottom_left, 1, 1, bgcolor = VDC_INV)
+    if barstate.islast
+        table.cell(vdcTab, 0, 0, calcVdcRes, text_color = vdcTabCol, text_size = vdcSizeT)
+
+// ════════════════════════════════════════════════════════════════
+// 8. SUB-PANE OSCILLATOR PLOTS
+// ════════════════════════════════════════════════════════════════
+// Zero Midline Baseline
+p_zero = plot(0.0, "Zero Baseline", color=color.new(u_neut, 60), linewidth=1, style=plot.style_line)
+
+// Net Conviction Area (Optional)
+float netConvHist = (longWinProb - shortWinProb) / 100.0
+color netConvCol  = netConvHist >= 0 ? color.new(u_bull, 80) : color.new(u_bear, 80)
+plot(showConvHist ? netConvHist : na, "Net Conviction Area", color=netConvCol, style=plot.style_area, linewidth=1)
+
+// OFP Slope Z Line (Optional)
+color ofpSlopeCol = ofpSlopeZ > 0 ? color.new(u_bull, 40) : color.new(u_bear, 40)
+plot(showOfpArea ? ofpSlopeZ : na, "OFP Slope Z", color=ofpSlopeCol, linewidth=1)
+
+// VWAP Dev Z-Score Curve & Dynamic Glowing Ribbon
+p_vwap = plot(showVwapHist ? vwapZ : na, "VWAP Dev Z (CF-adj)", style=plot.style_line, color=f_getVwapColor(vwapZ, u_bull, u_bear, u_neut), linewidth=2)
+color vwapRibbonCol = vwapZ >= 0 ? color.new(u_bull, 85) : color.new(u_bear, 85)
+fill(p_vwap, p_zero, color=showVwapHist ? vwapRibbonCol : na, title="VWAP Z Glow Ribbon")
+
+// Pressure Index (SMPI) Columns (Clean & Balanced Opacity)
+color smpiCol = smpi > 0 ? color.new(u_bull, 50) : smpi < 0 ? color.new(u_bear, 50) : color.new(u_neut, 75)
+plot(showSmpi ? smpi : na, "Pressure Index Columns", color=smpiCol, style=plot.style_columns)
+
+// Sigma Standard Deviation Thresholds (±1σ, ±2σ)
+p_p2 = plot(showStdBands ?  2.0 : na, "+2sigma Overbought", color=color.new(u_bull, 60), linewidth=1, style=plot.style_line)
+p_p1 = plot(showStdBands ?  1.0 : na, "+1sigma Upper",      color=color.new(u_bull, 75), linewidth=1, style=plot.style_line)
+p_m1 = plot(showStdBands ? -1.0 : na, "-1sigma Lower",      color=color.new(u_bear, 75), linewidth=1, style=plot.style_line)
+p_m2 = plot(showStdBands ? -2.0 : na, "-2sigma Oversold",   color=color.new(u_bear, 60), linewidth=1, style=plot.style_line)
+
+// Equilibrium Channel (±1σ Shading)
+fill(p_p1, p_m1, color=showStdBands ? color.new(u_neut, 96) : na, title="Equilibrium Zone (±1σ)")
+
+// Killzone Session Micro-Strip on Sub-Pane (Non-intrusive Top Ribbon)
+float kzMarkerY = 3.6
+color kzStripCol = inLondonFixKz ? u_acc : inLondonKz ? u_bull : inNyAmKz ? color.new(#FF9800, 20) : inAsiaKz ? color.new(#AB47BC, 20) : na
+plot(showKzBg and activeKillzone ? kzMarkerY : na, "Killzone Session Strip", color=kzStripCol, style=plot.style_circles, linewidth=2)
+
+// ── Vacuum Magnet: price-projected lines on the MAIN chart (force_overlay) ──────────
+var line vacMagnetLineUp = na
+var line vacMagnetLineDn = na
+var label vacMagnetLblUp = na
+var label vacMagnetLblDn = na
+if vacEnable and vacShowZones and barstate.islast
+    if not na(vacAbovePr)
+        if na(vacMagnetLineUp)
+            vacMagnetLineUp := line.new(bar_index - 5, vacAbovePr, bar_index + 15, vacAbovePr, color=color.new(#FF5252, 0), width=2, style=line.style_dotted, force_overlay=true)
+        else
+            line.set_xy1(vacMagnetLineUp, bar_index - 5, vacAbovePr)
+            line.set_xy2(vacMagnetLineUp, bar_index + 15, vacAbovePr)
+        if na(vacMagnetLblUp)
+            vacMagnetLblUp := label.new(bar_index + 16, vacAbovePr, "🌀 VAC " + str.tostring(vacAbovePr, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(#FF5252, 15), textcolor=color.white, size=size.small, force_overlay=true)
+        else
+            label.set_xy(vacMagnetLblUp, bar_index + 16, vacAbovePr)
+            label.set_text(vacMagnetLblUp, "🌀 VAC " + str.tostring(vacAbovePr, format.mintick) + "  ↑magnet " + str.tostring(vacAboveD / atr14, "#.0") + "ATR")
+    else
+        line.delete(vacMagnetLineUp)
+        label.delete(vacMagnetLblUp)
+        vacMagnetLineUp := na
+        vacMagnetLblUp := na
+    if not na(vacBelowPr)
+        if na(vacMagnetLineDn)
+            vacMagnetLineDn := line.new(bar_index - 5, vacBelowPr, bar_index + 15, vacBelowPr, color=color.new(#00E5FF, 0), width=2, style=line.style_dotted, force_overlay=true)
+        else
+            line.set_xy1(vacMagnetLineDn, bar_index - 5, vacBelowPr)
+            line.set_xy2(vacMagnetLineDn, bar_index + 15, vacBelowPr)
+        if na(vacMagnetLblDn)
+            vacMagnetLblDn := label.new(bar_index + 16, vacBelowPr, "🌀 VAC " + str.tostring(vacBelowPr, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(#00E5FF, 15), textcolor=color.black, size=size.small, force_overlay=true)
+        else
+            label.set_xy(vacMagnetLblDn, bar_index + 16, vacBelowPr)
+            label.set_text(vacMagnetLblDn, "🌀 VAC " + str.tostring(vacBelowPr, format.mintick) + "  ↓magnet " + str.tostring(vacBelowD / atr14, "#.0") + "ATR")
+    else
+        line.delete(vacMagnetLineDn)
+        label.delete(vacMagnetLblDn)
+        vacMagnetLineDn := na
+        vacMagnetLblDn := na
+
+// ── Hopla 3-97 Lines: price-projected on MAIN chart (force_overlay) ────────────────
+var line  hoplaLine97     = na
+var line  hoplaLine3      = na
+var label hoplaLabel97    = na
+var label hoplaLabel3     = na
+var line  hoplaLine97Abv  = na
+var line  hoplaLine3Bel   = na
+var label hoplaLabel97Abv = na
+var label hoplaLabel3Bel  = na
+
+if hoplaEnable and barstate.islast
+    // Current Dealing Box 97% Line
+    if na(hoplaLine97)
+        hoplaLine97 := line.new(bar_index - 8, hopla97Price, bar_index + 16, hopla97Price, color=color.new(hoplaCol97, 20), width=1, style=line.style_dashed, force_overlay=true)
+    else
+        line.set_xy1(hoplaLine97, bar_index - 8, hopla97Price)
+        line.set_xy2(hoplaLine97, bar_index + 16, hopla97Price)
+    if hoplaShowLabels
+        string tag97 = "97% Prem " + str.tostring(hopla97Price, format.mintick) + (hoplaVacShortAlign ? " 🌀VAC↓" : "")
+        if na(hoplaLabel97)
+            hoplaLabel97 := label.new(bar_index + 17, hopla97Price, tag97, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(hoplaCol97, 20), textcolor=color.white, size=size.tiny, force_overlay=true)
+        else
+            label.set_xy(hoplaLabel97, bar_index + 17, hopla97Price)
+            label.set_text(hoplaLabel97, tag97)
+    
+    // Current Dealing Box 3% Line
+    if na(hoplaLine3)
+        hoplaLine3 := line.new(bar_index - 8, hopla3Price, bar_index + 16, hopla3Price, color=color.new(hoplaCol3, 20), width=1, style=line.style_dashed, force_overlay=true)
+    else
+        line.set_xy1(hoplaLine3, bar_index - 8, hopla3Price)
+        line.set_xy2(hoplaLine3, bar_index + 16, hopla3Price)
+    if hoplaShowLabels
+        string tag3 = "3% Disc " + str.tostring(hopla3Price, format.mintick) + (hoplaVacLongAlign ? " 🌀VAC↑" : "")
+        if na(hoplaLabel3)
+            hoplaLabel3 := label.new(bar_index + 17, hopla3Price, tag3, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(hoplaCol3, 20), textcolor=color.white, size=size.tiny, force_overlay=true)
+        else
+            label.set_xy(hoplaLabel3, bar_index + 17, hopla3Price)
+            label.set_text(hoplaLabel3, tag3)
+
+    // Optional adjacent boxes (1 Above and 1 Below)
+    if hoplaBoxesShow >= 1
+        float hopla97AbvPrice = rHigh + 0.97 * hSize
+        float hopla3BelPrice  = (rLow - hSize) + 0.03 * hSize
+        if na(hoplaLine97Abv)
+            hoplaLine97Abv := line.new(bar_index - 8, hopla97AbvPrice, bar_index + 16, hopla97AbvPrice, color=color.new(hoplaCol97, 55), width=1, style=line.style_dotted, force_overlay=true)
+        else
+            line.set_xy1(hoplaLine97Abv, bar_index - 8, hopla97AbvPrice)
+            line.set_xy2(hoplaLine97Abv, bar_index + 16, hopla97AbvPrice)
+        if na(hoplaLine3Bel)
+            hoplaLine3Bel := line.new(bar_index - 8, hopla3BelPrice, bar_index + 16, hopla3BelPrice, color=color.new(hoplaCol3, 55), width=1, style=line.style_dotted, force_overlay=true)
+        else
+            line.set_xy1(hoplaLine3Bel, bar_index - 8, hopla3BelPrice)
+            line.set_xy2(hoplaLine3Bel, bar_index + 16, hopla3BelPrice)
+        if hoplaShowLabels
+            if na(hoplaLabel97Abv)
+                hoplaLabel97Abv := label.new(bar_index + 17, hopla97AbvPrice, "97% Prem+1 " + str.tostring(hopla97AbvPrice, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(hoplaCol97, 55), textcolor=color.white, size=size.tiny, force_overlay=true)
+            else
+                label.set_xy(hoplaLabel97Abv, bar_index + 17, hopla97AbvPrice)
+                label.set_text(hoplaLabel97Abv, "97% Prem+1 " + str.tostring(hopla97AbvPrice, format.mintick))
+            if na(hoplaLabel3Bel)
+                hoplaLabel3Bel := label.new(bar_index + 17, hopla3BelPrice, "3% Disc-1 " + str.tostring(hopla3BelPrice, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(hoplaCol3, 55), textcolor=color.white, size=size.tiny, force_overlay=true)
+            else
+                label.set_xy(hoplaLabel3Bel, bar_index + 17, hopla3BelPrice)
+                label.set_text(hoplaLabel3Bel, "3% Disc-1 " + str.tostring(hopla3BelPrice, format.mintick))
+else if not hoplaEnable and barstate.islast
+    line.delete(hoplaLine97)
+    line.delete(hoplaLine3)
+    label.delete(hoplaLabel97)
+    label.delete(hoplaLabel3)
+    line.delete(hoplaLine97Abv)
+    line.delete(hoplaLine3Bel)
+    label.delete(hoplaLabel97Abv)
+    label.delete(hoplaLabel3Bel)
+    hoplaLine97     := na
+    hoplaLine3      := na
+    hoplaLabel97    := na
+    hoplaLabel3     := na
+    hoplaLine97Abv  := na
+    hoplaLine3Bel   := na
+    hoplaLabel97Abv := na
+    hoplaLabel3Bel  := na
+
+// ── Sub-pane vacuum band: +1 price sucked toward a HIGH-side void, -1 toward LOW-side ─
+float vacBand = vacMagnetUp ? math.min(vacAboveStr, 3.0) : vacMagnetDown ? -math.min(vacBelowStr, 3.0) : 0.0
+color vacBandCol = vacBand > 0 ? color.new(#FF5252, 55) : vacBand < 0 ? color.new(#00E5FF, 55) : color.new(u_neut, 85)
+plot(vacEnable and vacShowOsc ? vacBand : na, "Vacuum Magnet Pull (+up/-down)", color=vacBandCol, style=plot.style_histogram, linewidth=2, histbase=0.0)
+
+// ════════════════════════════════════════════════════════════════
+// 9. EMBEDDED BAYESIAN HUD DASHBOARD TABLE
+// ════════════════════════════════════════════════════════════════
+var table hud = table.new(
+     position = hudPosition == "Top Right" ? position.top_right : hudPosition == "Top Left" ? position.top_left : hudPosition == "Bottom Right" ? position.bottom_right : position.bottom_left,
+     columns = 2, rows = 32, bgcolor = color.new(u_card, 15), border_width = 1, border_color = color.new(u_neut, 70))
+
+if showBayesHud and barstate.islast
+    string textSize = hudSize == "Small" ? size.small : hudSize == "Large" ? size.large : size.normal
+    
+    int hudRow = 0
+    
+    // Header
+    color headBg = color.new(#1F2937, 10)
+    table.cell(hud, 0, hudRow, "OSC-VIP v7.4 INSTITUTIONAL", bgcolor=headBg, text_color=u_acc, text_size=textSize)
+    string statText = shockGuardActive ? "⚡ SHOCK ACTIVE" : activeKillzone ? "● LIVE KZ" : "○ OFF-SESSION"
+    color  statCol  = shockGuardActive ? u_bear : activeKillzone ? u_bull : u_neut
+    table.cell(hud, 1, hudRow, statText, bgcolor=headBg, text_color=statCol, text_size=textSize)
+    hudRow += 1
+    
+    // Signal Direction / Conviction Bias Row
+    string biasText = longWinProb >= minAplusWinProb ? "▲ A+ BULLISH" : shortWinProb >= minAplusWinProb ? "▼ A+ BEARISH" : longWinProb >= 55.0 ? "▲ BULLISH BIAS" : shortWinProb >= 55.0 ? "▼ BEARISH BIAS" : "■ NEUTRAL"
+    color biasCol   = longWinProb >= 55.0 ? u_bull : shortWinProb >= 55.0 ? u_bear : u_neut
+    table.cell(hud, 0, hudRow, "Signal Direction", text_color=color.white, text_size=textSize)
+    table.cell(hud, 1, hudRow, biasText, text_color=biasCol, text_size=textSize)
+    hudRow += 1
+
+    if hudMode == "Small"
+        // COMPACT / SMALL MODE: Sleek Spark-Meter Scores for Buy and Sell
+        color longCol = longWinProb >= minAplusWinProb ? u_bull : longWinProb >= 50.0 ? u_acc : color.white
+        table.cell(hud, 0, hudRow, "Long Score", text_color=color.white, text_size=textSize)
+        table.cell(hud, 1, hudRow, f_meter(longWinProb, 0, 100, 6) + " " + str.tostring(longWinProb, "#.#") + "%", text_color=longCol, text_size=textSize)
+        hudRow += 1
+
+        color shortCol = shortWinProb >= minAplusWinProb ? u_bear : shortWinProb >= 50.0 ? u_acc : color.white
+        table.cell(hud, 0, hudRow, "Short Score", text_color=color.white, text_size=textSize)
+        table.cell(hud, 1, hudRow, f_meter(shortWinProb, 0, 100, 6) + " " + str.tostring(shortWinProb, "#.#") + "%", text_color=shortCol, text_size=textSize)
+        hudRow += 1
+        
+        // Market State Row
+        string stateText = (trendingRegime ? "TREND" : rangingRegime ? "RANGE" : "BALANCED") + " (ER " + str.tostring(erVal, "#.##") + ")"
+        color stateCol   = trendingRegime ? u_bull : rangingRegime ? u_acc : u_neut
+        table.cell(hud, 0, hudRow, "Regime", text_color=color.white, text_size=textSize)
+        table.cell(hud, 1, hudRow, stateText, text_color=stateCol, text_size=textSize)
+        hudRow += 1
+    else
+        // NORMAL & LARGE MODES
+        float activeProb = math.max(longWinProb, shortWinProb)
+        string probText  = f_meter(activeProb, 0, 100, 8) + " " + str.tostring(activeProb, "#.#") + "%"
+        color probCol    = activeProb >= minAplusWinProb ? u_bull : activeProb >= 50.0 ? u_acc : u_bear
+        table.cell(hud, 0, hudRow, "Model Score", text_color=color.white, text_size=textSize)
+        table.cell(hud, 1, hudRow, probText, text_color=probCol, text_size=textSize)
+        hudRow += 1
+        
+        // Order Flow Pressure (SMPI)
+        string pressText = (smpi > 0 ? "+" : "") + str.tostring(smpi, "#.##") + " (SNR=" + str.tostring(snrProxy, "#.#") + ")"
+        color pressCol   = smpi > 0.5 ? u_bull : smpi < -0.5 ? u_bear : u_neut
+        table.cell(hud, 0, hudRow, "Order Flow Pressure", text_color=color.white, text_size=textSize)
+        table.cell(hud, 1, hudRow, pressText, text_color=pressCol, text_size=textSize)
+        hudRow += 1
+        
+        // Regime State
+        string regText = trendingRegime ? "TRENDING (ER=" + str.tostring(erVal, "#.##") + ")" : rangingRegime ? "MEAN-REV (ER=" + str.tostring(erVal, "#.##") + ")" : "BALANCED"
+        color regCol   = trendingRegime ? u_bull : rangingRegime ? u_acc : u_neut
+        table.cell(hud, 0, hudRow, "Market Regime", text_color=color.white, text_size=textSize)
+        table.cell(hud, 1, hudRow, regText, text_color=regCol, text_size=textSize)
+        hudRow += 1
+
+        // HTF Macro Guard State
+        string htfText = useHtfTrendFilter ? (htfBullTrend ? "4H BULLISH" : "4H BEARISH") : "OFF"
+        color htfCol   = useHtfTrendFilter ? (htfBullTrend ? u_bull : u_bear) : u_neut
+        table.cell(hud, 0, hudRow, "HTF Trend Guard", text_color=color.white, text_size=textSize)
+        table.cell(hud, 1, hudRow, htfText, text_color=htfCol, text_size=textSize)
+        hudRow += 1
+
+        if hoplaEnable
+            string hoplaStatus  = inHoplaDiscount ? "3% DISCOUNT (Rejection Block)" : inHoplaPremium ? "97% PREMIUM (Rejection Block)" : "50% EQUILIBRIUM"
+            color  hoplaStatCol = inHoplaDiscount ? hoplaCol3 : inHoplaPremium ? hoplaCol97 : u_neut
+            string hoplaTag     = (hoplaVacLongAlign ? " 🌀VAC↑" : hoplaVacShortAlign ? " 🌀VAC↓" : "")
+            table.cell(hud, 0, hudRow, "Hopla PO3 (H=" + str.tostring(hoplaRange * hoplaMultiplier) + ")", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, hoplaStatus + hoplaTag, text_color=hoplaStatCol, text_size=textSize)
+            hudRow += 1
+
+        if hudMode == "Large"
+            // VWAP Z-Score
+            string zText = (vwapZ > 0 ? "+" : "") + str.tostring(vwapZ, "#.##") + " σ"
+            color zCol   = math.abs(vwapZ) >= 2.0 ? u_bear : color.white
+            table.cell(hud, 0, hudRow, "VWAP Z-Dev", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, zText, text_color=zCol, text_size=textSize)
+            hudRow += 1
+
+            // Microstructure Realism Rows
+            string vpinText = useVpinFilter ? str.tostring(nz(vpinProxy, 0.0), "#.00") + (toxicFlow ? (toxicBuySide ? " ⚠ BUY-TOX" : " ⚠ SELL-TOX") : lowerTfDataOk ? " OK" : " NO DATA") : "OFF"
+            color vpinCol   = not useVpinFilter ? u_neut : not lowerTfDataOk ? color.orange : toxicFlow ? u_bear : nz(vpinProxy, 0.0) >= vpinToxicThresh - 0.15 ? u_acc : u_bull
+            table.cell(hud, 0, hudRow, "Imbalance Proxy", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, vpinText, text_color=vpinCol, text_size=textSize)
+            hudRow += 1
+
+            string dxyText = not useDxyDecouple ? "OFF" : na(dxyCorr) ? "No Feed" : str.tostring(dxyCorr, "#.00") + (dealerHedgingFlow ? " ⚡ HEDGE" : dxyDecoupled ? " decoupl" : "")
+            color dxyCol   = not useDxyDecouple ? u_neut : na(dxyCorr) ? u_neut : dealerHedgingFlow ? u_acc : dxyDecoupled ? u_bull : color.white
+            table.cell(hud, 0, hudRow, "DXY Corr / Hedge", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, dxyText, text_color=dxyCol, text_size=textSize)
+            hudRow += 1
+
+            string cvdText = not useQueueDepletion ? "OFF" : cvdDefend ? "DEFENDED" : cvdFade ? "CONSUMED" : "Neutral"
+            color cvdCol   = not useQueueDepletion ? u_neut : cvdDefend ? u_bull : cvdFade ? u_bear : u_neut
+            table.cell(hud, 0, hudRow, "CVD Flow Proxy", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, cvdText, text_color=cvdCol, text_size=textSize)
+            hudRow += 1
+
+            if showIndep
+                color rCol = rBar >= 0.70 ? u_bear : rBar >= 0.40 ? u_acc : u_bull
+                table.cell(hud, 0, hudRow, "Driver Corr r̄", text_color=color.white, text_size=textSize)
+                table.cell(hud, 1, hudRow, str.tostring(rBar, "#.##"), text_color=rCol, text_size=textSize)
+                hudRow += 1
+
+                color nCol = (kActive >= 3 and nEff < 1.5) ? u_bear : nEff >= 2.0 ? u_bull : u_acc
+                string nText = kActive > 0 ? str.tostring(nEff, "#.#") + " votes" : "—"
+                table.cell(hud, 0, hudRow, "≈ Indep Votes (N_eff)", text_color=color.white, text_size=textSize)
+                table.cell(hud, 1, hudRow, nText, text_color=nCol, text_size=textSize)
+                hudRow += 1
+
+            if useLedgerBridge
+                [fvgRate, fvgN] = f_oscCalStats("FVG_Bull")
+                [obRate, obN]   = f_oscCalStats("OB_Bull")
+                int maxN = math.max(fvgN, obN)
+                string bridgeText = maxN >= 15 ? "Calibrated (FVG " + str.tostring(fvgRate, "#.0") + "%)" : "Warmup (n=" + str.tostring(maxN) + ")"
+                color bridgeCol = maxN >= 15 ? u_acc : u_neut
+                table.cell(hud, 0, hudRow, "Calibration Bridge", text_color=color.white, text_size=textSize)
+                table.cell(hud, 1, hudRow, bridgeText, text_color=bridgeCol, text_size=textSize)
+                hudRow += 1
+
+            if trackPerformance
+                float winRate = resolvedAplus > 0 ? (float(winAplusSignals) / float(resolvedAplus)) * 100.0 : 0.0
+                string perfText = resolvedAplus > 0 ? str.tostring(winRate, "#") + "% [" + str.tostring(wilsonLo, "#") + "-" + str.tostring(wilsonHi, "#") + "%] (n=" + str.tostring(resolvedAplus) + ")" : "No closed signals"
+                color perfCol   = resolvedAplus == 0 ? u_neut : winRate >= 50.0 ? u_bull : u_bear
+                table.cell(hud, 0, hudRow, "Positive Exit Rate (95% CI)", text_color=color.white, text_size=textSize)
+                table.cell(hud, 1, hudRow, perfText, text_color=perfCol, text_size=textSize)
+                hudRow += 1
+
+                string expText = na(aplusExpectancyR) ? "—" : str.tostring(aplusExpectancyR, "#.00") + "R (BE " + str.tostring(aplusBreakeven, "#.0") + "%)"
+                color expCol   = na(aplusExpectancyR) ? u_neut : aplusExpectancyR > 0 ? u_bull : u_bear
+                table.cell(hud, 0, hudRow, "Expectancy / Signal", text_color=color.white, text_size=textSize)
+                table.cell(hud, 1, hudRow, expText, text_color=expCol, text_size=textSize)
+                hudRow += 1
+
+            // VIX Risk Regime Row
+            string vixText = not useRiskProxy ? "OFF" : na(vixClose) ? "No Feed" : str.tostring(vixClose, "#.0") + (riskOff ? " ⚠ RISK-OFF" : riskOn ? " ✓ RISK-ON" : " Neutral")
+            color vixCol   = not useRiskProxy ? u_neut : na(vixClose) ? u_neut : riskOff ? u_acc : riskOn ? u_bull : color.white
+            table.cell(hud, 0, hudRow, "VIX Regime", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, vixText, text_color=vixCol, text_size=textSize)
+            hudRow += 1
+
+            // EQS Row
+            string eqsText = useEqs ? str.tostring(eqs, "#.00") + " × " + (eqs >= 1.05 ? "ENHANCED" : eqs >= 0.90 ? "OK" : "DEGRADED") : "OFF"
+            color eqsCol   = not useEqs ? u_neut : eqs >= 1.05 ? u_bull : eqs >= 0.90 ? u_acc : u_bear
+            table.cell(hud, 0, hudRow, "EQS Multiplier", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, eqsText, text_color=eqsCol, text_size=textSize)
+            hudRow += 1
+
+            // Dynamic Threshold Row
+            string thrText = useDynamicThreshold ? str.tostring(dynamicMinProb, "#.0") + "% (dyn)" : str.tostring(minAplusWinProb, "#.0") + "% (fixed)"
+            color thrCol   = dynamicMinProb < minAplusWinProb ? u_acc : dynamicMinProb > minAplusWinProb ? u_bear : color.white
+            table.cell(hud, 0, hudRow, "A+ Threshold", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, thrText, text_color=thrCol, text_size=textSize)
+            hudRow += 1
+
+            // Signal Freshness Row
+            float shownFresh = hasBullSetup ? bullFreshness : hasBearSetup ? bearFreshness : 0.0
+            string freshText = useTemporalDecay ? (hasBullSetup or hasBearSetup ? str.tostring(shownFresh * 100.0, "#") + "% fresh" : "No active setup") : "OFF"
+            color freshCol   = not useTemporalDecay ? u_neut : shownFresh >= 0.75 ? u_bull : shownFresh >= 0.40 ? u_acc : u_bear
+            table.cell(hud, 0, hudRow, "Signal Freshness", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, freshText, text_color=freshCol, text_size=textSize)
+            hudRow += 1
+
+            // LTF Data Health Row
+            string ltfText = lowerTfDataOk ? "LTF Data OK" : ltfDataValid ? "Volume Zero" : "No LTF Feed"
+            color ltfCol   = lowerTfDataOk ? u_bull : color.orange
+            table.cell(hud, 0, hudRow, "LTF Data Health", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, ltfText, text_color=ltfCol, text_size=textSize)
+            hudRow += 1
+
+            // Liquidity Vacuum Magnet Row
+            string vacText = not vacEnable ? "OFF" :
+                 vacMagnetUp   and not na(vacAbovePr) ? "▲ seek " + str.tostring(vacAbovePr, format.mintick) + " (" + str.tostring(vacAboveD / atr14, "#.#") + " ATR)" :
+                 vacMagnetDown and not na(vacBelowPr) ? "▼ seek " + str.tostring(vacBelowPr, format.mintick) + " (" + str.tostring(vacBelowD / atr14, "#.#") + " ATR)" : "No active void"
+            color vacCol = not vacEnable ? u_neut : vacAntiBull or vacAntiBear ? u_bear : vacActive ? u_acc : u_neut
+            table.cell(hud, 0, hudRow, "Vacuum Magnet", text_color=color.white, text_size=textSize)
+            table.cell(hud, 1, hudRow, vacText, text_color=vacCol, text_size=textSize)
+            hudRow += 1
+
+// ════════════════════════════════════════════════════════════════
+// END OF OSC-VIP v7.4 INSTITUTIONAL
+// ════════════════════════════════════════════════════════════════

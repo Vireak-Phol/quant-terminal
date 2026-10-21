@@ -1,0 +1,64 @@
+{
+  "date": "2026-07-26",
+  "market": "FOREX",
+  "symbol": "XAUUSD",
+  "meta": {
+    "as_of": "2026-07-26T14:30:00Z",
+    "source": "TradingView Desktop (CDP)",
+    "generator": "OSC-VIP V6.0",
+    "last_price": 3950.00
+  },
+  "big_money_analysis": {
+    "institutional_flow": {
+      "accumulation_score": 52,
+      "distribution_score": 48,
+      "net_institutional_flow": "neutral",
+      "large_blocks": []
+    },
+    "order_flow_imbalance": {
+      "bid_ask_ratio": 0.98,
+      "delta_volume": -150,
+      "cumulative_delta": "flat",
+      "imbalance_score": 52
+    },
+    "liquidity_clusters": [
+      { "price": 3970.00, "type": "resistance", "strength": "moderate", "volume_nodes": 7500 },
+      { "price": 3940.00, "type": "support", "strength": "moderate", "volume_nodes": 8200 }
+    ],
+    "professional_positioning": {
+      "put_call_ratio": 1.02,
+      "max_pain": 3950.00,
+      "gamma_exposure": 600000000,
+      "dealer_positioning": "neutral"
+    },
+    "smart_money_concepts": {
+      "market_structure": "ranging",
+      "fair_value_gaps": [],
+      "order_blocks": [],
+      "liquidity_sweeps": []
+    },
+    "session_bias": {
+      "overall_bias": "neutral",
+      "confidence": 52,
+      "key_levels": {
+        "resistance_r1": 3970.00,
+        "resistance_r2": 3985.00,
+        "support_s1": 3940.00,
+        "support_s2": 3925.00
+      },
+      "narrative": "Weekend market close."
+    }
+  },
+  "technical_confluence": {
+    "trend": { "short_term": "ranging", "medium_term": "bullish", "long_term": "bullish" },
+    "momentum": { "rsi": 49.0, "macd": "neutral", "stochastic": 48.0 },
+    "volume_analysis": { "volume_trend": "flat", "vwap_position": "at", "volume_profile": "Low volume weekend" },
+    "support_resistance": { "nearest_support": 3940.00, "nearest_resistance": 3970.00 }
+  },
+  "risk_assessment": {
+    "overall_risk": "low",
+    "volatility_regime": "low",
+    "key_risks": ["Weekend gap risk"],
+    "position_sizing": "standard"
+  }
+}

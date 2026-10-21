@@ -1,0 +1,32 @@
+[
+  {
+    "date": "2026-07-29",
+    "symbol": "XAUUSD",
+    "market": "FOREX",
+    "file": "/snapshots/2026-07-29-xauusd.json"
+  },
+  {
+    "date": "2026-07-29",
+    "symbol": "NVDA",
+    "market": "NASDAQ",
+    "file": "/snapshots/2026-07-29-nvda.json"
+  },
+  {
+    "date": "2026-07-28",
+    "symbol": "XAUUSD",
+    "market": "FOREX",
+    "file": "/snapshots/2026-07-28-xauusd.json"
+  },
+  {
+    "date": "2026-07-27",
+    "symbol": "XAUUSD",
+    "market": "FOREX",
+    "file": "/snapshots/2026-07-27-xauusd.json"
+  },
+  {
+    "date": "2026-07-26",
+    "symbol": "XAUUSD",
+    "market": "FOREX",
+    "file": "/snapshots/2026-07-26-xauusd.json"
+  }
+]
