@@ -36,6 +36,7 @@ from market_data.order_book import LocalOrderBook
 from market_data.binance_futures import BinanceFuturesProvider
 from analytics.liquidity_zones import LiquidityZoneDetector, LiquidityZone
 from analytics.absorption_engine import AbsorptionEngine, AbsorptionCandidate
+from analytics.vacuum_engine import VacuumEngine, Candle
 from replay.replay_engine import MarketRecorder, ReplayPlayer
 from engine.live import LiveHub
 from engine.orderflow import OrderflowSnapshot
@@ -70,6 +71,40 @@ absorption_engine = AbsorptionEngine(
     window_duration_ms=4000,
     min_confidence=0.50,
 )
+# Liquidity Vacuum engine (Pine v7.4 port). Candle-based: fed CLOSED bars built
+# from the live mid-price stream. Default bar size = 60s to match a 1m chart.
+VACUUM_BAR_MS = int(os.environ.get("VACUUM_BAR_MS", "60000"))
+vacuum_engine = VacuumEngine()
+
+
+class _CandleAggregator:
+    """Builds fixed-interval OHLC candles from a mid-price stream and emits a
+    callback with each CLOSED bar (so the vacuum engine only sees confirmed data)."""
+
+    def __init__(self, interval_ms: int):
+        self.interval_ms = interval_ms
+        self._bucket: Optional[int] = None
+        self._o = self._h = self._l = self._c = 0.0
+
+    def ingest(self, price: float, ts_ms: int):
+        bucket = (ts_ms // self.interval_ms) * self.interval_ms
+        if self._bucket is None:
+            self._bucket = bucket
+            self._o = self._h = self._l = self._c = price
+            return None
+        if bucket != self._bucket:
+            closed = Candle(t=self._bucket, o=self._o, h=self._h, l=self._l, c=self._c)
+            self._bucket = bucket
+            self._o = self._h = self._l = self._c = price
+            return closed
+        # same bucket -> update current forming bar
+        self._h = max(self._h, price)
+        self._l = min(self._l, price)
+        self._c = price
+        return None
+
+
+candle_agg = _CandleAggregator(VACUUM_BAR_MS)
 recorder = MarketRecorder(output_dir="data/recordings")
 replay_player = ReplayPlayer()
 alerts = AlertDispatcher.from_env()
@@ -149,6 +184,8 @@ terminal_state: Dict[str, Any] = {
     "mark_price": 0.0,
     "funding_rate": 0.0,
     "v6_flow_signal": "BALANCED",
+    "vacuum_zones": [],
+    "vacuum_magnet": {},
     "v74": None,
     "telemetry": {
         "connection_state": "connecting",
@@ -189,6 +226,14 @@ async def on_depth_update(book: LocalOrderBook):
         "bid": best_bid_f,
         "ask": best_ask_f,
     })
+
+    # 1b. Build candles from the mid-price stream; feed CLOSED bars to the vacuum engine.
+    closed_bar = candle_agg.ingest(mid_price, now_ms)
+    if closed_bar is not None:
+        vacuum_engine.update(closed_bar)
+        vac = vacuum_engine.to_dict()
+        terminal_state["vacuum_zones"] = vac["vacuum_zones"]
+        terminal_state["vacuum_magnet"] = vac["vacuum_magnet"]
 
     # 2. Extract top sorted levels & Order Flow Imbalance
     top_bids, top_asks = book.get_top_levels(limit=25)

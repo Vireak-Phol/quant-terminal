@@ -1,0 +1,858 @@
+/// SciChart controller (a.k.a. SciChartDeepEngine): owns the surface, axes,
+/// candlestick series, and the institutional overlays:
+///   1. Bookmap Liquidity Heatmap  (UniformHeatmapDataSeries)
+///   2. Price Candlesticks          (FastCandlestickRenderableSeries)
+///   3. Heavy Absorption Bubbles    (XyScatterRenderableSeries + DataLabels)
+///   4. Liquidity Vacuum Pockets    (v7.4 Pine Strategy structure; BoxAnnotations)
+///   5. Vacuum Magnet Line          (HorizontalLineAnnotation + axis badge)
+///   6. Hopla 3 / 50 / 97 range     (HorizontalLineAnnotation)
+///   7. Mark Price Line on Axis     (HorizontalLineAnnotation with amber badge)
+///
+/// Every overlay group is independently toggleable via setLayerVisibility() and
+/// every resource is released in delete() so React unmounts leave no WebGL leaks.
+///
+/// PERFORMANCE CONTRACT: update() is designed to be called at display refresh
+/// (the cockpit coalesces websocket frames with requestAnimationFrame). Within a
+/// frame it does the minimum work: candle O/H/L/C in place, heatmap pushed to the
+/// GPU only when the grid changed, absorption bubbles rebuilt only on a new closed
+/// candle (live footprints appended incrementally), and vacuum/hopla annotations
+/// rebuilt only when their v7.4 signature changes.
+
+import {
+  SciChartSurface,
+  NumericAxis,
+  DateTimeNumericAxis,
+  SmartDateLabelProvider,
+  NumberRange,
+  SciChartJsNavyTheme,
+  EAxisAlignment,
+  EAutoRange,
+  FastCandlestickRenderableSeries,
+  OhlcDataSeries,
+  UniformHeatmapDataSeries,
+  UniformHeatmapRenderableSeries,
+  HeatmapColorMap,
+  XyScatterRenderableSeries,
+  XyDataSeries,
+  EllipsePointMarker,
+  BoxAnnotation,
+  HorizontalLineAnnotation,
+  TextAnnotation,
+  ELabelPlacement,
+  ZoomPanModifier,
+  MouseWheelZoomModifier,
+  ZoomExtentsModifier,
+  EDataPointWidthMode,
+  EHorizontalTextPosition,
+  EVerticalTextPosition,
+  ECoordinateMode,
+  EHorizontalAnchorPoint,
+  EDataLabelSkipMode,
+} from "scichart";
+import type { CandleData } from "../lib/klines";
+import { detectHeavyAbsorptions, type HeavyAbsorptionPoint } from "../lib/absorption";
+import type { V74Frame, TimeframeFrame } from "../types/v74";
+
+export type Timeframe = "1m" | "5m" | "15m";
+
+export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
+  "1m": 60,
+  "5m": 300,
+  "15m": 900,
+};
+
+/** Overlay groups the UI can switch on/off. */
+export type ChartLayer = "heatmap" | "bubbles" | "vacuum" | "hopla";
+
+/** Minimal shape the chart needs from a live frame. Structurally compatible with
+ *  both the bridge `bookmap_update` frame and the `LiveOrderBookData` snapshot. */
+export interface ChartFrame {
+  mid_price: number;
+  timestamp: number;
+  liquidity_zones?: Array<{
+    priceLow: string | number;
+    priceHigh: string | number;
+    displayedQuantity: string | number;
+  }>;
+  absorption_candidates?: Array<{
+    side: "buy" | "sell";
+    price: string | number;
+    timestamp: number;
+    executedQuantity?: string | number;
+    reason?: string;
+  }>;
+  v74?: V74Frame | null;
+}
+
+/** A clickable absorption bubble recorded for hit-testing. */
+export interface BubbleHit {
+  x: number; // epoch seconds
+  y: number; // price
+  point: HeavyAbsorptionPoint | null; // null for live-tape footprints
+}
+
+const PRICE_ROWS = 240; // heatmap price buckets (240×160 depth tensor)
+const HEATMAP_COLS = 160; // heatmap time columns
+const MAX_CANDLES = 500; // candle history cap
+const VISIBLE_CANDLES = 80; // how many candles the live view shows
+
+export interface ChartConfig {
+  tickSize: number;
+  timeframe: Timeframe;
+}
+
+export class TerminalChart {
+  private surface!: SciChartSurface;
+  private cfg: ChartConfig;
+  private tfSeconds: number;
+
+  private xAxis!: DateTimeNumericAxis;
+  private yAxis!: NumericAxis;
+
+  private candleData!: OhlcDataSeries;
+  private candlestickSeries!: FastCandlestickRenderableSeries;
+
+  private heatmapData!: UniformHeatmapDataSeries;
+  private heatmapSeries!: UniformHeatmapRenderableSeries;
+
+  private buyBubbleData!: XyDataSeries;
+  private sellBubbleData!: XyDataSeries;
+  private buyBubbleSeries!: XyScatterRenderableSeries;
+  private sellBubbleSeries!: XyScatterRenderableSeries;
+  private buyWatermark!: TextAnnotation;
+  private sellWatermark!: TextAnnotation;
+
+  private vacuumAnnotations: (BoxAnnotation | HorizontalLineAnnotation | TextAnnotation)[] = [];
+  private hoplaAnnotations: HorizontalLineAnnotation[] = [];
+  private markPriceAnnotation: HorizontalLineAnnotation | null = null;
+
+  // Candle history storage for the rolling absorption detector.
+  private historicalCandles: CandleData[] = [];
+
+  // Recorded bubble positions for click-to-inspect hit-testing.
+  private bubbleHits: BubbleHit[] = [];
+
+  // Heatmap rolling grid [PRICE_ROWS][HEATMAP_COLS] (ring-buffered on the X axis).
+  private zGrid: number[][] = [];
+  private priceFloor = 0;
+  private lastHeatmapBucket = 0;
+  private heatmapInitialized = false;
+
+  // Candle aggregation state (bucketStartSec -> ohlc).
+  private curBucket = 0;
+  private curOhlc: { o: number; h: number; l: number; c: number } | null = null;
+
+  // Live-follow control.
+  private liveFollow = true;
+  private suppressRangeEvents = false;
+
+  // Layer visibility state (driven by the cockpit header).
+  private layers: Record<ChartLayer, boolean> = {
+    heatmap: true,
+    bubbles: true,
+    vacuum: true,
+    hopla: true,
+  };
+
+  // Last frame kept so toggles can re-render overlays without a new tick.
+  private lastFrame: ChartFrame | null = null;
+
+  // --- Perf: signature caches so overlays only rebuild when data changes ---
+  private vacuumSig = "";
+  private hoplaSig = "";
+  // Live-tape footprint dedup so identical carried-forward candidates are not
+  // re-appended; bounded so a long session cannot grow it without limit.
+  private seenFootprintIds = new Set<string>();
+  // Last applied live-view range, to skip redundant visibleRange writes.
+  private lastViewFirstX = NaN;
+  private lastViewLastX = NaN;
+  private lastViewLo = NaN;
+  private lastViewHi = NaN;
+
+  constructor(cfg: ChartConfig) {
+    this.cfg = cfg;
+    this.tfSeconds = TIMEFRAME_SECONDS[cfg.timeframe];
+    for (let r = 0; r < PRICE_ROWS; r++) {
+      this.zGrid.push(new Array(HEATMAP_COLS).fill(0));
+    }
+  }
+
+  async init(rootElement: string | HTMLDivElement) {
+    const { sciChartSurface, wasmContext } = await SciChartSurface.create(rootElement, {
+      theme: new SciChartJsNavyTheme(),
+    });
+    this.surface = sciChartSurface;
+
+    // --- X = time (DateTime), Y = price ---
+    this.xAxis = new DateTimeNumericAxis(wasmContext, {
+      axisTitle: "Time",
+      drawMajorGridLines: true,
+      labelProvider: new SmartDateLabelProvider(),
+      autoRange: EAutoRange.Never,
+    });
+    this.yAxis = new NumericAxis(wasmContext, {
+      axisTitle: "Price (USDT)",
+      axisAlignment: EAxisAlignment.Right,
+      growBy: new NumberRange(0.08, 0.08),
+      autoRange: EAutoRange.Never,
+      labelPrecision: 2,
+    });
+    this.surface.xAxes.add(this.xAxis);
+    this.surface.yAxes.add(this.yAxis);
+
+    // Stop live-follow when the user zooms or pans manually.
+    this.xAxis.visibleRangeChanged.subscribe(() => {
+      if (!this.suppressRangeEvents) this.liveFollow = false;
+    });
+
+    // --- Bookmap Heatmap (behind candles) ---
+    this.heatmapData = new UniformHeatmapDataSeries(wasmContext, {
+      xStart: 0,
+      xStep: this.tfSeconds,
+      yStart: 0,
+      yStep: this.cfg.tickSize,
+      zValues: this.zGrid.map((row) => [...row]),
+    });
+    this.heatmapSeries = new UniformHeatmapRenderableSeries(wasmContext, {
+      dataSeries: this.heatmapData,
+      opacity: 0.38,
+      colorMap: new HeatmapColorMap({
+        minimum: 0,
+        maximum: 1000,
+        gradientStops: [
+          { offset: 0, color: "transparent" },
+          { offset: 0.1, color: "#11263c55" },
+          { offset: 0.25, color: "#1d477388" },
+          { offset: 0.5, color: "#2563eb99" },
+          { offset: 0.75, color: "#f59e0baa" },
+          { offset: 1.0, color: "#ef4444cc" },
+        ],
+      }),
+    });
+    this.surface.renderableSeries.add(this.heatmapSeries);
+
+    // --- Candlesticks ---
+    this.candleData = new OhlcDataSeries(wasmContext);
+    this.candlestickSeries = new FastCandlestickRenderableSeries(wasmContext, {
+      dataSeries: this.candleData,
+      strokeThickness: 1,
+      brushUp: "#26a69a",
+      brushDown: "#ef5350",
+      strokeUp: "#26a69a",
+      strokeDown: "#ef5350",
+      dataPointWidth: 0.7,
+      dataPointWidthMode: EDataPointWidthMode.Relative,
+    });
+    this.surface.renderableSeries.add(this.candlestickSeries);
+
+    // --- Absorption Bubbles (Heavy Absorption Indicator) ---
+    // 1. Buyers Absorbed (aggressive buying rejected at high -> crimson).
+    this.buyBubbleData = new XyDataSeries(wasmContext, { dataSeriesName: "buyers_absorbed" });
+    this.buyBubbleSeries = new XyScatterRenderableSeries(wasmContext, {
+      dataSeries: this.buyBubbleData,
+      pointMarker: new EllipsePointMarker(wasmContext, {
+        width: 24,
+        height: 24,
+        strokeThickness: 1.5,
+        fill: "rgba(239, 68, 68, 0.40)",
+        stroke: "rgba(248, 113, 113, 0.95)",
+      }),
+      dataLabels: {
+        style: { fontFamily: "monospace", fontSize: 9 },
+        color: "#ffffff",
+        skipMode: EDataLabelSkipMode.ShowAll,
+        horizontalTextPosition: EHorizontalTextPosition.Center,
+        verticalTextPosition: EVerticalTextPosition.Center,
+        metaDataSelector: (md: any) => md?.text ?? "",
+      },
+    });
+    this.surface.renderableSeries.add(this.buyBubbleSeries);
+
+    // 2. Sellers Absorbed (aggressive selling absorbed at low -> emerald).
+    this.sellBubbleData = new XyDataSeries(wasmContext, { dataSeriesName: "sellers_absorbed" });
+    this.sellBubbleSeries = new XyScatterRenderableSeries(wasmContext, {
+      dataSeries: this.sellBubbleData,
+      pointMarker: new EllipsePointMarker(wasmContext, {
+        width: 24,
+        height: 24,
+        strokeThickness: 1.5,
+        fill: "rgba(16, 185, 129, 0.40)",
+        stroke: "rgba(52, 211, 153, 0.95)",
+      }),
+      dataLabels: {
+        style: { fontFamily: "monospace", fontSize: 9 },
+        color: "#ffffff",
+        skipMode: EDataLabelSkipMode.ShowAll,
+        horizontalTextPosition: EHorizontalTextPosition.Center,
+        verticalTextPosition: EVerticalTextPosition.Center,
+        metaDataSelector: (md: any) => md?.text ?? "",
+      },
+    });
+    this.surface.renderableSeries.add(this.sellBubbleSeries);
+
+    // 3. Watermark labels.
+    this.buyWatermark = new TextAnnotation({
+      x1: 0.98,
+      y1: 0.96,
+      xCoordinateMode: ECoordinateMode.Relative,
+      yCoordinateMode: ECoordinateMode.Relative,
+      horizontalAnchorPoint: EHorizontalAnchorPoint.Right,
+      text: "BUYERS ABSORBED",
+      textColor: "rgba(239, 68, 68, 0.88)",
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: 12,
+      fontWeight: "bold",
+    });
+    this.surface.annotations.add(this.buyWatermark);
+
+    this.sellWatermark = new TextAnnotation({
+      x1: 0.02,
+      y1: 0.04,
+      xCoordinateMode: ECoordinateMode.Relative,
+      yCoordinateMode: ECoordinateMode.Relative,
+      horizontalAnchorPoint: EHorizontalAnchorPoint.Left,
+      text: "SELLERS ABSORBED",
+      textColor: "rgba(34, 197, 94, 0.88)",
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: 12,
+      fontWeight: "bold",
+    });
+    this.surface.annotations.add(this.sellWatermark);
+
+    // --- Interaction: wheel zoom, drag pan, double-click reset to live extents ---
+    this.surface.chartModifiers.add(
+      new ZoomPanModifier(),
+      new MouseWheelZoomModifier(),
+      new ZoomExtentsModifier({
+        onZoomExtents: () => {
+          this.resetView();
+          return false;
+        },
+      })
+    );
+
+    // Apply initial layer visibility now that series exist.
+    this.applyLayerVisibility();
+  }
+
+  /** Toggle an overlay group on/off. Re-renders dependent annotations when needed. */
+  setLayerVisibility(layer: ChartLayer, visible: boolean) {
+    this.layers[layer] = visible;
+    this.applyLayerVisibility();
+    // Vacuum + Hopla are annotation-based; force a rebuild from the last frame.
+    if ((layer === "vacuum" || layer === "hopla") && this.lastFrame) {
+      if (layer === "vacuum") {
+        this.vacuumSig = "";
+        this.updateVacuum(this.lastFrame);
+      } else {
+        this.hoplaSig = "";
+        this.updateHopla(this.lastFrame);
+      }
+    }
+  }
+
+  getLayerVisibility(): Record<ChartLayer, boolean> {
+    return { ...this.layers };
+  }
+
+  private applyLayerVisibility() {
+    if (this.heatmapSeries) this.heatmapSeries.isVisible = this.layers.heatmap;
+    if (this.buyBubbleSeries) this.buyBubbleSeries.isVisible = this.layers.bubbles;
+    if (this.sellBubbleSeries) this.sellBubbleSeries.isVisible = this.layers.bubbles;
+    if (this.buyWatermark) this.buyWatermark.isHidden = !this.layers.bubbles;
+    if (this.sellWatermark) this.sellWatermark.isHidden = !this.layers.bubbles;
+  }
+
+  /** Load historical candles from Binance to seed price action + absorption history. */
+  loadHistoricalCandles(candles: CandleData[]) {
+    if (!this.surface || candles.length === 0) return;
+    this.historicalCandles = [...candles];
+    this.candleData.clear();
+    for (const c of candles) {
+      this.candleData.append(c.time, c.open, c.high, c.low, c.close);
+    }
+    const last = candles[candles.length - 1];
+    this.curBucket = last.time;
+    this.curOhlc = { o: last.open, h: last.high, l: last.low, c: last.close };
+
+    if (this.priceFloor === 0) {
+      const span = PRICE_ROWS * this.cfg.tickSize;
+      this.priceFloor = Math.round((last.close - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
+    }
+
+    this.rebuildHeavyAbsorptions();
+    this.liveFollow = true;
+    this.invalidateView();
+    this.applyLiveView();
+  }
+
+  /** Switch timeframe: clear state and prepare for new klines. */
+  setTimeframe(tf: Timeframe) {
+    this.cfg.timeframe = tf;
+    this.tfSeconds = TIMEFRAME_SECONDS[tf];
+    this.curOhlc = null;
+    this.curBucket = 0;
+    this.heatmapInitialized = false;
+    this.lastHeatmapBucket = 0;
+    this.historicalCandles = [];
+    this.bubbleHits = [];
+    this.seenFootprintIds.clear();
+    this.vacuumSig = "";
+    this.hoplaSig = "";
+    this.buyBubbleData?.clear();
+    this.sellBubbleData?.clear();
+    for (let r = 0; r < PRICE_ROWS; r++) {
+      this.zGrid[r].fill(0);
+    }
+    this.liveFollow = true;
+    this.invalidateView();
+  }
+
+  /** Feed a (coalesced) websocket frame. Called at most once per animation frame. */
+  update(frame: ChartFrame) {
+    if (!this.surface || !frame.mid_price) return;
+    this.lastFrame = frame;
+    const nowSec = Math.floor((frame.timestamp ?? Date.now()) / 1000);
+    const newCandle = this.updateCandles(frame.mid_price, nowSec);
+    if (newCandle) this.rebuildHeavyAbsorptions();
+    this.updateHeatmap(frame, nowSec);
+    if (frame.absorption_candidates && frame.absorption_candidates.length > 0) {
+      this.appendLiveFootprints(frame.absorption_candidates);
+    }
+    this.updateVacuum(frame);
+    this.updateHopla(frame);
+    this.updateMarkPrice(frame.mid_price);
+    if (this.liveFollow) {
+      this.applyLiveView();
+    }
+  }
+
+  /** Returns true when a new candle bucket was opened (caller rebuilds bubbles). */
+  private updateCandles(price: number, nowSec: number): boolean {
+    const bucket = Math.floor(nowSec / this.tfSeconds) * this.tfSeconds;
+    if (this.curOhlc === null || bucket > this.curBucket) {
+      this.curBucket = bucket;
+      this.curOhlc = { o: price, h: price, l: price, c: price };
+      this.candleData.append(bucket, price, price, price, price);
+      while (this.candleData.count() > MAX_CANDLES) {
+        this.candleData.removeAt(0);
+      }
+      this.historicalCandles.push({
+        time: bucket,
+        open: price,
+        high: price,
+        low: price,
+        close: price,
+        volume: 0,
+      });
+      while (this.historicalCandles.length > MAX_CANDLES) {
+        this.historicalCandles.shift();
+      }
+      return true;
+    }
+    this.curOhlc.h = Math.max(this.curOhlc.h, price);
+    this.curOhlc.l = Math.min(this.curOhlc.l, price);
+    this.curOhlc.c = price;
+    const idx = this.candleData.count() - 1;
+    if (idx >= 0) {
+      this.candleData.update(idx, this.curOhlc.o, this.curOhlc.h, this.curOhlc.l, this.curOhlc.c);
+    }
+    if (this.historicalCandles.length > 0) {
+      const last = this.historicalCandles[this.historicalCandles.length - 1];
+      last.high = Math.max(last.high, price);
+      last.low = Math.min(last.low, price);
+      last.close = price;
+    }
+    return false;
+  }
+
+  /**
+   * Full rebuild of the Heavy Absorption bubbles from the candle history.
+   * Expensive (runs the detector over up to 500 candles), so it only runs on a
+   * new closed candle or a historical (re)load — NOT on every websocket frame.
+   */
+  private rebuildHeavyAbsorptions() {
+    if (!this.buyBubbleData || !this.sellBubbleData) return;
+    this.buyBubbleData.clear();
+    this.sellBubbleData.clear();
+    this.bubbleHits = [];
+    this.seenFootprintIds.clear();
+
+    const points = detectHeavyAbsorptions(this.historicalCandles);
+    for (const pt of points) {
+      const meta = { isSelected: false, text: `${pt.volRatio}` };
+      if (pt.type === "buyers_absorbed") {
+        this.buyBubbleData.append(pt.time, pt.price, meta);
+      } else {
+        this.sellBubbleData.append(pt.time, pt.price, meta);
+      }
+      this.bubbleHits.push({ x: pt.time, y: pt.price, point: pt });
+    }
+  }
+
+  /**
+   * Incrementally append only NEW live order-flow tape footprints. Deduped by a
+   * synthetic id so a frame carrying the same (carried-forward) candidates does
+   * not re-append. No clear(), so this is O(new points) per frame, not O(all).
+   */
+  private appendLiveFootprints(candidates: ChartFrame["absorption_candidates"]) {
+    if (!this.buyBubbleData || !this.sellBubbleData || !candidates) return;
+    for (const a of candidates) {
+      const t = Math.floor(a.timestamp / 1000);
+      const px = Number(a.price);
+      if (!Number.isFinite(px)) continue;
+      const id = `${a.side}-${t}-${px}`;
+      if (this.seenFootprintIds.has(id)) continue;
+      this.seenFootprintIds.add(id);
+      const meta = { isSelected: false, text: "ABS" };
+      if (a.side === "buy") {
+        this.buyBubbleData.append(t, px, meta);
+      } else {
+        this.sellBubbleData.append(t, px, meta);
+      }
+      this.bubbleHits.push({ x: t, y: px, point: null });
+    }
+    if (this.seenFootprintIds.size > 2000) {
+      // Retain the most recent ids (insertion order) so carried-forward
+      // candidates are still recognised as seen — avoids a duplicate-append
+      // window. The next closed-bar rebuild fully re-seeds the set anyway.
+      const recent = Array.from(this.seenFootprintIds).slice(-500);
+      this.seenFootprintIds = new Set(recent);
+    }
+  }
+
+  private updateHeatmap(frame: ChartFrame, nowSec: number) {
+    const mid = frame.mid_price;
+    const span = PRICE_ROWS * this.cfg.tickSize;
+    let dirty = false;
+    if (this.priceFloor === 0 || mid < this.priceFloor + 15 || mid > this.priceFloor + span - 15) {
+      this.priceFloor = Math.round((mid - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
+      dirty = true;
+    }
+
+    const bucket = Math.floor(nowSec / this.tfSeconds) * this.tfSeconds;
+    const zones = frame.liquidity_zones ?? [];
+    const col = HEATMAP_COLS - 1;
+
+    if (!this.heatmapInitialized) {
+      this.heatmapInitialized = true;
+      this.lastHeatmapBucket = bucket;
+      for (let r = 0; r < PRICE_ROWS; r++) this.zGrid[r].fill(0);
+      this.paintZones(zones, (r, qty) => {
+        this.zGrid[r].fill(qty);
+      });
+      dirty = true;
+    } else {
+      if (bucket !== this.lastHeatmapBucket) {
+        this.lastHeatmapBucket = bucket;
+        for (let r = 0; r < PRICE_ROWS; r++) {
+          this.zGrid[r].shift();
+          this.zGrid[r].push(0);
+        }
+        dirty = true;
+      }
+      // Rebuild only the newest column from the current resting liquidity, and
+      // only push to the GPU if that column actually differs from last frame.
+      for (let r = 0; r < PRICE_ROWS; r++) {
+        if (this.zGrid[r][col] !== 0) {
+          this.zGrid[r][col] = 0;
+          dirty = true;
+        }
+      }
+      this.paintZones(zones, (r, qty) => {
+        const v = Math.max(this.zGrid[r][col], qty);
+        if (v !== this.zGrid[r][col]) {
+          this.zGrid[r][col] = v;
+          dirty = true;
+        }
+      });
+    }
+
+    // setZValues marshals the whole 240×160 tensor across the WASM boundary, so
+    // only do it when something in the grid actually changed this frame.
+    if (dirty) {
+      this.heatmapData.setZValues(this.zGrid);
+    }
+    this.heatmapData.yStart = this.priceFloor;
+    this.heatmapData.yStep = this.cfg.tickSize;
+    this.heatmapData.xStart = bucket - (HEATMAP_COLS - 1) * this.tfSeconds;
+    this.heatmapData.xStep = this.tfSeconds;
+  }
+
+  /** Map resting-liquidity zones onto price rows and invoke a cell writer. */
+  private paintZones(
+    zones: NonNullable<ChartFrame["liquidity_zones"]>,
+    write: (row: number, qty: number) => void,
+  ) {
+    for (const z of zones) {
+      const lo = Number(z.priceLow);
+      const hi = Number(z.priceHigh);
+      const qty = Number(z.displayedQuantity);
+      if (!Number.isFinite(lo) || !Number.isFinite(qty)) continue;
+      const rLo = Math.floor((lo - this.priceFloor) / this.cfg.tickSize);
+      const rHi = Math.floor((hi - this.priceFloor) / this.cfg.tickSize);
+      if (rLo > PRICE_ROWS - 1 || rHi < 0) continue;
+      for (let r = Math.max(0, rLo); r <= Math.min(PRICE_ROWS - 1, rHi); r++) {
+        write(r, qty);
+      }
+    }
+  }
+
+  /** Pick the v7.4 timeframe frame matching the chart timeframe, falling back. */
+  private pickV74Frame(frame: ChartFrame): TimeframeFrame | undefined {
+    const frames = frame.v74?.frames;
+    if (!frames) return undefined;
+    return (
+      (frames as Record<string, TimeframeFrame>)[this.cfg.timeframe] ||
+      frames["5m"] ||
+      frames["15m"]
+    );
+  }
+
+  /** Render Liquidity Vacuum pockets + Magnet line — only when the signature changes. */
+  private updateVacuum(frame: ChartFrame) {
+    if (!this.layers.vacuum) {
+      if (this.vacuumAnnotations.length) {
+        for (const a of this.vacuumAnnotations) this.surface.annotations.remove(a);
+        this.vacuumAnnotations = [];
+      }
+      this.vacuumSig = "__off__";
+      return;
+    }
+
+    const structure = this.pickV74Frame(frame)?.structure;
+    const pockets = structure?.vacuum ?? [];
+    const vacBand = structure?.vac_band ?? 0;
+    const magnet = vacBand > 0 ? structure?.vac_above : vacBand < 0 ? structure?.vac_below : null;
+
+    // Signature: the only things that affect the drawn annotations.
+    const sig =
+      pockets.map((v) => `${v.strength}:${v.top}:${v.bottom}:${v.price}`).join("|") +
+      `#${vacBand}:${magnet ?? ""}`;
+    if (sig === this.vacuumSig) return; // unchanged → no annotation churn
+    this.vacuumSig = sig;
+
+    for (const a of this.vacuumAnnotations) this.surface.annotations.remove(a);
+    this.vacuumAnnotations = [];
+    if (pockets.length === 0 && magnet == null) return;
+
+    const strengthColor = (s: number) => (s === 3 ? "#FF5252" : s === 2 ? "#FFA726" : "#8B9BB4");
+
+    for (const v of pockets) {
+      const color = strengthColor(v.strength);
+      const top = Math.max(v.top, v.bottom);
+      const bot = Math.min(v.top, v.bottom);
+
+      const box = new BoxAnnotation({
+        x1: 0,
+        x2: 1,
+        xCoordinateMode: ECoordinateMode.Relative,
+        yCoordinateMode: ECoordinateMode.DataValue,
+        y1: top,
+        y2: bot,
+        fill: color + "1a",
+        stroke: color + "88",
+        strokeThickness: 1,
+      });
+      this.surface.annotations.add(box);
+      this.vacuumAnnotations.push(box);
+
+      const label = new TextAnnotation({
+        x1: 0.98,
+        xCoordinateMode: ECoordinateMode.Relative,
+        horizontalAnchorPoint: EHorizontalAnchorPoint.Right,
+        y1: (top + bot) / 2,
+        yCoordinateMode: ECoordinateMode.DataValue,
+        text: `VAC${v.strength} ${v.price.toFixed(2)}`,
+        textColor: color,
+        fontSize: 10,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontWeight: "bold",
+      });
+      this.surface.annotations.add(label);
+      this.vacuumAnnotations.push(label);
+    }
+
+    if (magnet != null) {
+      const dir = vacBand > 0 ? "↑" : "↓";
+      const line = new HorizontalLineAnnotation({
+        y1: magnet,
+        stroke: "#00E5FF",
+        strokeThickness: 1.5,
+        strokeDashArray: [6, 3],
+        showLabel: true,
+        labelPlacement: ELabelPlacement.TopRight,
+        axisLabelFill: "#00E5FF",
+        axisLabelStroke: "#000000",
+        labelValue: `MAGNET ${dir} ${magnet.toFixed(2)}`,
+      });
+      this.surface.annotations.add(line);
+      this.vacuumAnnotations.push(line);
+    }
+  }
+
+  /** Render the Hopla 3 / 50 / 97 lines — only when the signature changes. */
+  private updateHopla(frame: ChartFrame) {
+    if (!this.layers.hopla) {
+      if (this.hoplaAnnotations.length) {
+        for (const a of this.hoplaAnnotations) this.surface.annotations.remove(a);
+        this.hoplaAnnotations = [];
+      }
+      this.hoplaSig = "__off__";
+      return;
+    }
+
+    const h = this.pickV74Frame(frame)?.structure?.hopla;
+    const sig = h ? `${h.line_3}:${h.line_50}:${h.line_97}` : "";
+    if (sig === this.hoplaSig) return; // unchanged → no annotation churn
+    this.hoplaSig = sig;
+
+    for (const a of this.hoplaAnnotations) this.surface.annotations.remove(a);
+    this.hoplaAnnotations = [];
+    if (!h) return;
+
+    const mk = (price: number, color: string, label: string, dash: number[]) => {
+      const line = new HorizontalLineAnnotation({
+        y1: price,
+        stroke: color,
+        strokeThickness: 1,
+        strokeDashArray: dash,
+        showLabel: true,
+        labelPlacement: ELabelPlacement.TopRight,
+        axisLabelFill: color,
+        axisLabelStroke: "#000000",
+        labelValue: label,
+      });
+      this.surface.annotations.add(line);
+      this.hoplaAnnotations.push(line);
+    };
+
+    if (Number.isFinite(h.line_97)) mk(h.line_97, "#ff3b30", `97% ${h.line_97.toFixed(2)}`, [4, 4]);
+    if (Number.isFinite(h.line_50)) mk(h.line_50, "#94a3b8", `EQ ${h.line_50.toFixed(2)}`, [1, 4]);
+    if (Number.isFinite(h.line_3)) mk(h.line_3, "#00b4d8", `3% ${h.line_3.toFixed(2)}`, [4, 4]);
+  }
+
+  private updateMarkPrice(midPrice: number) {
+    if (!this.markPriceAnnotation) {
+      this.markPriceAnnotation = new HorizontalLineAnnotation({
+        y1: midPrice,
+        stroke: "#f59e0b",
+        strokeThickness: 1,
+        strokeDashArray: [4, 4],
+        showLabel: true,
+        labelValue: `MARK ${midPrice.toFixed(2)}`,
+        labelPlacement: ELabelPlacement.Axis,
+        axisLabelFill: "#f59e0b",
+        axisLabelStroke: "#000000",
+      });
+      this.surface.annotations.add(this.markPriceAnnotation);
+    } else {
+      // Mutate in place — never recreate the annotation per frame.
+      this.markPriceAnnotation.y1 = midPrice;
+      this.markPriceAnnotation.labelValue = `MARK ${midPrice.toFixed(2)}`;
+    }
+  }
+
+  /**
+   * Click-to-inspect hit test. Given a click point in pixel coordinates relative
+   * to the chart canvas, return the nearest absorption bubble within a pixel
+   * tolerance, or null. Used by the cockpit to open the Absorption modal.
+   */
+  hitTestBubble(clientX: number, clientY: number, tolerancePx = 16): BubbleHit | null {
+    if (!this.surface || this.bubbleHits.length === 0 || !this.layers.bubbles) return null;
+    const rect = this.surface.domCanvasWebGL?.getBoundingClientRect?.();
+    if (!rect) return null;
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+    const xCalc = this.xAxis.getCurrentCoordinateCalculator();
+    const yCalc = this.yAxis.getCurrentCoordinateCalculator();
+    let best: BubbleHit | null = null;
+    let bestDist = tolerancePx;
+    for (const hit of this.bubbleHits) {
+      const hx = xCalc.getCoordinate(hit.x);
+      const hy = yCalc.getCoordinate(hit.y);
+      const d = Math.hypot(hx - px, hy - py);
+      if (d < bestDist) {
+        bestDist = d;
+        best = hit;
+      }
+    }
+    return best;
+  }
+
+  /** Reset the cached live-view range so the next applyLiveView() always writes. */
+  private invalidateView() {
+    this.lastViewFirstX = NaN;
+    this.lastViewLastX = NaN;
+    this.lastViewLo = NaN;
+    this.lastViewHi = NaN;
+  }
+
+  /** Snap the view to the latest VISIBLE_CANDLES and fit price to visible highs/lows.
+   *  Skips the axis writes when the computed range is unchanged (avoids per-frame
+   *  full relayout while price ticks inside the same window). */
+  applyLiveView() {
+    const n = this.candleData.count();
+    if (n === 0) return;
+    const xVals = this.candleData.getNativeXValues();
+    const lastX = xVals.get(n - 1);
+    const firstIdx = Math.max(0, n - VISIBLE_CANDLES);
+    const firstX = xVals.get(firstIdx);
+    const pad = this.tfSeconds * 4;
+
+    const highs = this.candleData.getNativeHighValues();
+    const lows = this.candleData.getNativeLowValues();
+    let hi = -Infinity;
+    let lo = Infinity;
+    for (let i = firstIdx; i < n; i++) {
+      const h = highs.get(i);
+      const l = lows.get(i);
+      if (Number.isFinite(h) && h > hi) hi = h;
+      if (Number.isFinite(l) && l < lo) lo = l;
+    }
+
+    const xChanged = firstX !== this.lastViewFirstX || lastX !== this.lastViewLastX;
+    const yOk = Number.isFinite(hi) && Number.isFinite(lo) && hi > lo;
+    const yChanged = yOk && (lo !== this.lastViewLo || hi !== this.lastViewHi);
+
+    if (!xChanged && !yChanged) return; // nothing moved → no axis write, no relayout
+
+    this.suppressRangeEvents = true;
+    if (xChanged) {
+      this.xAxis.visibleRange = new NumberRange(firstX, lastX + pad);
+      this.lastViewFirstX = firstX;
+      this.lastViewLastX = lastX;
+    }
+    if (yChanged) {
+      const padY = (hi - lo) * 0.12;
+      this.yAxis.visibleRange = new NumberRange(lo - padY, hi + padY);
+      this.lastViewLo = lo;
+      this.lastViewHi = hi;
+    }
+    this.suppressRangeEvents = false;
+  }
+
+  /** Re-enable live follow (used by the "Live" button / double-click reset). */
+  resetView() {
+    this.liveFollow = true;
+    this.invalidateView();
+    this.applyLiveView();
+  }
+
+  /** Release every WebGL buffer, texture, annotation and listener. */
+  delete() {
+    for (const a of this.hoplaAnnotations) this.surface?.annotations.remove(a);
+    this.hoplaAnnotations = [];
+    for (const a of this.vacuumAnnotations) this.surface?.annotations.remove(a);
+    this.vacuumAnnotations = [];
+    if (this.markPriceAnnotation) {
+      this.surface?.annotations.remove(this.markPriceAnnotation);
+      this.markPriceAnnotation = null;
+    }
+    // Surface.delete() tears down renderable series, data series, point markers,
+    // modifiers, the WebGL context and the WASM-backed buffers in one pass.
+    this.surface?.delete();
+    this.bubbleHits = [];
+    this.lastFrame = null;
+  }
+}
