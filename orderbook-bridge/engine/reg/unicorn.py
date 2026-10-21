@@ -55,6 +55,7 @@ class UnicornConfig:
     is_preset_minimal: bool = True       # Minimalist (Clean) default preset
     signal_priority: str = "Show All"
     mintick: float = 0.01
+    chart_tf_seconds: int = 300  # chart bar length; used to detect the bar that closes an HTF bucket
 
     # MTF show toggles (Pine defaults). 3m/5m off, W off.
     show_current: bool = True
@@ -192,8 +193,9 @@ class _HtfStream:
     expression list.
     """
 
-    def __init__(self, tf: str, swing_length: int, atr_len: int):
+    def __init__(self, tf: str, swing_length: int, atr_len: int, chart_tf_seconds: int = 300):
         self.tf = tf
+        self.chart_tf_seconds = chart_tf_seconds
         self.sl = swing_length
         self.atr = ATR(atr_len)
         self.atr_sma = SMA(50)
@@ -218,7 +220,7 @@ class _HtfStream:
             self.l = min(self.l, l)
             self.c = c
         # does this chart bar close the HTF bucket?  (next 5m bar starts a new bucket)
-        closes = _bucket_of(t + 300, self.tf) != b
+        closes = _bucket_of(t + self.chart_tf_seconds, self.tf) != b
         if not closes:
             return None
         # finalize: push into HTF indicator state
@@ -277,7 +279,7 @@ class UnicornEngine:
         self._htf: Dict[str, _HtfStream] = {}
         for tf, on in self._enabled_tfs().items():
             if on:
-                self._htf[tf] = _HtfStream(tf, c.swing_length, c.global_atr_length)
+                self._htf[tf] = _HtfStream(tf, c.swing_length, c.global_atr_length, c.chart_tf_seconds)
 
     def _enabled_tfs(self) -> Dict[str, bool]:
         c = self.cfg

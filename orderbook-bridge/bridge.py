@@ -36,6 +36,9 @@ from analytics.liquidity_zones import LiquidityZoneDetector, LiquidityZone
 from analytics.absorption_engine import AbsorptionEngine, AbsorptionCandidate
 from replay.replay_engine import MarketRecorder, ReplayPlayer
 from v7_engine import V7InstitutionalEngine
+from engine.live import LiveHub
+from engine.orderflow import OrderflowSnapshot
+from engine.alerts import AlertDispatcher
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +69,41 @@ absorption_engine = AbsorptionEngine(
 recorder = MarketRecorder(output_dir="data/recordings")
 replay_player = ReplayPlayer()
 v7_engine = V7InstitutionalEngine(hopla_range=27.0)
+alerts = AlertDispatcher.from_env()
+
+
+def _orderflow_snapshot() -> Optional[OrderflowSnapshot]:
+    """Live L2 evidence captured at bar close for the v7.4 engine."""
+    if terminal_state["mid_price"] <= 0:
+        return None
+    return OrderflowSnapshot(
+        mid=terminal_state["mid_price"],
+        imbalance=terminal_state["imbalance"],
+        walls=list(terminal_state["resting_walls"]),
+        absorptions=list(terminal_state["absorption_candidates"]),
+        spread=terminal_state["spread"],
+        timestamp_ms=int(time.time() * 1000),
+    )
+
+
+hub = LiveHub(symbol=SYMBOL, snapshot_fn=_orderflow_snapshot, on_signal=alerts.on_signal)
+_v74_cache: Dict[str, Any] = {"version": -1, "at": 0.0, "frame": None}
+
+
+def refresh_v74_frame() -> None:
+    """Rebuild the v7.4 frame when the engine changed (bar close) or every 5 s (guardrails)."""
+    now = time.time()
+    if hub.version != _v74_cache["version"] or now - _v74_cache["at"] > 5.0:
+        try:
+            frame = hub.frame(terminal_state["mid_price"] or None)
+            if frame is not None:  # None = engine busy; keep the previous frame
+                _v74_cache["frame"] = frame
+                _v74_cache["version"] = hub.version
+                _v74_cache["at"] = now
+        except Exception as e:  # never let the UI frame break the depth feed
+            logger.error(f"v74 frame error: {e}")
+            _v74_cache["at"] = now
+    terminal_state["v74"] = _v74_cache["frame"]
 
 # Rolling display buffers
 PRICE_HISTORY = deque(maxlen=250)  # (time_ms, mid_price, best_bid, best_ask)
@@ -104,6 +142,7 @@ terminal_state: Dict[str, Any] = {
     "v7_signal": None,
     "hopla": {},
     "active_fvgs": [],
+    "v74": None,
     "telemetry": {
         "connection_state": "connecting",
         "order_book_sync_state": "uninitialized",
@@ -271,6 +310,7 @@ async def broadcast():
     """Broadcasts current snapshot to connected UI terminals."""
     if not CLIENTS or terminal_state["mid_price"] == 0.0:
         return
+    refresh_v74_frame()
     msg = json.dumps(terminal_state)
     dead = set()
     for ws in CLIENTS:
@@ -326,6 +366,17 @@ async def ws_server_handler(ws):
                     await replay_player.stop()
                 elif action == "set_replay_speed":
                     replay_player.set_speed(float(cmd.get("speed", 1.0)))
+                elif action == "get_ledger":
+                    tf = cmd.get("tf")
+                    tf = tf if tf in hub.tfs else None
+                    limit = max(1, min(int(cmd.get("limit", 100)), 500))
+                    await ws.send(json.dumps(hub.ledger_view(tf, limit), default=str))
+                elif action == "set_risk_config":
+                    try:
+                        cfg = hub.set_risk(dict(cmd.get("config", {})))
+                        await ws.send(json.dumps({"type": "risk_config", "ok": True, "config": cfg.__dict__}))
+                    except (ValueError, TypeError) as e:
+                        await ws.send(json.dumps({"type": "risk_config", "ok": False, "error": str(e)}))
             except Exception as e:
                 logger.error(f"Error handling client command: {e}")
     finally:
@@ -344,12 +395,14 @@ async def main():
     # Start provider & broadcast loop
     await provider.start()
     broadcaster = asyncio.create_task(broadcast_loop())
+    engine_task = asyncio.create_task(hub.run())
 
     try:
-        await asyncio.gather(server.serve_forever(), broadcaster)
+        await asyncio.gather(server.serve_forever(), broadcaster, engine_task)
     finally:
         await provider.stop()
         broadcaster.cancel()
+        engine_task.cancel()
 
 
 if __name__ == "__main__":

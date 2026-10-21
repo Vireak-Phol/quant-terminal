@@ -43,9 +43,10 @@ class HtfTracker:
             i = bisect.bisect_right(self.opens, t) - 1
             if i >= 0:
                 last = self.opens[-1]
-                # past the last known HTF open: fall back to fixed alignment
+                # past the last known HTF open (bar not closed yet): step forward from the
+                # last known open, preserving the feed's own bucket phase
                 if i == len(self.opens) - 1 and t >= last + self.bucket_seconds:
-                    return t - (t % self.bucket_seconds)
+                    return last + ((t - last) // self.bucket_seconds) * self.bucket_seconds
                 return self.opens[i]
         return t - (t % self.bucket_seconds)
 
