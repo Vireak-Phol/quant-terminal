@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useSyncExternalStore, useCallback } from 'react'
+import type { V74Frame } from '../types/v74'
 
 export interface OrderBookLevel {
   price: number
@@ -145,80 +146,144 @@ export interface LiveOrderBookData {
   hopla?: HoplaLevels
   active_fvgs?: ActiveFVG[]
   telemetry?: TelemetryData
+  /** v7.4 institutional engine frame (closed-bar signals, structure, ledger). */
+  v74?: V74Frame | null
   status: string
 }
 
 export type ConnectionState = 'connected' | 'connecting' | 'disconnected'
 
-export function useLiveOrderBook(url = 'ws://localhost:8765') {
-  const [data, setData] = useState<LiveOrderBookData | null>(null)
-  const [connectionState, setConnectionState] = useState<ConnectionState>('connecting')
-  const [latencyMs, setLatencyMs] = useState<number>(0)
-  const wsRef = useRef<WebSocket | null>(null)
-  const reconnectTimeoutRef = useRef<any>(null)
+interface Snapshot {
+  data: LiveOrderBookData | null
+  connectionState: ConnectionState
+  latencyMs: number
+}
 
-  const connect = useCallback(() => {
-    try {
-      setConnectionState('connecting')
-      const ws = new WebSocket(url)
-      wsRef.current = ws
+/**
+ * One WebSocket per URL, shared by every component that calls `useLiveOrderBook()`.
+ * Ref-counted: the socket opens on the first subscriber and closes (and stops
+ * reconnecting) when the last one unmounts. Previously each panel opened its own
+ * socket, multiplying bridge load and JSON parsing per frame.
+ */
+export class SharedSocket {
+  private ws: WebSocket | null = null
+  private listeners = new Set<() => void>()
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private closedByUs = false
+  snapshot: Snapshot = { data: null, connectionState: 'connecting', latencyMs: 0 }
 
-      ws.onopen = () => {
-        setConnectionState('connected')
-      }
+  constructor(private url: string, private reconnectMs = 2000) {}
 
-      ws.onmessage = (event) => {
-        try {
-          const parsed = JSON.parse(event.data) as LiveOrderBookData
-          if (parsed && parsed.timestamp) {
-            setLatencyMs(Math.max(0, Date.now() - parsed.timestamp))
-          }
-          setData(parsed)
-        } catch (e) {
-          console.error('Error parsing OrderBook WS payload:', e)
-        }
-      }
-
-      ws.onerror = () => {
-        // ws.onclose will fire after error
-      }
-
-      ws.onclose = () => {
-        setConnectionState('disconnected')
-        reconnectTimeoutRef.current = setTimeout(() => {
-          connect()
-        }, 2000)
-      }
-    } catch {
-      setConnectionState('disconnected')
-      reconnectTimeoutRef.current = setTimeout(() => {
-        connect()
-      }, 2000)
-    }
-  }, [url])
-
-  const sendCommand = useCallback((action: string, payload: Record<string, any> = {}) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action, ...payload }))
-    }
-  }, [])
-
-  useEffect(() => {
-    connect()
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener)
+    if (this.listeners.size === 1) this.open()
     return () => {
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current)
-      }
-      if (wsRef.current) {
-        wsRef.current.close()
+      this.listeners.delete(listener)
+      if (this.listeners.size === 0) this.close()
+    }
+  }
+
+  getSnapshot = (): Snapshot => this.snapshot
+
+  send(action: string, payload: Record<string, unknown> = {}): boolean {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ action, ...payload }))
+      return true
+    }
+    return false
+  }
+
+  private emit(patch: Partial<Snapshot>) {
+    this.snapshot = { ...this.snapshot, ...patch }
+    this.listeners.forEach((l) => l())
+  }
+
+  private open() {
+    this.closedByUs = false
+    this.emit({ connectionState: 'connecting' })
+    let ws: WebSocket
+    try {
+      ws = new WebSocket(this.url)
+    } catch {
+      this.scheduleReconnect()
+      return
+    }
+    this.ws = ws
+    ws.onopen = () => this.emit({ connectionState: 'connected' })
+    ws.onmessage = (event: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(event.data as string)
+        // Only full bookmap frames replace state; command replies are ignored here.
+        if (!parsed || (parsed.type && parsed.type !== 'bookmap_update')) return
+        const latencyMs = parsed.timestamp ? Math.max(0, Date.now() - parsed.timestamp) : this.snapshot.latencyMs
+        this.emit({ data: parsed as LiveOrderBookData, latencyMs })
+      } catch (e) {
+        console.error('Error parsing OrderBook WS payload:', e)
       }
     }
-  }, [connect])
+    ws.onclose = () => {
+      this.ws = null
+      if (this.closedByUs) return
+      this.emit({ connectionState: 'disconnected' })
+      this.scheduleReconnect()
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.closedByUs || this.reconnectTimer) return
+    this.emit({ connectionState: 'disconnected' })
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      if (!this.closedByUs && this.listeners.size > 0) this.open()
+    }, this.reconnectMs)
+  }
+
+  private close() {
+    this.closedByUs = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    if (this.ws) {
+      this.ws.close()
+      this.ws = null
+    }
+  }
+}
+
+const sockets = new Map<string, SharedSocket>()
+
+export function getSharedSocket(url: string): SharedSocket {
+  let s = sockets.get(url)
+  if (!s) {
+    s = new SharedSocket(url)
+    sockets.set(url, s)
+  }
+  return s
+}
+
+/** Test hook: drop all cached sockets. */
+export function __resetSharedSockets() {
+  sockets.clear()
+}
+
+export const DEFAULT_BRIDGE_URL = 'ws://localhost:8765'
+
+export function useLiveOrderBook(url = DEFAULT_BRIDGE_URL) {
+  const socket = getSharedSocket(url)
+  const snap = useSyncExternalStore(socket.subscribe, socket.getSnapshot, socket.getSnapshot)
+
+  const sendCommand = useCallback(
+    (action: string, payload: Record<string, any> = {}) => {
+      socket.send(action, payload)
+    },
+    [socket],
+  )
 
   return {
-    data,
-    connectionState,
-    latencyMs,
+    data: snap.data,
+    connectionState: snap.connectionState,
+    latencyMs: snap.latencyMs,
     sendCommand,
   }
 }
