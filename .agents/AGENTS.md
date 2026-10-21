@@ -164,6 +164,11 @@ Located at [`trading-terminal/src/components/Dashboard/TradingViewDeepChart.tsx`
     - **Centered Numbers**: Crisp white volume ratio % (e.g., `80`, `130`, `187`, `99`, `129`).
   - **Click-to-Inspect Tooltip**: Clicking any bubble opens `🎯 Heavy Absorption Detector` showing price anchor, volume ratio vs 20-SMA, wick rejection %, bar bias, and institutional explanation.
 
+### 2b. v7.4 Signal Engine (`orderbook-bridge/engine/`)
+- Python port of OSC-VIP v7.4 + REG v7.4 (bar-for-bar parity tests in `orderbook-bridge/tests/`). Bridge publishes `terminal_state["v74"]` (only when changed); frontend types in `trading-terminal/src/types/v74.ts`.
+- **Honest-probability rule**: UI "win rate" = measured ledger hit rate after fees/slippage (Beta(2,2), Wilson CI, warm-up < 15 samples). Never label the OSC model score as a probability.
+- Chart layers live in `Dashboard/v74ChartLayers.ts`; panel in `Dashboard/V7SignalPanel.tsx`. Legacy `v7_engine.py` / `v7_signal` removed.
+
 ### 3. Deliberate Architectural Invariants (DO NOT REVERT)
 1. **NO VWAP OR EMA LINES**: VWAP and EMA 20 lines were intentionally removed from the terminal chart to maximize raw price action and microstructure visibility. Do NOT re-add them unless explicitly requested.
 2. **Zone Guide Line Gating (No Ghost Lines)**:

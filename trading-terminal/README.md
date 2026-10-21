@@ -58,8 +58,15 @@ npm run dev
 ```
 Open [http://localhost:5173](http://localhost:5173).
 
-### Step 3: Run Automated Test Suite
-From repository root:
+### Step 3: Run Automated Test Suites
 ```bash
-PYTHONPATH=. .venv/bin/pytest tests/
+cd orderbook-bridge && ../.venv/bin/python -m pytest tests -q   # engine + Pine parity
+cd trading-terminal && pnpm test                                # UI
 ```
+
+### v7.4 Signal Engine UI
+- **★ SIGNALS** panel (5m / 15m): active trade plan (entry, SL, TP1/TP2, size, cost in R), **measured** win rate with 95% CI and net expectancy (gray *warm-up* until n ≥ 15), long/short gate checklist, market context, recent signals. Tabs: **Ledger** (backtest vs live per setup, gross vs net, reliability chart) and **Risk** (equity, risk %, fees, leverage, stop/TP multiples, guardrail limits).
+- **Chart layers** (top-left toggles, persisted): Signals, Trade box, Structure (Unicorn FVG/breaker, RegOB, PDH/PDL, sweeps, RPD), Hopla 3/50/97, Vacuum pockets + magnet, History (closed outcomes in R). All distance-culled; no VWAP/EMA lines.
+- **Alerts**: toast + chime for each new live A+ (🔔 toggle in header); Telegram via `.env`.
+- Soft guardrail banner: daily -3R, 3 losses in a row, 5 A+ trades/day (configurable).
+- `VITE_BRIDGE_URL` overrides the default `ws://localhost:8765`.

@@ -335,7 +335,7 @@ function RecentSignals({ fr }: { fr: TimeframeFrame }) {
               {s.direction === 'LONG' ? '▲' : '▼'} {s.tier === 'A_PLUS' ? 'A+' : 'S'} {setupLabel(s.setup)}
             </span>
             <span className="text-terminal-text-dim">
-              {s.status === 'closed' ? `${s.outcome} ${fmtR(s.r_net)}` : s.status === 'history' ? 'warm-up' : 'open'} · {timeAgo(s.time)}
+              {s.status === 'closed' ? `${s.outcome} ${fmtR(s.r_net)}` : s.status === 'history' ? 'replay' : 'open'} · {timeAgo(s.time)}
             </span>
           </li>
         ))}

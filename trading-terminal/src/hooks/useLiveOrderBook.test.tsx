@@ -84,6 +84,23 @@ describe('useLiveOrderBook shared socket', () => {
     expect(getByTestId('a').textContent).toBe('connected:1')
   })
 
+  it('carries the last v74 frame forward when a frame omits it', () => {
+    let seen: any = null
+    function V() {
+      const { data } = useLiveOrderBook()
+      seen = data
+      return null
+    }
+    render(<V />)
+    act(() => {
+      MockWS.instances[0].fireOpen()
+      MockWS.instances[0].fireMessage({ type: 'bookmap_update', mid_price: 1, timestamp: Date.now(), v74: { version: 3 } })
+      MockWS.instances[0].fireMessage({ type: 'bookmap_update', mid_price: 2, timestamp: Date.now() })
+    })
+    expect(seen.mid_price).toBe(2)
+    expect(seen.v74.version).toBe(3)
+  })
+
   it('reconnects after a drop and closes when the last consumer unmounts', () => {
     const { unmount } = render(<Consumer id="a" />)
     act(() => MockWS.instances[0].fireOpen())

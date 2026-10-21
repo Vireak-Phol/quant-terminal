@@ -119,3 +119,36 @@ Open `http://localhost:5173` in your browser.
 ```bash
 PYTHONPATH=. .venv/bin/pytest tests/
 ```
+
+---
+
+## 6. v7.4 Institutional Signal Engine (`engine/`)
+
+Python port of `pine-strategy/7.4` (OSC-VIP v7.4 + REG/UIS-VIP v7.4), driven by closed bars only so live == backtest.
+
+| Module | Role |
+|---|---|
+| `pine.py`, `sessions.py`, `htf.py` | Pine runtime primitives (ta.* semantics), NY killzones (DST-aware), 4H / cross-symbol alignment |
+| `osc_engine.py` | OSC §3–§6: shock guard, CF-VWAP-Z, SMPI, ER regime, CHoCH/FVG/OB/sweeps/trap, liquidity vacuum, Hopla, log-odds + N_eff scoring, EQS, dynamic A+ threshold, tiers |
+| `reg/unicorn.py`, `reg/liquidity.py`, `reg/rpd.py`, `reg/regob.py` | REG: FVG+breaker (CTF+MTF), liquidity zones/sweeps + PDH/PDL, RPD, Regression OBs |
+| `risk.py` | Trade plan: session-σ stops (wall-anchored when a resting wall is within 0.5 ATR), TP1/TP2, sizing, leverage cap, fees + slippage in R |
+| `ledger.py`, `calibration.py` | SQLite ledger (`data/ledger.db`), outcome resolution, Beta(2,2) + Wilson CI per setup × tier × score bin |
+| `runtime.py`, `live.py` | Per-timeframe orchestrator (5m, 15m), warm-up, live bar polling, `v74` WebSocket frame, soft guardrails |
+| `backtest.py` | Full-history replay through the identical code path |
+| `alerts.py` | Opt-in Telegram alerts (`.env`, see `.env.example`) |
+
+**Probability rule.** The only number shown as "win rate" is the measured, cost-adjusted hit rate from the ledger (gray *warm-up* until n ≥ 15). The OSC model score is used internally for tiering/ranking.
+
+**Parity with TradingView** (`tests/test_osc_parity.py`, fixtures exported from TradingView Desktop): OSC A+/Structural/Trap, killzones, shock, vacuum, VWAP-Z and SMPI match bar-for-bar; REG Unicorn setups and liquidity sweeps exact; RPD 85% (residual is TradingView's internal 20m MTF series).
+
+### Commands
+```bash
+# tests (from orderbook-bridge/)
+../.venv/bin/python -m pytest tests -q
+# backtest → fills ledger with source=backtest, prints per-setup stats
+../.venv/bin/python -m engine.backtest --tf 5m --tf 15m --json ../data/backtest_report.json
+# bridge on another port (frontend: VITE_BRIDGE_URL=ws://localhost:8766 pnpm dev)
+BRIDGE_PORT=8766 PYTHONPATH=orderbook-bridge:. .venv/bin/python3 orderbook-bridge/bridge.py
+```
+
+WebSocket commands: `{"action":"get_ledger","tf":"5m"}` → `{"type":"ledger",…}`; `{"action":"set_risk_config","config":{…}}` → `{"type":"risk_config","ok":…}` (validated, saved to `data/config.json`).

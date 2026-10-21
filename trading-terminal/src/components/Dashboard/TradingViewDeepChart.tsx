@@ -1589,7 +1589,7 @@ export function TradingViewDeepChart({
         {/* v7.4 layer toggles */}
         {onToggleV74Layer && (
           <div
-            className="absolute top-2 left-2 z-20 flex flex-wrap items-center gap-0.5 rounded border border-terminal-border/70 bg-[#090d16]/85 p-0.5 font-mono text-[10px]"
+            className="absolute top-9 left-2 z-20 flex flex-wrap items-center gap-0.5 rounded border border-terminal-border/70 bg-[#090d16]/85 p-0.5 font-mono text-[10px]"
             role="group"
             aria-label={`v7.4 chart layers (${signalTf})`}
           >

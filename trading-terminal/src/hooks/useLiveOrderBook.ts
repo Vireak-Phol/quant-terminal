@@ -64,44 +64,6 @@ export interface TradePoint {
   id?: number
 }
 
-export interface V7Signal {
-  id: string
-  direction: 'LONG' | 'SHORT'
-  tier: 'TIER_1_A_PLUS' | 'TIER_2_STRUCTURAL' | 'TRAP_WARNING'
-  tier_label: string
-  win_probability: number
-  entry_price: number
-  stop_loss: number
-  tp1: number
-  tp2: number
-  risk_reward: number
-  wall_price: number
-  wall_size: number
-  confluence_factors: string[]
-  timestamp: number
-}
-
-export interface HoplaLevels {
-  box_low?: number
-  box_high?: number
-  line_3_disc?: number
-  line_97_prem?: number
-  line_50_eq?: number
-  line_97_above?: number
-  line_3_below?: number
-  at_discount?: boolean
-  at_premium?: boolean
-}
-
-export interface ActiveFVG {
-  id: string
-  side: 'bullish' | 'bearish'
-  time: number
-  top: number
-  bottom: number
-  size: number
-}
-
 export interface TelemetryData {
   connection_state: string
   order_book_sync_state: string
@@ -142,9 +104,6 @@ export interface LiveOrderBookData {
   mark_price?: number
   funding_rate?: number
   v6_flow_signal: 'BULLISH_PRESSURE' | 'BEARISH_PRESSURE' | 'BALANCED'
-  v7_signal?: V7Signal | null
-  hopla?: HoplaLevels
-  active_fvgs?: ActiveFVG[]
   telemetry?: TelemetryData
   /** v7.4 institutional engine frame (closed-bar signals, structure, ledger). */
   v74?: V74Frame | null
@@ -229,6 +188,8 @@ export class SharedSocket {
           return
         }
         const latencyMs = parsed.timestamp ? Math.max(0, Date.now() - parsed.timestamp) : this.snapshot.latencyMs
+        // The bridge sends the heavy `v74` frame only when it changes; carry the last one forward.
+        if (!('v74' in parsed) && this.snapshot.data?.v74 !== undefined) parsed.v74 = this.snapshot.data.v74
         this.emit({ data: parsed as LiveOrderBookData, latencyMs })
       } catch (e) {
         console.error('Error parsing OrderBook WS payload:', e)
@@ -280,7 +241,8 @@ export function __resetSharedSockets() {
   sockets.clear()
 }
 
-export const DEFAULT_BRIDGE_URL = 'ws://localhost:8765'
+export const DEFAULT_BRIDGE_URL: string =
+  (import.meta as any).env?.VITE_BRIDGE_URL || 'ws://localhost:8765'
 
 export function useLiveOrderBook(url = DEFAULT_BRIDGE_URL) {
   const socket = getSharedSocket(url)

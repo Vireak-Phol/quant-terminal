@@ -7,7 +7,7 @@ Capabilities:
 1. Sequence-synchronized L2 Order Book with REST snapshot recovery & gap detection.
 2. Resting Liquidity Zone overlay engine with multi-threshold clustering & lifecycle tracking.
 3. Absorption bubble candidate engine with volatility-normalized volume vs. price response.
-4. v7.4 Bayesian institutional confluence scoring & PO3 Hopla levels.
+4. v7.4 engine (engine/): OSC-VIP + REG v7.4 port, empirical ledger calibration, risk plans.
 5. Event recording & replay engine.
 6. Broadcasts structured JSON frames to trading-terminal on ws://0.0.0.0:8765.
 """
@@ -35,7 +35,6 @@ from market_data.binance_futures import BinanceFuturesProvider
 from analytics.liquidity_zones import LiquidityZoneDetector, LiquidityZone
 from analytics.absorption_engine import AbsorptionEngine, AbsorptionCandidate
 from replay.replay_engine import MarketRecorder, ReplayPlayer
-from v7_engine import V7InstitutionalEngine
 from engine.live import LiveHub
 from engine.orderflow import OrderflowSnapshot
 from engine.alerts import AlertDispatcher
@@ -46,7 +45,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TerminalBridge")
 
-PORT = 8765
+PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 SYMBOL = "XAUUSDT"
 
 # Connected frontend clients
@@ -68,7 +67,6 @@ absorption_engine = AbsorptionEngine(
 )
 recorder = MarketRecorder(output_dir="data/recordings")
 replay_player = ReplayPlayer()
-v7_engine = V7InstitutionalEngine(hopla_range=27.0)
 alerts = AlertDispatcher.from_env()
 
 
@@ -90,9 +88,14 @@ hub = LiveHub(symbol=SYMBOL, snapshot_fn=_orderflow_snapshot, on_signal=alerts.o
 _v74_cache: Dict[str, Any] = {"version": -1, "at": 0.0, "frame": None}
 
 
-def refresh_v74_frame() -> None:
-    """Rebuild the v7.4 frame when the engine changed (bar close) or every 5 s (guardrails)."""
+def refresh_v74_frame() -> bool:
+    """Rebuild the v7.4 frame when the engine changed (bar close) or every 5 s (guardrails).
+
+    Returns True when the frame changed. The frame (~70 KB) is only broadcast on change;
+    other depth frames omit the key and the UI keeps its last copy.
+    """
     now = time.time()
+    changed = False
     if hub.version != _v74_cache["version"] or now - _v74_cache["at"] > 5.0:
         try:
             frame = hub.frame(terminal_state["mid_price"] or None)
@@ -100,10 +103,12 @@ def refresh_v74_frame() -> None:
                 _v74_cache["frame"] = frame
                 _v74_cache["version"] = hub.version
                 _v74_cache["at"] = now
+                changed = True
         except Exception as e:  # never let the UI frame break the depth feed
             logger.error(f"v74 frame error: {e}")
             _v74_cache["at"] = now
     terminal_state["v74"] = _v74_cache["frame"]
+    return changed
 
 # Rolling display buffers
 PRICE_HISTORY = deque(maxlen=250)  # (time_ms, mid_price, best_bid, best_ask)
@@ -139,9 +144,6 @@ terminal_state: Dict[str, Any] = {
     "mark_price": 0.0,
     "funding_rate": 0.0,
     "v6_flow_signal": "BALANCED",
-    "v7_signal": None,
-    "hopla": {},
-    "active_fvgs": [],
     "v74": None,
     "telemetry": {
         "connection_state": "connecting",
@@ -210,16 +212,6 @@ async def on_depth_update(book: LocalOrderBook):
     else:
         flow_signal = "BALANCED"
 
-    # Evaluate v7 Bayesian institutional signal engine
-    v7_signal = v7_engine.evaluate_signals(
-        mid_price=mid_price,
-        spread=spread,
-        imbalance=imbalance,
-        resting_walls=resting_walls,
-        recent_trades=list(RECENT_TRADES),
-    )
-    v7_telemetry = v7_engine.get_telemetry_snapshot(mid_price)
-
     top5_bid_vol = sum(b["size"] for b in top_bids[:5])
     top5_ask_vol = sum(a["size"] for a in top_asks[:5])
     bid_total_vol = sum(b["size"] for b in top_bids)
@@ -243,9 +235,6 @@ async def on_depth_update(book: LocalOrderBook):
     terminal_state["liquidity_zones"] = [z.to_dict() for z in CURRENT_ZONES]
     terminal_state["price_history"] = list(PRICE_HISTORY)
     terminal_state["v6_flow_signal"] = flow_signal
-    terminal_state["v7_signal"] = v7_signal
-    terminal_state["hopla"] = v7_telemetry.get("hopla", {})
-    terminal_state["active_fvgs"] = v7_telemetry.get("active_fvgs", [])
     terminal_state["mark_price"] = provider.mark_price
     terminal_state["funding_rate"] = provider.funding_rate
     terminal_state["status"] = "LIVE_FEED"
@@ -310,8 +299,10 @@ async def broadcast():
     """Broadcasts current snapshot to connected UI terminals."""
     if not CLIENTS or terminal_state["mid_price"] == 0.0:
         return
-    refresh_v74_frame()
-    msg = json.dumps(terminal_state)
+    if refresh_v74_frame():
+        msg = json.dumps(terminal_state)
+    else:
+        msg = json.dumps({k: v for k, v in terminal_state.items() if k != "v74"})
     dead = set()
     for ws in CLIENTS:
         try:
