@@ -143,6 +143,10 @@ export interface LiveOrderBookData {
   open_interest?: number
   oi_delta?: number
   bubbles?: BubbleSignalData[]
+  /** Monotonic emit counter from the bridge bubble engine. The sweep-feed
+   *  selector keys its re-render off this so a new bubble is never dropped at
+   *  ring-buffer capacity when a same-signature fill repeats (Audit #1). */
+  bubblesRev?: number
   status: string
 }
 

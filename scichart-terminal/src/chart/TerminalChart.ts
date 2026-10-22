@@ -305,6 +305,8 @@ export class TerminalChart {
   // Last applied live-view range, to skip redundant visibleRange writes.
   private lastViewFirstX = NaN;
   private lastViewLastX = NaN;
+  private lastViewPad = NaN;
+  private lastViewWidth = NaN;
   private lastViewLo = NaN;
   private lastViewHi = NaN;
 
@@ -755,15 +757,22 @@ export class TerminalChart {
       // 2. Handle bucket advancement (including multi-bucket jumps when web tab was idle/backgrounded).
       if (bucket !== this.lastHeatmapBucket) {
         const elapsed = Math.round((bucket - this.lastHeatmapBucket) / this.tfSeconds);
-        const shiftCount = Math.min(HEATMAP_COLS, Math.max(1, elapsed));
-        this.lastHeatmapBucket = bucket;
-        for (let r = 0; r < PRICE_ROWS; r++) {
-          for (let k = 0; k < shiftCount; k++) {
-            this.rawZGrid[r].shift();
-            this.rawZGrid[r].push(0);
+        if (elapsed > 0) {
+          const shiftCount = Math.min(HEATMAP_COLS, elapsed);
+          this.lastHeatmapBucket = bucket;
+          for (let r = 0; r < PRICE_ROWS; r++) {
+            if (shiftCount >= HEATMAP_COLS) {
+              this.rawZGrid[r].fill(0);
+            } else {
+              this.rawZGrid[r] = this.rawZGrid[r].slice(shiftCount).concat(new Array(shiftCount).fill(0));
+            }
           }
+          dirty = true;
+        } else {
+          // Negative or zero elapsed (clock skew, replay, or out-of-order tick):
+          // do NOT shift existing resting history forward.
+          this.lastHeatmapBucket = bucket;
         }
-        dirty = true;
       }
 
       // Rebuild only the newest column from the current resting liquidity, and
@@ -1168,6 +1177,8 @@ export class TerminalChart {
   private invalidateView() {
     this.lastViewFirstX = NaN;
     this.lastViewLastX = NaN;
+    this.lastViewPad = NaN;
+    this.lastViewWidth = NaN;
     this.lastViewLo = NaN;
     this.lastViewHi = NaN;
   }
@@ -1184,17 +1195,17 @@ export class TerminalChart {
     const firstX = xVals.get(firstIdx);
 
     // Convert the desired RIGHT_OFFSET_PX whitespace into time (data) units so
-    // the active candle sits a constant ~200px clear of the right edge. The gap
-    // is part of the visible span, so solve for `pad` such that
-    //   pad / (candleSpan + pad) == RIGHT_OFFSET_PX / plotWidthPx
-    // => pad = candleSpan * OFF / (plotWidthPx - OFF).
-    // Fall back to a candle-width multiple before the surface has laid out
-    // (seriesViewRect width 0 on the very first frame).
+    // the active candle sits a constant ~200px clear of the right edge.
+    // Require at least 120px room for candles beyond the 200px offset so the
+    // denominator cannot collapse to zero / near-zero when side panels open.
     const candleSpan = Math.max(lastX - firstX, this.tfSeconds);
     let pad = this.tfSeconds * 4;
     const plotWidthPx = this.surface?.seriesViewRect?.width ?? 0;
-    if (plotWidthPx > RIGHT_OFFSET_PX) {
-      pad = (candleSpan * RIGHT_OFFSET_PX) / (plotWidthPx - RIGHT_OFFSET_PX);
+    const minSafePlot = RIGHT_OFFSET_PX + 120;
+    if (plotWidthPx > minSafePlot) {
+      const computedPad = (candleSpan * RIGHT_OFFSET_PX) / (plotWidthPx - RIGHT_OFFSET_PX);
+      // Cap pad to at most 1.5x candleSpan so candles never compress to hairlines
+      pad = Math.min(computedPad, candleSpan * 1.5);
     }
 
     const highs = this.candleData.getNativeHighValues();
@@ -1208,7 +1219,9 @@ export class TerminalChart {
       if (Number.isFinite(l) && l < lo) lo = l;
     }
 
-    const xChanged = firstX !== this.lastViewFirstX || lastX !== this.lastViewLastX;
+    const widthChanged = Math.abs(plotWidthPx - this.lastViewWidth) > 8;
+    const padChanged = Math.abs(pad - this.lastViewPad) > this.tfSeconds * 0.5;
+    const xChanged = firstX !== this.lastViewFirstX || lastX !== this.lastViewLastX || widthChanged || padChanged;
     const yOk = Number.isFinite(hi) && Number.isFinite(lo) && hi > lo;
     const yChanged = yOk && (lo !== this.lastViewLo || hi !== this.lastViewHi);
 
@@ -1219,6 +1232,8 @@ export class TerminalChart {
       this.xAxis.visibleRange = new NumberRange(firstX, lastX + pad);
       this.lastViewFirstX = firstX;
       this.lastViewLastX = lastX;
+      this.lastViewPad = pad;
+      this.lastViewWidth = plotWidthPx;
     }
     if (yChanged) {
       const padY = (hi - lo) * 0.12;

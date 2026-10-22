@@ -21,6 +21,7 @@ export function useBridge(url: string = DEFAULT_URL) {
   const wsRef = useRef<WebSocket | null>(null);
   const retryRef = useRef(0);
   const closedRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     closedRef.current = false;
@@ -55,7 +56,7 @@ export function useBridge(url: string = DEFAULT_URL) {
         if (closedRef.current) return;
         const delay = Math.min(1000 * 2 ** retryRef.current, 8000);
         retryRef.current += 1;
-        setTimeout(connect, delay);
+        reconnectTimerRef.current = setTimeout(connect, delay);
       };
 
       ws.onerror = () => {
@@ -67,6 +68,10 @@ export function useBridge(url: string = DEFAULT_URL) {
 
     return () => {
       closedRef.current = true;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       wsRef.current?.close();
     };
   }, [url]);

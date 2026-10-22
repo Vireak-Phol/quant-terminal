@@ -241,6 +241,7 @@ terminal_state: Dict[str, Any] = {
     "open_interest": 0.0,  # latest REST open interest (contracts)
     "oi_delta": 0.0,       # open_interest change between last two readings
     "bubbles": [],         # recent classified BubbleSignal dicts (ring buffer)
+    "bubblesRev": 0,       # monotonic emit counter (UI sweep-feed change-detect)
     # --- Audit R3: session/killzone + key levels + sweep events ---
     "session": {
         "london": False,
@@ -458,6 +459,8 @@ async def on_trade_received(trade: TradeEvent):
     terminal_state["oi_delta"] = bubble_state["oi_delta"]
     # Only ship the most recent sweeps so the frame stays light (engine retains 500).
     terminal_state["bubbles"] = bubble_state["bubbles"][-40:]
+    # Monotonic revision drives the UI's sweep-feed change detection (Audit #1).
+    terminal_state["bubblesRev"] = bubble_state["bubblesRev"]
 
     # --- Audit #5: feed the session regime baseline at each 1-minute bar close ---
     # The closed trade candle's transacted volume is a clean per-minute sample of
@@ -530,6 +533,17 @@ async def broadcast():
     """Broadcasts current snapshot to connected UI terminals."""
     if not CLIENTS or terminal_state["mid_price"] == 0.0:
         return
+    # Audit #4: a coalescing sweep only emits on the *next* trade. If the tape
+    # pauses right after an institutional absorption completes, the sweep is
+    # trapped in the engine and the bubble never reaches the UI until more flow
+    # arrives — so absorption bubbles appear to need a reload. Flush any sweep
+    # that has gone quiet past the coalesce window so it ships in real time.
+    if bubble_engine.flush_if_stale(int(time.time() * 1000)) is not None:
+        bubble_state = bubble_engine.to_dict()
+        terminal_state["open_interest"] = bubble_state["open_interest"]
+        terminal_state["oi_delta"] = bubble_state["oi_delta"]
+        terminal_state["bubbles"] = bubble_state["bubbles"][-40:]
+        terminal_state["bubblesRev"] = bubble_state["bubblesRev"]
     if refresh_v74_frame():
         msg = safe_json_dumps(terminal_state)
     else:

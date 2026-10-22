@@ -274,18 +274,25 @@ class BinanceFuturesProvider(MarketDataProvider):
 
         def _fetch():
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (MarketMicrostructure/1.0)"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 return json.loads(resp.read().decode("utf-8"))
 
         while self._running:
             try:
                 data = await loop.run_in_executor(None, _fetch)
+                if not self._running:
+                    break
                 oi = data.get("openInterest")
                 if oi is not None:
                     self.open_interest = float(oi)
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.debug(f"[{self.symbol}] open interest poll failed: {e}")
-            await asyncio.sleep(self._oi_poll_sec)
+            try:
+                await asyncio.sleep(self._oi_poll_sec)
+            except asyncio.CancelledError:
+                break
 
     async def _stream_loop(self):
         """Main resilient WebSocket streaming loop with exponential backoff & jitter."""

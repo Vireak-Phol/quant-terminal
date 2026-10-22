@@ -113,8 +113,15 @@ class BubbleRegimeEngine:
         # Active sweep accumulator.
         self._active_side: Optional[str] = None
         self._active_start_ts: int = 0
+        self._active_last_ts: int = 0
         self._active_prices: List[float] = []
         self._active_qtys: List[float] = []
+
+        # Monotonic revision: bumped on every emitted signal. The UI keys its
+        # sweep-feed re-render off this so a new bubble is never silently dropped
+        # when the ring buffer is at capacity and a same-signature fill repeats
+        # (Audit #1 — reactive stale key).
+        self._rev: int = 0
 
         # OI + liquidation context.
         self.recent_liquidations: Deque[Liquidation] = deque(maxlen=retention)
@@ -163,12 +170,14 @@ class BubbleRegimeEngine:
         ):
             self._active_prices.append(price)
             self._active_qtys.append(qty)
+            self._active_last_ts = timestamp_ms
             return None
 
         # Side flipped or window lapsed → flush the previous sweep, start a new one.
         emitted = self._flush_active_sweep()
         self._active_side = aggressor_side
         self._active_start_ts = timestamp_ms
+        self._active_last_ts = timestamp_ms
         self._active_prices = [price]
         self._active_qtys = [qty]
         return emitted
@@ -176,6 +185,45 @@ class BubbleRegimeEngine:
     def flush_pending(self) -> Optional[BubbleSignal]:
         """Force-emit any trailing sweep (e.g. at shutdown)."""
         return self._flush_active_sweep()
+
+    def has_pending_sweep(self, now_ms: int) -> bool:
+        """True when an accumulating sweep has gone quiet past the coalesce window.
+
+        The coalesce accumulator only emits on the *next* trade that flips side or
+        lapses the window. If the tape pauses right after an institutional
+        absorption completes, the sweep sits in `_active_*` and never reaches the
+        UI until another trade arrives — so absorption bubbles appear to require a
+        reload (Audit #4). The broadcast loop calls this every tick to detect a
+        quiet-but-complete sweep and flush it in real time.
+        """
+        if self._active_side is None or not self._active_qtys:
+            return False
+        return (now_ms - self._active_last_ts) > self.sweep_coalesce_ms
+
+    def flush_if_stale(self, now_ms: int) -> Optional[BubbleSignal]:
+        """Emit the trailing sweep if it has gone quiet past the coalesce window.
+
+        Returns the emitted signal (or None). Safe to call on every broadcast
+        tick; it is a no-op while a sweep is still actively accumulating.
+        """
+        if not self.has_pending_sweep(now_ms):
+            return None
+        return self._flush_active_sweep()
+
+    @property
+    def rev(self) -> int:
+        """Monotonic counter, bumped once per emitted signal (UI change-detect)."""
+        return self._rev
+
+    def flush_if_expired(self, now_ms: int) -> Optional[BubbleSignal]:
+        """Flush and emit trailing sweep if active coalesce window has lapsed."""
+        if (
+            self._active_qtys
+            and self._active_side is not None
+            and (now_ms - self._active_start_ts) > self.sweep_coalesce_ms
+        ):
+            return self._flush_active_sweep()
+        return None
 
     # ── classification ─────────────────────────────────────────────────────────
     def _flush_active_sweep(self) -> Optional[BubbleSignal]:
@@ -186,6 +234,7 @@ class BubbleRegimeEngine:
         if total_qty < self.min_bubble_qty:
             self._active_qtys.clear()
             self._active_prices.clear()
+            self._active_side = None
             return None
 
         vwap = sum(p * q for p, q in zip(self._active_prices, self._active_qtys)) / total_qty
@@ -213,9 +262,11 @@ class BubbleRegimeEngine:
             regime=regime,
         )
         self.emitted.append(signal)
+        self._rev += 1
 
         self._active_qtys.clear()
         self._active_prices.clear()
+        self._active_side = None
         return signal
 
     def _classify(
@@ -242,4 +293,8 @@ class BubbleRegimeEngine:
             "open_interest": round(self.latest_oi, 3),
             "oi_delta": round(self.latest_oi - self.prev_oi, 3),
             "bubbles": [s.to_dict() for s in self.emitted],
+            # Monotonic emit counter — the UI equality check keys its sweep-feed
+            # re-render off this so a new bubble is never dropped at ring-buffer
+            # capacity when a same-signature fill repeats (Audit #1).
+            "bubblesRev": self._rev,
         }

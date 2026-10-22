@@ -180,6 +180,8 @@ export interface BookmapFrame {
   open_interest?: number;
   oi_delta?: number;
   bubbles?: BubbleSignal[];
+  /** Monotonic emit counter from the bridge bubble engine (UI change-detect). */
+  bubblesRev?: number;
   // --- Audit R3: session/killzone + key levels + sweep events ---
   session: SessionFlags;
   key_levels: KeyLevels;

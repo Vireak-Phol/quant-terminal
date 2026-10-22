@@ -119,3 +119,71 @@ def test_to_dict_is_json_friendly():
     # prices/quantities emitted as strings per repo convention
     assert isinstance(b["priceCenter"], str)
     assert isinstance(b["totalQuantity"], str)
+
+
+def test_flush_if_stale():
+    eng = BubbleRegimeEngine(sweep_coalesce_ms=12, min_bubble_qty=20.0)
+    # Trade starts at 1000ms
+    eng.process_trade(price=4100.0, qty=30.0, aggressor_side="buy", timestamp_ms=1000)
+    # At 1005ms (5ms elapsed, <= 12ms coalesce): should NOT flush
+    assert eng.flush_if_stale(1005) is None
+    # At 1015ms (15ms elapsed, > 12ms coalesce): should flush and emit
+    sig = eng.flush_if_stale(1015)
+    assert sig is not None
+    assert sig.total_qty == 30.0
+    assert sig.aggressor_side == "buy"
+    # Subsequent call with empty buffer: returns None
+    assert eng.flush_if_stale(1020) is None
+
+
+def test_has_pending_sweep_quiet_vs_active():
+    eng = BubbleRegimeEngine(sweep_coalesce_ms=12, min_bubble_qty=20.0)
+    # No active sweep yet.
+    assert eng.has_pending_sweep(1000) is False
+    eng.process_trade(price=4100.0, qty=30.0, aggressor_side="buy", timestamp_ms=1000)
+    # Still inside the coalesce window → not yet pending.
+    assert eng.has_pending_sweep(1008) is False
+    # Gone quiet past the window → a trailing sweep is pending for real-time flush.
+    assert eng.has_pending_sweep(1015) is True
+
+
+def test_real_time_flush_without_next_trade():
+    """Audit #4: a trailing absorption must ship without waiting for a new trade."""
+    eng = BubbleRegimeEngine(sweep_coalesce_ms=12, min_bubble_qty=20.0)
+    eng.update_open_interest(12_500.0)
+    eng.update_open_interest(12_540.0)
+    # Institutional absorption: three tight fills, then the tape goes silent.
+    for i, q in enumerate([18.0, 20.0, 17.0]):
+        eng.process_trade(price=4140.0, qty=q, aggressor_side="sell", timestamp_ms=1000 + i * 3)
+    # Before the flush the bubble is trapped in the accumulator — UI would be empty.
+    assert eng.to_dict()["bubbles"] == []
+    # Broadcast loop detects the quiet sweep and flushes it in real time.
+    flushed = eng.flush_if_stale(1050)
+    assert flushed is not None
+    assert flushed.regime == REGIME_INSTITUTIONAL_ABSORPTION_OPEN
+    assert len(eng.to_dict()["bubbles"]) == 1
+
+
+def test_rev_counter_monotonic_on_emit():
+    """The UI keys its sweep-feed re-render off `bubblesRev`; it must advance once
+    per emitted signal and never on sub-threshold / no-op flushes (Audit #1)."""
+    eng = BubbleRegimeEngine(sweep_coalesce_ms=12, min_bubble_qty=20.0)
+    assert eng.rev == 0
+    assert eng.to_dict()["bubblesRev"] == 0
+    # Sub-threshold sweep: no emit, rev unchanged.
+    eng.process_trade(price=4100.0, qty=5.0, aggressor_side="buy", timestamp_ms=1000)
+    assert eng.flush_if_stale(1050) is None
+    assert eng.rev == 0
+    # First qualifying sweep → rev 1.
+    eng.process_trade(price=4100.0, qty=30.0, aggressor_side="buy", timestamp_ms=2000)
+    assert eng.flush_if_stale(2050) is not None
+    assert eng.rev == 1
+    assert eng.to_dict()["bubblesRev"] == 1
+    # Second qualifying sweep → rev 2 (monotonic).
+    eng.process_trade(price=4101.0, qty=40.0, aggressor_side="sell", timestamp_ms=3000)
+    assert eng.flush_if_stale(3050) is not None
+    assert eng.rev == 2
+    # No pending sweep → flush is a no-op, rev stays at 2.
+    assert eng.flush_if_stale(4000) is None
+    assert eng.rev == 2
+

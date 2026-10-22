@@ -152,15 +152,18 @@ export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
     (snap) => {
       const d = snap.data
       const bubbles = d?.bubbles ?? []
+      // `bubblesRev` is a monotonic counter the bridge bumps once per emitted
+      // sweep. Keying the equality check off it means a brand-new sweep is never
+      // silently dropped — even at ring-buffer capacity (count === 40) when a
+      // same-signature algorithmic fill repeats the newest entry (Audit #1). We
+      // keep count as a cheap fallback for frames predating the rev field.
       return {
-        // Identity key: newest timestamp + count is enough to detect a change
-        // without deep-comparing the whole array every frame.
-        lastTs: bubbles.length ? bubbles[bubbles.length - 1].timestamp : 0,
+        rev: d?.bubblesRev ?? 0,
         count: bubbles.length,
         bubbles,
       }
     },
-    (a, b) => a.lastTs === b.lastTs && a.count === b.count,
+    (a, b) => a.rev === b.rev && a.count === b.count,
   )
 
   // Local 1s ticker so relative timestamps ("4s", "25s") keep advancing during
@@ -247,13 +250,13 @@ export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
             </p>
           ) : (
             <div className="space-y-1 pt-1">
-              {feed.map((b) => {
+              {feed.map((b, i) => {
                 const meta = REGIME_META[b.regime] ?? REGIME_META.standard_flow
                 const isBuy = b.aggressorSide === 'buy'
                 const liq = Number(b.liquidationQuantity)
                 return (
                   <div
-                    key={`${b.timestamp}-${b.priceCenter}-${b.aggressorSide}-${b.totalQuantity}`}
+                    key={`${b.timestamp}-${b.priceCenter}-${b.aggressorSide}-${b.totalQuantity}-${i}`}
                     className={`flex items-center gap-2 px-2 py-1.5 rounded bg-terminal-surface border ${meta.border}`}
                   >
                     <span className="text-sm leading-none">{meta.glyph}</span>
