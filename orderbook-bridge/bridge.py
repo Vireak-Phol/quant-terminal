@@ -38,6 +38,7 @@ from analytics.liquidity_zones import LiquidityZoneDetector, LiquidityZone
 from analytics.absorption_engine import AbsorptionEngine, AbsorptionCandidate
 from analytics.vacuum_engine import VacuumEngine, Candle
 from analytics.trade_candles import TradeCandleAggregator
+from analytics.bubble_regime_engine import BubbleRegimeEngine, Liquidation
 from engine.sessions import session_flags as _v74_session_flags
 from replay.replay_engine import MarketRecorder, ReplayPlayer
 from engine.live import LiveHub
@@ -109,6 +110,9 @@ class _CandleAggregator:
 candle_agg = _CandleAggregator(VACUUM_BAR_MS)
 # Trade-price candle aggregator for OHLCV + delta + CVD (audit R1)
 trade_candle_agg = TradeCandleAggregator(interval_ms=60_000)
+# Bubble Regime engine: OI + liquidation classifier for aggressive sweeps.
+# Fed by the live aggTrade stream, @forceOrder liquidations, and REST open interest.
+bubble_engine = BubbleRegimeEngine()
 recorder = MarketRecorder(output_dir="data/recordings")
 replay_player = ReplayPlayer()
 alerts = AlertDispatcher.from_env()
@@ -194,6 +198,10 @@ terminal_state: Dict[str, Any] = {
     # --- Audit R1: trade-price candles + CVD ---
     "trade_candle": None,  # current forming TradeCandle (closed=False)
     "cvd": 0.0,            # session-anchored cumulative volume delta (oz)
+    # --- Bubble Regime engine: OI + liquidation classified sweeps ---
+    "open_interest": 0.0,  # latest REST open interest (contracts)
+    "oi_delta": 0.0,       # open_interest change between last two readings
+    "bubbles": [],         # recent classified BubbleSignal dicts (ring buffer)
     # --- Audit R3: session/killzone + key levels + sweep events ---
     "session": {
         "london": False,
@@ -390,6 +398,28 @@ async def on_trade_received(trade: TradeEvent):
     terminal_state["trade_candle"] = forming.to_dict() if forming else None
     terminal_state["cvd"] = trade_candle_agg.cvd()
 
+    # --- Bubble Regime engine: classify aggressive sweeps with OI + liquidation ---
+    # Refresh the latest OI reading (polled by the provider) before processing the
+    # trade so sweep classification sees the freshest OI delta.
+    bubble_engine.update_open_interest(provider.open_interest)
+    bubble_signal = bubble_engine.process_trade(
+        price=float(trade.price),
+        qty=float(trade.quantity),
+        aggressor_side=trade.aggressor_side,
+        timestamp_ms=trade.exchange_timestamp,
+    )
+    if bubble_signal is not None:
+        logger.info(
+            f"🫧 Bubble[{bubble_signal.regime}] {bubble_signal.aggressor_side} "
+            f"{bubble_signal.total_qty:.1f} @ {bubble_signal.price_center:.2f} "
+            f"(oiΔ={bubble_signal.oi_delta:+.1f}, liq={bubble_signal.liquidation_qty:.1f})"
+        )
+    bubble_state = bubble_engine.to_dict()
+    terminal_state["open_interest"] = bubble_state["open_interest"]
+    terminal_state["oi_delta"] = bubble_state["oi_delta"]
+    # Only ship the most recent sweeps so the frame stays light (engine retains 500).
+    terminal_state["bubbles"] = bubble_state["bubbles"][-40:]
+
     # --- Audit #5: feed the session regime baseline at each 1-minute bar close ---
     # The closed trade candle's transacted volume is a clean per-minute sample of
     # how thick/thin the tape currently is. Pushing it to update_session_baseline
@@ -416,6 +446,23 @@ async def on_trade_received(trade: TradeEvent):
 
     if recorder.is_recording:
         recorder.record_event("trade", trade.to_dict())
+
+
+async def on_liquidation_received(liq: Dict[str, Any]):
+    """Callback for @forceOrder liquidation prints — feeds the Bubble Regime engine."""
+    try:
+        bubble_engine.record_liquidation(Liquidation(
+            timestamp_ms=int(liq["timestamp_ms"]),
+            side=str(liq["side"]),
+            price=float(liq["price"]),
+            qty=float(liq["qty"]),
+        ))
+    except (KeyError, TypeError, ValueError) as e:
+        logger.debug(f"bad liquidation payload {liq!r}: {e}")
+        return
+    logger.info(f"💥 Liquidation {liq['side']} {liq['qty']:.1f} @ {liq['price']:.2f}")
+    if recorder.is_recording:
+        recorder.record_event("liquidation", liq)
 
 
 async def broadcast():
@@ -508,6 +555,7 @@ async def main():
     # Register callbacks with provider
     provider.register_depth_callback(on_depth_update)
     provider.register_trade_callback(on_trade_received)
+    provider.register_liquidation_callback(on_liquidation_received)
 
     # Start provider & broadcast loop
     await provider.start()

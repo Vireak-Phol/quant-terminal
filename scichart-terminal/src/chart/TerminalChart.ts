@@ -69,6 +69,7 @@ export interface ChartFrame {
     priceLow: string | number;
     priceHigh: string | number;
     displayedQuantity: string | number;
+    firstSeenTimestamp?: number;
   }>;
   absorption_candidates?: Array<{
     side: "buy" | "sell";
@@ -111,6 +112,22 @@ export interface ChartFrame {
     price: number;
     dir: number;
   }>;
+  // --- Bubble Regime engine: OI + liquidation classified sweeps ---
+  bubbles?: Array<{
+    type: "bubble_regime";
+    timestamp: number;
+    priceCenter: string | number;
+    aggressorSide: "buy" | "sell";
+    totalQuantity: string | number;
+    sweepTicks: number;
+    oiDelta: number;
+    liquidationQuantity: string | number;
+    regime:
+      | "standard_flow"
+      | "institutional_absorption_open"
+      | "liquidation_exhaustion_flush"
+      | "vacuum_sweep_breakout";
+  }>;
 }
 
 /** A clickable absorption bubble recorded for hit-testing. */
@@ -125,11 +142,23 @@ const HEATMAP_COLS = 160; // heatmap time columns
 const MAX_CANDLES = 1000; // candle history cap (retains the seeded HISTORY_LIMIT)
 const VISIBLE_CANDLES = 80; // how many candles the live view shows
 
+// Default whitespace (in screen pixels) kept to the RIGHT of the newest candle
+// in live-follow mode, so the active candle never hugs the right edge / the
+// price-axis badges. Converted to time units per-frame from the current plot
+// width (see applyLiveView), so it stays a constant on-screen gap regardless of
+// timeframe or zoom.
+const RIGHT_OFFSET_PX = 200;
+
 // Absorption bubbles are fixed-size markers (reverted from volume/zoom scaling):
 // every bubble is drawn at a constant pixel radius, matching the original
 // EllipsePointMarker look. `priceRadius` is retained on the annotation for
 // possible future use but is NOT used for sizing.
 const BUBBLE_RADIUS_PX = 12; // on-screen radius (24px diameter, original size)
+
+// How often (ms) the Heavy Absorption detector may re-run against the FORMING
+// (not-yet-closed) candle so a developing absorption appears in near real-time.
+// A full sweep is O(history), so it is throttled rather than run every frame.
+const LIVE_DETECT_MS = 1500;
 
 /**
  * A round absorption bubble. Positioned at a (time, price) point and rendered at
@@ -205,8 +234,6 @@ export class TerminalChart {
   // scale with the chart zoom, with radius proportional to volume. Each bubble
   // is a VolumeBubbleAnnotation; we keep them in one list for lifecycle mgmt.
   private bubbleAnnotations: VolumeBubbleAnnotation[] = [];
-  private buyWatermark!: TextAnnotation;
-  private sellWatermark!: TextAnnotation;
 
   private vacuumAnnotations: (BoxAnnotation | HorizontalLineAnnotation | TextAnnotation)[] = [];
   private hoplaAnnotations: HorizontalLineAnnotation[] = [];
@@ -214,8 +241,10 @@ export class TerminalChart {
   // --- Audit R3: key levels + sweep markers ---
   private keyLevelAnnotations: HorizontalLineAnnotation[] = [];
   private sweepAnnotations: (BoxAnnotation | TextAnnotation)[] = [];
+  private bubbleRegimeAnnotations: TextAnnotation[] = [];
   private keyLevelsSig = "";
   private sweepsSig = "";
+  private bubblesSig = "";
 
   // Candle history storage for the rolling absorption detector.
   private historicalCandles: CandleData[] = [];
@@ -223,8 +252,15 @@ export class TerminalChart {
   // Recorded bubble positions for click-to-inspect hit-testing.
   private bubbleHits: BubbleHit[] = [];
 
-  // Heatmap rolling grid [PRICE_ROWS][HEATMAP_COLS] (ring-buffered on the X axis).
-  private zGrid: number[][] = [];
+  // Heatmap rolling grids [PRICE_ROWS][HEATMAP_COLS] (ring-buffered on the X axis).
+  // rawZGrid holds resting quantities; displayZGrid is what the GPU sees. The
+  // BookMap time-decay fade is DISABLED by default (restored flat look) — when
+  // off, displayZGrid simply mirrors rawZGrid. The fade machinery is retained so
+  // it can be re-enabled via setHeatmapFade() without a code change.
+  private rawZGrid: number[][] = [];
+  private displayZGrid: number[][] = [];
+  private heatmapFadeEnabled = false;
+  private heatmapFadeStrength = 0.70;
   private priceFloor = 0;
   private lastHeatmapBucket = 0;
   private heatmapInitialized = false;
@@ -232,6 +268,15 @@ export class TerminalChart {
   // Candle aggregation state (bucketStartSec -> ohlc).
   private curBucket = 0;
   private curOhlc: { o: number; h: number; l: number; c: number } | null = null;
+  // Running max trade-volume accumulated into the CURRENT bucket. The trade_candle
+  // is a 60s rolling aggregate whose `v` is monotonically increasing within its
+  // minute and resets at each minute boundary; we take the per-frame max so the
+  // closing bucket's FINAL volume is captured on the rollover frame (which the
+  // same-bucket `else` branch never runs on). Without this, the just-closed
+  // candle keeps a stale/partial volume and the Heavy Absorption detector drops
+  // the newest bubble — which is why it only appeared after a browser reload
+  // (reload re-seeds true volumes from Binance klines).
+  private curBucketMaxVol = 0;
 
   // Live-follow control.
   private liveFollow = true;
@@ -254,6 +299,11 @@ export class TerminalChart {
   // Live-tape footprint dedup so identical carried-forward candidates are not
   // re-appended; bounded so a long session cannot grow it without limit.
   private seenFootprintIds = new Set<string>();
+  // Throttle for re-running the Heavy Absorption detector on the FORMING candle
+  // so a developing absorption surfaces in near real-time instead of only when
+  // the bar finally closes. Full detector sweeps are O(history); we cap them to
+  // once per LIVE_DETECT_MS. (ms epoch of the last forming-candle sweep.)
+  private lastLiveDetectMs = 0;
   // Last applied live-view range, to skip redundant visibleRange writes.
   private lastViewFirstX = NaN;
   private lastViewLastX = NaN;
@@ -264,7 +314,8 @@ export class TerminalChart {
     this.cfg = cfg;
     this.tfSeconds = TIMEFRAME_SECONDS[cfg.timeframe];
     for (let r = 0; r < PRICE_ROWS; r++) {
-      this.zGrid.push(new Array(HEATMAP_COLS).fill(0));
+      this.rawZGrid.push(new Array(HEATMAP_COLS).fill(0));
+      this.displayZGrid.push(new Array(HEATMAP_COLS).fill(0));
     }
   }
 
@@ -302,7 +353,7 @@ export class TerminalChart {
       xStep: this.tfSeconds,
       yStart: 0,
       yStep: this.cfg.tickSize,
-      zValues: this.zGrid.map((row) => [...row]),
+      zValues: this.displayZGrid.map((row) => [...row]),
     });
     this.heatmapSeries = new UniformHeatmapRenderableSeries(wasmContext, {
       dataSeries: this.heatmapData,
@@ -339,37 +390,7 @@ export class TerminalChart {
     // --- Absorption Bubbles (Heavy Absorption Indicator, DeepChart-style) ---
     // Bubbles are drawn as VolumeBubbleAnnotations in price units (so they scale
     // with zoom); they are created on demand in rebuildHeavyAbsorptions() and
-    // appendLiveFootprints(), not here. Buyers-absorbed = crimson, sellers =
-    // emerald. Only the static watermark labels are created at init time.
-
-    // Watermark labels.
-    this.buyWatermark = new TextAnnotation({
-      x1: 0.98,
-      y1: 0.96,
-      xCoordinateMode: ECoordinateMode.Relative,
-      yCoordinateMode: ECoordinateMode.Relative,
-      horizontalAnchorPoint: EHorizontalAnchorPoint.Right,
-      text: "BUYERS ABSORBED",
-      textColor: "rgba(239, 68, 68, 0.88)",
-      fontFamily: "'JetBrains Mono', monospace",
-      fontSize: 12,
-      fontWeight: "bold",
-    });
-    this.surface.annotations.add(this.buyWatermark);
-
-    this.sellWatermark = new TextAnnotation({
-      x1: 0.02,
-      y1: 0.04,
-      xCoordinateMode: ECoordinateMode.Relative,
-      yCoordinateMode: ECoordinateMode.Relative,
-      horizontalAnchorPoint: EHorizontalAnchorPoint.Left,
-      text: "SELLERS ABSORBED",
-      textColor: "rgba(34, 197, 94, 0.88)",
-      fontFamily: "'JetBrains Mono', monospace",
-      fontSize: 12,
-      fontWeight: "bold",
-    });
-    this.surface.annotations.add(this.sellWatermark);
+    // appendLiveFootprints(). Buyers-absorbed = crimson, sellers = emerald.
 
     // --- Interaction: wheel zoom, drag pan, double-click reset to live extents ---
     this.surface.chartModifiers.add(
@@ -401,6 +422,11 @@ export class TerminalChart {
         this.updateHopla(this.lastFrame);
       }
     }
+    // Bubble-regime markers share the `bubbles` toggle; rebuild from last frame.
+    if (layer === "bubbles" && this.lastFrame) {
+      this.bubblesSig = "";
+      this.updateBubbleRegimes(this.lastFrame);
+    }
   }
 
   getLayerVisibility(): Record<ChartLayer, boolean> {
@@ -410,8 +436,6 @@ export class TerminalChart {
   private applyLayerVisibility() {
     if (this.heatmapSeries) this.heatmapSeries.isVisible = this.layers.heatmap;
     for (const b of this.bubbleAnnotations) b.isHidden = !this.layers.bubbles;
-    if (this.buyWatermark) this.buyWatermark.isHidden = !this.layers.bubbles;
-    if (this.sellWatermark) this.sellWatermark.isHidden = !this.layers.bubbles;
   }
 
   /** Load historical candles from Binance to seed price action + absorption history. */
@@ -425,6 +449,7 @@ export class TerminalChart {
     const last = candles[candles.length - 1];
     this.curBucket = last.time;
     this.curOhlc = { o: last.open, h: last.high, l: last.low, c: last.close };
+    this.curBucketMaxVol = last.volume;
 
     if (this.priceFloor === 0) {
       const span = PRICE_ROWS * this.cfg.tickSize;
@@ -443,6 +468,7 @@ export class TerminalChart {
     this.tfSeconds = TIMEFRAME_SECONDS[tf];
     this.curOhlc = null;
     this.curBucket = 0;
+    this.curBucketMaxVol = 0;
     this.heatmapInitialized = false;
     this.lastHeatmapBucket = 0;
     this.historicalCandles = [];
@@ -459,9 +485,13 @@ export class TerminalChart {
     this.keyLevelAnnotations = [];
     for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
     this.sweepAnnotations = [];
+    this.bubblesSig = "";
+    for (const a of this.bubbleRegimeAnnotations) this.surface?.annotations.remove(a);
+    this.bubbleRegimeAnnotations = [];
     this.clearBubbles();
     for (let r = 0; r < PRICE_ROWS; r++) {
-      this.zGrid[r].fill(0);
+      this.rawZGrid[r].fill(0);
+      this.displayZGrid[r].fill(0);
     }
     this.liveFollow = true;
     this.invalidateView();
@@ -473,7 +503,20 @@ export class TerminalChart {
     this.lastFrame = frame;
     const nowSec = Math.floor((frame.timestamp ?? Date.now()) / 1000);
     const newCandle = this.updateCandles(frame, nowSec);
-    if (newCandle) this.rebuildHeavyAbsorptions();
+    if (newCandle) {
+      this.rebuildHeavyAbsorptions();
+      this.lastLiveDetectMs = frame.timestamp ?? Date.now();
+    } else {
+      // Re-run the detector against the FORMING candle on a throttle so a
+      // developing absorption (the newest/last bar) appears in near real-time
+      // rather than only once the bar closes. This is what made the latest
+      // bubble require a browser reload before. Skipped when bubbles are hidden.
+      const nowMs = frame.timestamp ?? Date.now();
+      if (this.layers.bubbles && nowMs - this.lastLiveDetectMs >= LIVE_DETECT_MS) {
+        this.lastLiveDetectMs = nowMs;
+        this.rebuildHeavyAbsorptions();
+      }
+    }
     this.updateHeatmap(frame, nowSec);
     if (frame.absorption_candidates && frame.absorption_candidates.length > 0) {
       this.appendLiveFootprints(frame.absorption_candidates);
@@ -484,9 +527,15 @@ export class TerminalChart {
     // --- Audit R3: key levels + sweep markers ---
     this.updateKeyLevels(frame);
     this.updateSweeps(frame);
+    this.updateBubbleRegimes(frame);
     if (this.liveFollow) {
       this.applyLiveView();
     }
+    // Force a redraw this frame. SciChart's internal render loop is rAF-driven
+    // and therefore paused while the tab is hidden; an explicit forced draw
+    // guarantees the active candle, heatmap and absorption bubbles advance even
+    // off-screen (the App drives update() from a timer when document.hidden).
+    this.surface.invalidateElement({ force: true });
   }
 
   /** Returns true when a new candle bucket was opened (caller rebuilds bubbles).
@@ -503,8 +552,24 @@ export class TerminalChart {
     const tc = frame.trade_candle;
     const bucket = Math.floor(nowSec / this.tfSeconds) * this.tfSeconds;
     if (this.curOhlc === null || bucket > this.curBucket) {
+      // A bucket just rolled. Flush the CLOSING candle's final volume before
+      // opening the new one: the same-bucket `else` below never runs on this
+      // frame, so without this flush the closed candle keeps a stale/partial
+      // volume and the Heavy Absorption detector drops the newest bubble (the
+      // exact reason it only surfaced after a browser reload). `curBucketMaxVol`
+      // holds the running max trade-volume accumulated into the closing bucket.
+      if (this.historicalCandles.length > 0 && this.curOhlc !== null) {
+        const closing = this.historicalCandles[this.historicalCandles.length - 1];
+        if (closing.time === this.curBucket) {
+          closing.volume = Math.max(closing.volume, this.curBucketMaxVol);
+        }
+      }
+
       this.curBucket = bucket;
       this.curOhlc = { o: price, h: price, l: price, c: price };
+      // The new bucket's running volume starts from the current trade_candle's
+      // reading (tc.v resets each minute; for a 1m chart it's this bucket's start).
+      this.curBucketMaxVol = tc ? tc.v : 0;
       this.candleData.append(bucket, price, price, price, price);
       while (this.candleData.count() > MAX_CANDLES) {
         this.candleData.removeAt(0);
@@ -539,8 +604,10 @@ export class TerminalChart {
       // and resets each minute, so accumulate the max seen per minute boundary.
       // For charts at the 1m timeframe this is the exact bucket volume; for
       // higher timeframes it approximates the folded total (good enough to keep
-      // the absorption detector live rather than blind).
+      // the absorption detector live rather than blind). Keep curBucketMaxVol in
+      // sync so the rollover flush above can commit the final volume.
       if (tc) {
+        this.curBucketMaxVol = Math.max(this.curBucketMaxVol, tc.v);
         last.volume = Math.max(last.volume, tc.v);
       }
     }
@@ -624,8 +691,29 @@ export class TerminalChart {
     const mid = frame.mid_price;
     const span = PRICE_ROWS * this.cfg.tickSize;
     let dirty = false;
+
+    // 1. Manage priceFloor and vertically translate existing rows when price floor moves.
+    // Without this row translation, historical resting levels get shifted to wrong prices
+    // whenever price wanders beyond the margin, causing broken pixels and disjointed steps.
     if (this.priceFloor === 0 || mid < this.priceFloor + 15 || mid > this.priceFloor + span - 15) {
-      this.priceFloor = Math.round((mid - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
+      const oldPriceFloor = this.priceFloor;
+      const newPriceFloor = Math.round((mid - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
+      if (oldPriceFloor !== 0 && oldPriceFloor !== newPriceFloor) {
+        const rowDelta = Math.round((newPriceFloor - oldPriceFloor) / this.cfg.tickSize);
+        for (let c = 0; c < HEATMAP_COLS; c++) {
+          const colData = new Array(PRICE_ROWS).fill(0);
+          for (let r = 0; r < PRICE_ROWS; r++) {
+            const oldR = r + rowDelta;
+            if (oldR >= 0 && oldR < PRICE_ROWS) {
+              colData[r] = this.rawZGrid[oldR][c];
+            }
+          }
+          for (let r = 0; r < PRICE_ROWS; r++) {
+            this.rawZGrid[r][c] = colData[r];
+          }
+        }
+      }
+      this.priceFloor = newPriceFloor;
       dirty = true;
     }
 
@@ -636,46 +724,116 @@ export class TerminalChart {
     if (!this.heatmapInitialized) {
       this.heatmapInitialized = true;
       this.lastHeatmapBucket = bucket;
-      for (let r = 0; r < PRICE_ROWS; r++) this.zGrid[r].fill(0);
-      this.paintZones(zones, (r, qty) => {
-        this.zGrid[r].fill(qty);
-      });
+      for (let r = 0; r < PRICE_ROWS; r++) this.rawZGrid[r].fill(0);
+
+      // Seed historical columns based on each zone's actual firstSeenTimestamp (or recent columns),
+      // so we don't paint a giant artificial flat brick across all 160 historical columns!
+      for (const z of zones) {
+        const lo = Number(z.priceLow);
+        const hi = Number(z.priceHigh);
+        const qty = Number(z.displayedQuantity);
+        if (!Number.isFinite(lo) || !Number.isFinite(qty)) continue;
+        const rLo = Math.floor((lo - this.priceFloor) / this.cfg.tickSize);
+        const rHi = Math.floor((hi - this.priceFloor) / this.cfg.tickSize);
+        if (rLo > PRICE_ROWS - 1 || rHi < 0) continue;
+
+        const firstSeen = z.firstSeenTimestamp
+          ? (z.firstSeenTimestamp > 1e11 ? Math.floor(z.firstSeenTimestamp / 1000) : z.firstSeenTimestamp)
+          : null;
+
+        for (let c = 0; c < HEATMAP_COLS; c++) {
+          const colTime = bucket - (HEATMAP_COLS - 1 - c) * this.tfSeconds;
+          const shouldPaint = firstSeen != null
+            ? colTime >= firstSeen
+            : c >= HEATMAP_COLS - 20;
+          if (shouldPaint) {
+            for (let r = Math.max(0, rLo); r <= Math.min(PRICE_ROWS - 1, rHi); r++) {
+              this.rawZGrid[r][c] = Math.max(this.rawZGrid[r][c], qty);
+            }
+          }
+        }
+      }
+      this.recalculateDisplayGrid();
       dirty = true;
     } else {
+      // 2. Handle bucket advancement (including multi-bucket jumps when web tab was idle/backgrounded).
       if (bucket !== this.lastHeatmapBucket) {
+        const elapsed = Math.round((bucket - this.lastHeatmapBucket) / this.tfSeconds);
+        const shiftCount = Math.min(HEATMAP_COLS, Math.max(1, elapsed));
         this.lastHeatmapBucket = bucket;
         for (let r = 0; r < PRICE_ROWS; r++) {
-          this.zGrid[r].shift();
-          this.zGrid[r].push(0);
+          for (let k = 0; k < shiftCount; k++) {
+            this.rawZGrid[r].shift();
+            this.rawZGrid[r].push(0);
+          }
         }
         dirty = true;
       }
+
       // Rebuild only the newest column from the current resting liquidity, and
       // only push to the GPU if that column actually differs from last frame.
       for (let r = 0; r < PRICE_ROWS; r++) {
-        if (this.zGrid[r][col] !== 0) {
-          this.zGrid[r][col] = 0;
+        if (this.rawZGrid[r][col] !== 0) {
+          this.rawZGrid[r][col] = 0;
           dirty = true;
         }
       }
       this.paintZones(zones, (r, qty) => {
-        const v = Math.max(this.zGrid[r][col], qty);
-        if (v !== this.zGrid[r][col]) {
-          this.zGrid[r][col] = v;
+        const v = Math.max(this.rawZGrid[r][col], qty);
+        if (v !== this.rawZGrid[r][col]) {
+          this.rawZGrid[r][col] = v;
           dirty = true;
         }
       });
+      if (dirty) {
+        this.recalculateDisplayGrid();
+      }
     }
 
     // setZValues marshals the whole 240×160 tensor across the WASM boundary, so
     // only do it when something in the grid actually changed this frame.
     if (dirty) {
-      this.heatmapData.setZValues(this.zGrid);
+      this.heatmapData.setZValues(this.displayZGrid);
     }
     this.heatmapData.yStart = this.priceFloor;
     this.heatmapData.yStep = this.cfg.tickSize;
     this.heatmapData.xStart = bucket - (HEATMAP_COLS - 1) * this.tfSeconds;
     this.heatmapData.xStep = this.tfSeconds;
+  }
+
+  /** Recompute display grid applying BookMap historical time-decay fade. */
+  private recalculateDisplayGrid() {
+    const maxCol = HEATMAP_COLS - 1;
+    for (let c = 0; c < HEATMAP_COLS; c++) {
+      let factor = 1.0;
+      if (this.heatmapFadeEnabled && maxCol > 0) {
+        // BookMap time-decay: older columns (left) attenuate smoothly into the dark canvas.
+        const t = c / maxCol; // 0.0 at oldest column, 1.0 at live front
+        factor = (1 - this.heatmapFadeStrength) + this.heatmapFadeStrength * Math.pow(t, 1.35);
+      }
+      for (let r = 0; r < PRICE_ROWS; r++) {
+        this.displayZGrid[r][c] = this.rawZGrid[r][c] * factor;
+      }
+    }
+  }
+
+  /** Update BookMap heatmap time-decay fade settings. */
+  setHeatmapFade(enabled: boolean, strength?: number) {
+    this.heatmapFadeEnabled = enabled;
+    if (strength !== undefined) {
+      this.heatmapFadeStrength = Math.max(0, Math.min(1, strength));
+    }
+    if (this.heatmapInitialized) {
+      this.recalculateDisplayGrid();
+      this.heatmapData?.setZValues(this.displayZGrid);
+    }
+  }
+
+  getHeatmapFade(): { enabled: boolean; strength: number } {
+    return {
+      enabled: this.heatmapFadeEnabled,
+      strength: this.heatmapFadeStrength,
+    };
   }
 
   /** Map resting-liquidity zones onto price rows and invoke a cell writer. */
@@ -907,6 +1065,61 @@ export class TerminalChart {
     }
   }
 
+  /** Bubble Regime markers: OI + liquidation classified aggressive sweeps from
+   *  the BubbleRegimeEngine. Only the "interesting" regimes are drawn (standard
+   *  flow is suppressed to avoid chart clutter). Shares the `bubbles` layer
+   *  toggle with the absorption footprints. Mirrors updateSweeps' lifecycle:
+   *  signature-gated rebuild, full detach/reattach, bounded to the last few. */
+  private updateBubbleRegimes(frame: ChartFrame) {
+    if (!this.surface) return;
+
+    const all = frame.bubbles || [];
+    // Only non-standard regimes carry a chart-worthy signal.
+    const notable = all.filter((b) => b.regime !== "standard_flow");
+    const sig = notable
+      .slice(-8)
+      .map((b) => `${b.timestamp}:${b.regime}:${b.priceCenter}`)
+      .join("|");
+    if (sig === this.bubblesSig) return;
+    this.bubblesSig = sig;
+
+    for (const a of this.bubbleRegimeAnnotations) this.surface.annotations.remove(a);
+    this.bubbleRegimeAnnotations = [];
+    if (!this.layers.bubbles || notable.length === 0) return;
+
+    const META: Record<string, { glyph: string; color: string }> = {
+      institutional_absorption_open: { glyph: "🧱 ABSORB", color: "#22d3ee" },
+      liquidation_exhaustion_flush: { glyph: "💥 LIQ", color: "#f43f5e" },
+      vacuum_sweep_breakout: { glyph: "🚀 SWEEP", color: "#f59e0b" },
+    };
+
+    for (const b of notable.slice(-8)) {
+      const meta = META[b.regime];
+      if (!meta) continue;
+      // timestamp is epoch ms from the bridge; the x-axis is epoch seconds.
+      const tSec = b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : Math.floor(b.timestamp);
+      const price = typeof b.priceCenter === "string" ? parseFloat(b.priceCenter) : b.priceCenter;
+      if (!Number.isFinite(price)) continue;
+      const isBuy = b.aggressorSide === "buy";
+      const marker = new TextAnnotation({
+        x1: tSec,
+        y1: price,
+        yCoordinateMode: ECoordinateMode.DataValue,
+        text: `${isBuy ? "▲" : "▼"} ${meta.glyph}`,
+        textColor: meta.color,
+        fontSize: 9,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontWeight: "bold",
+        horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
+        // Buy aggression prints below the level, sell aggression above, so the
+        // marker clears the candle body like the sweep markers do.
+        verticalAnchorPoint: isBuy ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
+      });
+      this.surface.annotations.add(marker);
+      this.bubbleRegimeAnnotations.push(marker);
+    }
+  }
+
   private updateMarkPrice(midPrice: number) {
     if (!this.markPriceAnnotation) {
       this.markPriceAnnotation = new HorizontalLineAnnotation({
@@ -973,7 +1186,20 @@ export class TerminalChart {
     const lastX = xVals.get(n - 1);
     const firstIdx = Math.max(0, n - VISIBLE_CANDLES);
     const firstX = xVals.get(firstIdx);
-    const pad = this.tfSeconds * 4;
+
+    // Convert the desired RIGHT_OFFSET_PX whitespace into time (data) units so
+    // the active candle sits a constant ~200px clear of the right edge. The gap
+    // is part of the visible span, so solve for `pad` such that
+    //   pad / (candleSpan + pad) == RIGHT_OFFSET_PX / plotWidthPx
+    // => pad = candleSpan * OFF / (plotWidthPx - OFF).
+    // Fall back to a candle-width multiple before the surface has laid out
+    // (seriesViewRect width 0 on the very first frame).
+    const candleSpan = Math.max(lastX - firstX, this.tfSeconds);
+    let pad = this.tfSeconds * 4;
+    const plotWidthPx = this.surface?.seriesViewRect?.width ?? 0;
+    if (plotWidthPx > RIGHT_OFFSET_PX) {
+      pad = (candleSpan * RIGHT_OFFSET_PX) / (plotWidthPx - RIGHT_OFFSET_PX);
+    }
 
     const highs = this.candleData.getNativeHighValues();
     const lows = this.candleData.getNativeLowValues();
@@ -1024,6 +1250,8 @@ export class TerminalChart {
     this.keyLevelAnnotations = [];
     for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
     this.sweepAnnotations = [];
+    for (const a of this.bubbleRegimeAnnotations) this.surface?.annotations.remove(a);
+    this.bubbleRegimeAnnotations = [];
     for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
     this.bubbleAnnotations = [];
     if (this.markPriceAnnotation) {

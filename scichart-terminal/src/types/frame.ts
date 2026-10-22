@@ -138,6 +138,24 @@ export interface SweepEvent {
   prob?: number | null;
 }
 
+export type BubbleRegime =
+  | "standard_flow"
+  | "institutional_absorption_open"
+  | "liquidation_exhaustion_flush"
+  | "vacuum_sweep_breakout";
+
+export interface BubbleSignal {
+  type: "bubble_regime";
+  timestamp: number;
+  priceCenter: string;
+  aggressorSide: "buy" | "sell";
+  totalQuantity: string;
+  sweepTicks: number;
+  oiDelta: number;
+  liquidationQuantity: string;
+  regime: BubbleRegime;
+}
+
 export interface BookmapFrame {
   type: "bookmap_update";
   symbol: string;
@@ -158,6 +176,10 @@ export interface BookmapFrame {
   // --- Audit R1: trade-price candles + CVD ---
   trade_candle?: TradeCandle | null;
   cvd: number;
+  // --- Bubble Regime engine: OI + liquidation classified sweeps ---
+  open_interest?: number;
+  oi_delta?: number;
+  bubbles?: BubbleSignal[];
   // --- Audit R3: session/killzone + key levels + sweep events ---
   session: SessionFlags;
   key_levels: KeyLevels;

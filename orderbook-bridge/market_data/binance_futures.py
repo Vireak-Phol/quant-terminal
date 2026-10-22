@@ -11,6 +11,7 @@ import asyncio
 from decimal import Decimal
 import json
 import logging
+import os
 import random
 import time
 from typing import Callable, Dict, List, Optional, Awaitable, Any
@@ -51,7 +52,12 @@ class BinanceFuturesProvider(MarketDataProvider):
 
         self._running = False
         self._ws_task: Optional[asyncio.Task] = None
+        self._oi_task: Optional[asyncio.Task] = None
         self._resync_lock = asyncio.Lock()
+
+        # Liquidation (@forceOrder) callbacks — forced-order prints for the
+        # BubbleRegimeEngine. Payload: dict(side, price, qty, timestamp_ms).
+        self._liquidation_callbacks: List[Callable[[Dict[str, Any]], Awaitable[None]]] = []
 
         # Telemetry
         self.reconnect_count = 0
@@ -60,6 +66,9 @@ class BinanceFuturesProvider(MarketDataProvider):
         self.last_receive_time = 0
         self.mark_price: float = 0.0
         self.funding_rate: float = 0.0
+        # Open Interest (contracts) polled from REST /fapi/v1/openInterest.
+        self.open_interest: float = 0.0
+        self._oi_poll_sec: float = float(os.environ.get("OI_POLL_SEC", "15"))
 
     def get_connection_state(self) -> ConnectionState:
         return self._connection_state
@@ -69,6 +78,10 @@ class BinanceFuturesProvider(MarketDataProvider):
 
     def register_depth_callback(self, callback: Callable[[LocalOrderBook], Awaitable[None]]):
         self._depth_callbacks.append(callback)
+
+    def register_liquidation_callback(self, callback: Callable[[Dict[str, Any]], Awaitable[None]]):
+        """Register a callback invoked for every @forceOrder (liquidation) print."""
+        self._liquidation_callbacks.append(callback)
 
     async def get_instrument_metadata(self, symbol: str) -> InstrumentMetadata:
         """Fetch and validate instrument metadata from fapi exchangeInfo."""
@@ -228,9 +241,55 @@ class BinanceFuturesProvider(MarketDataProvider):
             is_buyer_maker=is_buyer_maker,
         )
 
+    def _parse_liquidation_event(self, data: Dict[str, Any], now_ms: int) -> Optional[Dict[str, Any]]:
+        """Parse a Binance @forceOrder (liquidation) print into a normalised dict.
+
+        The ``o`` object carries the forced order. ``S`` is the order side of the
+        forced order ("BUY"/"SELL"); the aggressor side of a forced liquidation
+        equals that side (a forced BUY lifts asks, a forced SELL hits bids).
+        """
+        o = data.get("o") or {}
+        side_raw = str(o.get("S", "")).upper()
+        if side_raw not in ("BUY", "SELL"):
+            return None
+        try:
+            price = float(o.get("ap") or o.get("p") or 0.0)  # avg fill price preferred
+            qty = float(o.get("q") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0:
+            return None
+        return {
+            "side": "buy" if side_raw == "BUY" else "sell",
+            "price": price,
+            "qty": qty,
+            "timestamp_ms": int(o.get("T") or data.get("E") or now_ms),
+        }
+
+    async def _poll_open_interest_loop(self):
+        """Periodically poll REST open interest so the BubbleRegimeEngine can
+        classify OI-rising (absorption opening) vs OI-falling (liquidation flush)."""
+        loop = asyncio.get_running_loop()
+        url = f"{self.REST_BASE_URL}/fapi/v1/openInterest?symbol={self.symbol}"
+
+        def _fetch():
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (MarketMicrostructure/1.0)"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        while self._running:
+            try:
+                data = await loop.run_in_executor(None, _fetch)
+                oi = data.get("openInterest")
+                if oi is not None:
+                    self.open_interest = float(oi)
+            except Exception as e:
+                logger.debug(f"[{self.symbol}] open interest poll failed: {e}")
+            await asyncio.sleep(self._oi_poll_sec)
+
     async def _stream_loop(self):
         """Main resilient WebSocket streaming loop with exponential backoff & jitter."""
-        stream_path = f"{self.symbol.lower()}@depth@100ms/{self.symbol.lower()}@aggTrade/{self.symbol.lower()}@kline_1m/{self.symbol.lower()}@markPrice@1s"
+        stream_path = f"{self.symbol.lower()}@depth@100ms/{self.symbol.lower()}@aggTrade/{self.symbol.lower()}@kline_1m/{self.symbol.lower()}@markPrice@1s/{self.symbol.lower()}@forceOrder"
         ws_url = f"{self.WS_STREAM_URL}?streams={stream_path}"
         backoff_sec = 1.0
 
@@ -283,6 +342,12 @@ class BinanceFuturesProvider(MarketDataProvider):
                             self.mark_price = float(data.get("p", 0.0))
                             self.funding_rate = float(data.get("r", 0.0))
 
+                        elif "forceOrder" in stream_name:
+                            liq = self._parse_liquidation_event(data, now_ms)
+                            if liq is not None:
+                                for cb in self._liquidation_callbacks:
+                                    await cb(liq)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -297,6 +362,7 @@ class BinanceFuturesProvider(MarketDataProvider):
         self._running = True
         await self.get_instrument_metadata(self.symbol)
         self._ws_task = asyncio.create_task(self._stream_loop())
+        self._oi_task = asyncio.create_task(self._poll_open_interest_loop())
 
     async def stop(self):
         self._running = False
@@ -304,6 +370,12 @@ class BinanceFuturesProvider(MarketDataProvider):
             self._ws_task.cancel()
             try:
                 await self._ws_task
+            except asyncio.CancelledError:
+                pass
+        if self._oi_task:
+            self._oi_task.cancel()
+            try:
+                await self._oi_task
             except asyncio.CancelledError:
                 pass
         self._connection_state = ConnectionState.DISCONNECTED

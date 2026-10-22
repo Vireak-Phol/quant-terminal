@@ -1193,29 +1193,7 @@ export function TradingViewDeepChart({
 
       // --- FEATURE B: ABSORPTION BUBBLES (TRADINGVIEW HEAVY ABSORPTION & DEEPCHART FOOTPRINTS) ---
       if (showBubbles) {
-        // 1. Watermark Labels matching TradingView "Heavy Absorption" Indicator
-        ctx.save();
-        ctx.font =
-          "bold 16px -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif";
-
-        // Red "BUYERS ABSORBED" at top right
-        ctx.fillStyle = "rgba(239, 68, 68, 0.88)";
-        ctx.textAlign = "right";
-        ctx.textBaseline = "top";
-        ctx.shadowColor = "rgba(239, 68, 68, 0.4)";
-        ctx.shadowBlur = 8;
-        ctx.fillText("BUYERS ABSORBED", width - 85, 24);
-
-        // Green "SELLERS ABSORBED" at bottom left (above bottom legend)
-        ctx.fillStyle = "rgba(34, 197, 94, 0.88)";
-        ctx.textAlign = "left";
-        ctx.textBaseline = "bottom";
-        ctx.shadowColor = "rgba(34, 197, 94, 0.4)";
-        ctx.shadowBlur = 8;
-        ctx.fillText("SELLERS ABSORBED", 24, height - 48);
-        ctx.restore();
-
-        // 2. Plot Heavy Absorption Candlestick Bubbles (from historical kline analysis)
+        // 1. Plot Heavy Absorption Candlestick Bubbles (from historical kline analysis)
         const heavyPoints = heavyAbsorptionsRef.current;
         for (const pt of heavyPoints) {
           const x = chart.timeScale().timeToCoordinate(pt.time as Time);

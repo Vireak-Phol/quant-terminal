@@ -17,6 +17,7 @@ import type { ChartTf } from "./types/v74";
 import { V7SignalPanel } from "./components/Dashboard/V7SignalPanel";
 import { OrderBookLadder } from "./components/Dashboard/OrderBookLadder";
 import { DiagnosticsPanel } from "./components/Dashboard/DiagnosticsPanel";
+import { OrderFlowPanel } from "./components/Dashboard/OrderFlowPanel";
 import {
   AbsorptionModal,
   type AbsorptionModalData,
@@ -34,11 +35,36 @@ const TIMEFRAMES: Timeframe[] = ["1m", "5m", "15m"];
 // chart retains up to MAX_CANDLES (see TerminalChart.ts) — keep this <= that cap.
 const HISTORY_LIMIT = 1000;
 
-const LAYER_META: { key: ChartLayer; label: string; glyph: string; on: string }[] = [
-  { key: "heatmap", label: "HEATMAP", glyph: "🔥", on: "bg-rose-500/20 text-rose-300 border border-rose-500/40 shadow-glow" },
-  { key: "bubbles", label: "ABSORPTION", glyph: "🫧", on: "bg-terminal-bull/20 text-terminal-bull border border-terminal-bull/40 shadow-glow" },
-  { key: "vacuum", label: "VACUUM", glyph: "🧲", on: "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-glow" },
-  { key: "hopla", label: "HOPLA", glyph: "📐", on: "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow" },
+const LAYER_META: {
+  key: ChartLayer;
+  label: string;
+  glyph: string;
+  on: string;
+}[] = [
+  {
+    key: "heatmap",
+    label: "HEATMAP",
+    glyph: "🔥",
+    on: "bg-rose-500/20 text-rose-300 border border-rose-500/40 shadow-glow",
+  },
+  {
+    key: "bubbles",
+    label: "ABSORPTION",
+    glyph: "🫧",
+    on: "bg-terminal-bull/20 text-terminal-bull border border-terminal-bull/40 shadow-glow",
+  },
+  {
+    key: "vacuum",
+    label: "VACUUM",
+    glyph: "🧲",
+    on: "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-glow",
+  },
+  {
+    key: "hopla",
+    label: "HOPLA",
+    glyph: "📐",
+    on: "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow",
+  },
 ];
 
 // Memoised panels: only re-render when their own props / subscriptions change,
@@ -46,6 +72,7 @@ const LAYER_META: { key: ChartLayer; label: string; glyph: string; on: string }[
 const SignalPanelMemo = memo(V7SignalPanel);
 const LadderPanel = memo(OrderBookLadder);
 const DiagsPanel = memo(DiagnosticsPanel);
+const FlowPanel = memo(OrderFlowPanel);
 
 export default function App() {
   const { prefs, cycleTheme } = usePrefs();
@@ -53,9 +80,10 @@ export default function App() {
   // App only subscribes to low-frequency status fields; the per-frame price feed
   // is handled imperatively below (refs + rAF) so the whole tree does not
   // reconcile 12-15×/sec.
-  const { connectionState, latencyMs } = useLiveField(
+  const { connectionState } = useLiveField(
     (s) => ({ connectionState: s.connectionState, latencyMs: s.latencyMs }),
-    (a, b) => a.connectionState === b.connectionState && a.latencyMs === b.latencyMs,
+    (a, b) =>
+      a.connectionState === b.connectionState && a.latencyMs === b.latencyMs,
   );
 
   const chartRef = useRef<TerminalChart | null>(null);
@@ -72,9 +100,53 @@ export default function App() {
     hopla: true,
   });
 
+  const [heatmapFade, setHeatmapFadeState] = useState<boolean>(() => {
+    const saved = localStorage.getItem("terminal.heatmapFade");
+    return saved !== null ? saved === "true" : true;
+  });
+  const [fadeStrength, setFadeStrengthState] = useState<number>(() => {
+    const saved = localStorage.getItem("terminal.heatmapFadeStrength");
+    return saved ? parseFloat(saved) : 0.70;
+  });
+  const [showFadeMenu, setShowFadeMenu] = useState(false);
+  const fadeMenuRef = useRef<HTMLDivElement | null>(null);
+
+  const toggleHeatmapFade = useCallback(() => {
+    setHeatmapFadeState((prev) => {
+      const next = !prev;
+      localStorage.setItem("terminal.heatmapFade", String(next));
+      chartRef.current?.setHeatmapFade(next, fadeStrength);
+      return next;
+    });
+  }, [fadeStrength]);
+
+  const changeFadeStrength = useCallback(
+    (strength: number) => {
+      setFadeStrengthState(strength);
+      localStorage.setItem("terminal.heatmapFadeStrength", String(strength));
+      chartRef.current?.setHeatmapFade(heatmapFade, strength);
+    },
+    [heatmapFade],
+  );
+
+  useEffect(() => {
+    if (!showFadeMenu) return;
+    const onClickOutside = (e: MouseEvent) => {
+      if (
+        fadeMenuRef.current &&
+        !fadeMenuRef.current.contains(e.target as Node)
+      ) {
+        setShowFadeMenu(false);
+      }
+    };
+    window.addEventListener("mousedown", onClickOutside);
+    return () => window.removeEventListener("mousedown", onClickOutside);
+  }, [showFadeMenu]);
+
   const [showSignals, setShowSignals] = useState(true);
   const [showDomLadder, setShowDomLadder] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [showOrderFlow, setShowOrderFlow] = useState(false);
   const [signalTf, setSignalTf] = useState<ChartTf>("5m");
 
   const [soundOn, setSoundOn] = useState<boolean>(
@@ -87,7 +159,8 @@ export default function App() {
   }, [soundOn]);
 
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
-  const [absorptionModal, setAbsorptionModal] = useState<AbsorptionModalData | null>(null);
+  const [absorptionModal, setAbsorptionModal] =
+    useState<AbsorptionModalData | null>(null);
 
   const seenSignalIds = useRef<Set<string>>(new Set());
   const firstV74Ref = useRef<boolean>(true);
@@ -108,18 +181,27 @@ export default function App() {
   // double-invoked effect is always torn down — no orphaned WebGL context.
   useEffect(() => {
     let disposed = false;
-    const chart = new TerminalChart({ tickSize: 0.5, timeframe: timeframeRef.current });
+    const chart = new TerminalChart({
+      tickSize: 0.5,
+      timeframe: timeframeRef.current,
+    });
     const initPromise = chart
       .init(CHART_DIV_ID)
       .then(async () => {
         if (disposed) return;
         chartRef.current = chart;
         readyRef.current = true;
-        for (const { key } of LAYER_META) chart.setLayerVisibility(key, layersRef.current[key]);
+        chart.setHeatmapFade(heatmapFade, fadeStrength);
+        for (const { key } of LAYER_META)
+          chart.setLayerVisibility(key, layersRef.current[key]);
 
         setIsLoadingKlines(true);
         try {
-          const klines = await fetchBinanceFuturesKlines("XAUUSDT", timeframeRef.current, HISTORY_LIMIT);
+          const klines = await fetchBinanceFuturesKlines(
+            "XAUUSDT",
+            timeframeRef.current,
+            HISTORY_LIMIT,
+          );
           if (!disposed && chartRef.current === chart && klines.length > 0) {
             chart.loadHistoricalCandles(klines);
           }
@@ -149,13 +231,22 @@ export default function App() {
 
   // ── Per-frame pipeline: subscribe imperatively, coalesce with rAF ─────────
   // The websocket emits ~12-15 fps; we keep only the newest frame and drain it
-  // to the GPU once per animation frame. Intermediate frames are dropped. This
-  // decouples chart + alert work from the raw socket rate and caps it at the
-  // display refresh, which is the single biggest protection against the tab
-  // becoming unresponsive during volatility / replay bursts.
+  // to the GPU once per animation frame while the tab is visible. Intermediate
+  // frames are dropped. This decouples chart + alert work from the raw socket
+  // rate and caps it at the display refresh — the single biggest protection
+  // against the tab becoming unresponsive during volatility / replay bursts.
+  //
+  // BACKGROUND-TAB CONTRACT: requestAnimationFrame is paused by the browser when
+  // the tab is hidden, which previously froze the chart (the active candle and
+  // absorption bubbles only "caught up" when you refocused the tab). We fall
+  // back to a setInterval-driven drain while `document.hidden`, so the active
+  // candle, heatmap and bubbles keep advancing off-screen. Browsers clamp
+  // background timers to ~1s, which is plenty for an off-screen chart and still
+  // far better than a fully frozen one.
   useEffect(() => {
     const socket = getSharedSocket(DEFAULT_BRIDGE_URL);
     let rafId = 0;
+    let intervalId: ReturnType<typeof setInterval> | 0 = 0;
     let pending = false;
 
     const drain = () => {
@@ -170,9 +261,15 @@ export default function App() {
       }
 
       // A+ signal alerts (v74 changes only on closed bars, so this is cheap).
-      const v74 = (snap.data as { v74?: Parameters<typeof newAplusSignals>[0] } | null)?.v74;
+      const v74 = (
+        snap.data as { v74?: Parameters<typeof newAplusSignals>[0] } | null
+      )?.v74;
       if (v74) {
-        const fresh = newAplusSignals(v74, seenSignalIds.current, firstV74Ref.current);
+        const fresh = newAplusSignals(
+          v74,
+          seenSignalIds.current,
+          firstV74Ref.current,
+        );
         firstV74Ref.current = false;
         // Bound the dedup set so it cannot grow unbounded over a long session.
         if (seenSignalIds.current.size > 4000) seenSignalIds.current.clear();
@@ -191,41 +288,88 @@ export default function App() {
       }
     };
 
-    const schedule = () => {
-      if (pending) return;
+    // Visible tab → coalesce at display refresh via rAF (one frame per vsync).
+    const scheduleRaf = () => {
+      if (pending || document.hidden) return;
       pending = true;
       rafId = requestAnimationFrame(drain);
     };
 
-    const unsubscribe = socket.subscribe(schedule);
-    // Draw the current snapshot immediately on mount.
-    schedule();
+    // Hidden tab → rAF is paused; a throttled interval keeps the chart alive.
+    const startHiddenPump = () => {
+      if (intervalId) return;
+      intervalId = setInterval(() => {
+        // Guard against a double-drain racing a queued rAF.
+        if (!pending) drain();
+      }, 250);
+    };
+    const stopHiddenPump = () => {
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = 0;
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        // Cancel any queued rAF (it won't fire anyway) and pump via interval.
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = 0;
+          pending = false;
+        }
+        startHiddenPump();
+      } else {
+        // Back in the foreground: stop the interval, draw the latest frame now,
+        // then resume rAF-paced draining.
+        stopHiddenPump();
+        drain();
+      }
+    };
+
+    // On each websocket frame: rAF when visible, otherwise rely on the pump.
+    const onFrame = () => {
+      if (document.hidden) startHiddenPump();
+      else scheduleRaf();
+    };
+
+    const unsubscribe = socket.subscribe(onFrame);
+    document.addEventListener("visibilitychange", onVisibility);
+    // Draw the current snapshot immediately on mount (respecting visibility).
+    onFrame();
 
     return () => {
       unsubscribe();
+      document.removeEventListener("visibilitychange", onVisibility);
       if (rafId) cancelAnimationFrame(rafId);
+      stopHiddenPump();
     };
   }, [addToast]);
 
   // ── Timeframe switching ──────────────────────────────────────────────────
-  const changeTimeframe = useCallback(
-    async (tf: Timeframe) => {
-      if (tf === timeframeRef.current) return;
-      timeframeRef.current = tf;
-      setTimeframe(tf);
-      chartRef.current?.setTimeframe(tf);
-      setIsLoadingKlines(true);
-      try {
-        const klines = await fetchBinanceFuturesKlines("XAUUSDT", tf, HISTORY_LIMIT);
-        if (chartRef.current && timeframeRef.current === tf && klines.length > 0) {
-          chartRef.current.loadHistoricalCandles(klines);
-        }
-      } finally {
-        setIsLoadingKlines(false);
+  const changeTimeframe = useCallback(async (tf: Timeframe) => {
+    if (tf === timeframeRef.current) return;
+    timeframeRef.current = tf;
+    setTimeframe(tf);
+    chartRef.current?.setTimeframe(tf);
+    setIsLoadingKlines(true);
+    try {
+      const klines = await fetchBinanceFuturesKlines(
+        "XAUUSDT",
+        tf,
+        HISTORY_LIMIT,
+      );
+      if (
+        chartRef.current &&
+        timeframeRef.current === tf &&
+        klines.length > 0
+      ) {
+        chartRef.current.loadHistoricalCandles(klines);
       }
-    },
-    [],
-  );
+    } finally {
+      setIsLoadingKlines(false);
+    }
+  }, []);
 
   // ── Layer toggles ────────────────────────────────────────────────────────
   const toggleLayer = useCallback((key: ChartLayer) => {
@@ -268,7 +412,9 @@ export default function App() {
         <div className="flex items-center gap-2 sm:gap-2.5">
           <div className="flex items-center gap-2 px-2.5 py-1 rounded bg-terminal-panel border border-terminal-border shadow-xs">
             <div className="w-2 h-2 rounded-full bg-terminal-gold shadow-glow animate-pulse" />
-            <span className="font-extrabold tracking-wider text-sm text-terminal-text">XAUUSDT</span>
+            <span className="font-extrabold tracking-wider text-sm text-terminal-text">
+              XAUUSDT
+            </span>
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-terminal-surface border border-terminal-border text-terminal-gold font-bold">
               GPU · USDⓈ-M
             </span>
@@ -321,13 +467,132 @@ export default function App() {
                 onClick={() => toggleLayer(l.key)}
                 aria-pressed={layers[l.key]}
                 className={`px-2 py-0.5 rounded font-bold transition-all ${
-                  layers[l.key] ? l.on : "text-terminal-text-dim hover:text-terminal-text"
+                  layers[l.key]
+                    ? l.on
+                    : "text-terminal-text-dim hover:text-terminal-text"
                 }`}
                 title={`Toggle ${l.label} layer`}
               >
                 {l.glyph} {l.label}
               </button>
             ))}
+
+            {/* BookMap Heatmap Historical Fade Control */}
+            <div className="relative flex items-center ml-1 pl-1 border-l border-terminal-border/60" ref={fadeMenuRef}>
+              <button
+                onClick={toggleHeatmapFade}
+                aria-pressed={heatmapFade}
+                disabled={!layers.heatmap}
+                className={`px-2 py-0.5 rounded-l font-bold transition-all flex items-center gap-1 ${
+                  !layers.heatmap
+                    ? "opacity-35 cursor-not-allowed text-terminal-text-dim"
+                    : heatmapFade
+                      ? "bg-indigo-500/25 text-indigo-300 border border-indigo-500/50 shadow-glow"
+                      : "text-terminal-text-dim hover:text-terminal-text"
+                }`}
+                title={
+                  layers.heatmap
+                    ? `Toggle BookMap Historical Heatmap Fade (${heatmapFade ? "Active" : "Off"})`
+                    : "Enable HEATMAP layer first to activate BookMap Fade"
+                }
+              >
+                <span>🌫️</span>
+                <span>FADE</span>
+                {heatmapFade && layers.heatmap && (
+                  <span className="text-3xs opacity-80 tabular-nums">
+                    {Math.round(fadeStrength * 100)}%
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => setShowFadeMenu((v) => !v)}
+                disabled={!layers.heatmap}
+                className={`px-1 py-0.5 rounded-r border-l border-terminal-border/40 text-terminal-text-dim hover:text-terminal-text hover:bg-white/5 transition-all text-2xs ${
+                  !layers.heatmap
+                    ? "opacity-35 cursor-not-allowed"
+                    : showFadeMenu
+                      ? "bg-white/10 text-terminal-gold"
+                      : ""
+                }`}
+                title="Configure BookMap Heatmap Fade Decay & Palette"
+              >
+                ▾
+              </button>
+
+              {showFadeMenu && layers.heatmap && (
+                <div className="absolute top-full mt-2 right-0 z-50 w-64 p-3 rounded-lg bg-terminal-surface/98 border border-terminal-border shadow-2xl backdrop-blur-md text-2xs font-mono space-y-2.5">
+                  <div className="flex items-center justify-between border-b border-terminal-border/60 pb-1.5">
+                    <span className="font-bold text-terminal-gold flex items-center gap-1.5">
+                      <span>🔥</span> BOOKMAP HEATMAP FADE
+                    </span>
+                    <button
+                      onClick={() => setShowFadeMenu(false)}
+                      className="text-terminal-text-dim hover:text-white"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-terminal-text-dim">Time-Decay Fade</span>
+                    <button
+                      onClick={toggleHeatmapFade}
+                      className={`px-2 py-0.5 rounded text-2xs font-bold transition-all ${
+                        heatmapFade
+                          ? "bg-terminal-bull/20 text-terminal-bull border border-terminal-bull/40"
+                          : "bg-terminal-panel text-terminal-text-dim border border-terminal-border"
+                      }`}
+                    >
+                      {heatmapFade ? "ACTIVE" : "OFF"}
+                    </button>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-terminal-text-dim">
+                      <span>Fade Decay Strength</span>
+                      <span className="font-bold tabular-nums text-terminal-text">
+                        {Math.round(fadeStrength * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.10"
+                      max="0.95"
+                      step="0.05"
+                      value={fadeStrength}
+                      onChange={(e) =>
+                        changeFadeStrength(parseFloat(e.target.value))
+                      }
+                      className="w-full h-1.5 bg-terminal-panel rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                    />
+                    <div className="flex justify-between text-3xs text-terminal-text-dim">
+                      <span>Subtle (10%)</span>
+                      <span>Balanced (70%)</span>
+                      <span>Steep (95%)</span>
+                    </div>
+                  </div>
+
+                  <div className="p-1.5 rounded bg-terminal-panel/80 border border-terminal-border/60 text-3xs text-terminal-text-dim space-y-1">
+                    <div className="flex items-center justify-between text-terminal-text">
+                      <span>Palette</span>
+                      <span className="text-terminal-gold font-bold">BookMap High-Contrast</span>
+                    </div>
+                    <div className="h-2 rounded flex overflow-hidden border border-black/40">
+                      <div className="flex-1 bg-[#05182e]" title="Deep Navy" />
+                      <div className="flex-1 bg-[#00b4d8]" title="Cyan" />
+                      <div className="flex-1 bg-[#10b981]" title="Lime" />
+                      <div className="flex-1 bg-[#facc15]" title="Yellow" />
+                      <div className="flex-1 bg-[#f97316]" title="Orange" />
+                      <div className="flex-1 bg-[#ef4444]" title="Red" />
+                      <div className="flex-1 bg-[#ffffff]" title="Hot White" />
+                    </div>
+                    <p className="leading-tight pt-0.5">
+                      Older liquidity dims smoothly into the canvas; the active front displays at full intensity.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="h-4 w-px bg-terminal-border/80 mx-0.5 hidden md:block" />
@@ -370,10 +635,24 @@ export default function App() {
               🩺 DIAGS
             </button>
             <button
+              onClick={() => setShowOrderFlow((v) => !v)}
+              aria-pressed={showOrderFlow}
+              className={`px-2 py-0.5 rounded font-bold transition-all ${
+                showOrderFlow
+                  ? "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow"
+                  : "text-terminal-text-dim hover:text-terminal-text"
+              }`}
+              title="Toggle Order Flow · Bubble Regime Panel (OI + liquidation classified sweeps)"
+            >
+              🫧 FLOW
+            </button>
+            <button
               onClick={() => setSoundOn((v) => !v)}
               aria-pressed={soundOn}
               className={`px-2 py-0.5 rounded font-bold transition-all ${
-                soundOn ? "text-terminal-gold" : "text-terminal-text-dim hover:text-terminal-text"
+                soundOn
+                  ? "text-terminal-gold"
+                  : "text-terminal-text-dim hover:text-terminal-text"
               }`}
               title={soundOn ? "Mute A+ alert sound" : "Unmute A+ alert sound"}
               aria-label={soundOn ? "Mute alert sound" : "Unmute alert sound"}
@@ -394,9 +673,6 @@ export default function App() {
                     : "bg-terminal-bear"
               }`}
             />
-            <span className="text-terminal-text-dim uppercase hidden sm:inline">
-              {connectionState === "connected" ? `${latencyMs}ms` : "OFFLINE"}
-            </span>
           </div>
 
           <button
@@ -404,7 +680,9 @@ export default function App() {
             className="px-2 py-1 text-2xs font-medium text-terminal-text-dim hover:text-terminal-text bg-terminal-panel hover:bg-terminal-surface border border-terminal-border rounded transition-all"
             title={`Current theme: ${prefs.theme}`}
           >
-            <span className="text-terminal-accent uppercase font-bold">{prefs.theme}</span>
+            <span className="text-terminal-accent uppercase font-bold">
+              {prefs.theme}
+            </span>
           </button>
         </div>
       </header>
@@ -413,7 +691,11 @@ export default function App() {
       <main className="flex-1 w-full min-h-0 relative flex overflow-hidden bg-terminal-bg">
         <ErrorBoundary title="Chart Workspace">
           <div className="flex-1 h-full min-h-0 relative overflow-hidden">
-            <div id={CHART_DIV_ID} onClick={onChartClick} className="absolute inset-0" />
+            <div
+              id={CHART_DIV_ID}
+              onClick={onChartClick}
+              className="absolute inset-0"
+            />
           </div>
 
           {showSignals && (
@@ -443,6 +725,14 @@ export default function App() {
               </ErrorBoundary>
             </aside>
           )}
+
+          {showOrderFlow && (
+            <aside className="w-80 lg:w-96 h-full min-h-0 border-l border-terminal-border bg-terminal-surface/95 shrink-0 z-20 shadow-2xl flex flex-col">
+              <ErrorBoundary title="Order Flow">
+                <FlowPanel onClose={() => setShowOrderFlow(false)} />
+              </ErrorBoundary>
+            </aside>
+          )}
         </ErrorBoundary>
       </main>
 
@@ -450,7 +740,10 @@ export default function App() {
       <StatusBar timeframe={timeframe} />
 
       {absorptionModal && (
-        <AbsorptionModal data={absorptionModal} onClose={() => setAbsorptionModal(null)} />
+        <AbsorptionModal
+          data={absorptionModal}
+          onClose={() => setAbsorptionModal(null)}
+        />
       )}
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>
@@ -466,18 +759,23 @@ const LiveQuote = memo(function LiveQuote() {
       spread: s.data?.spread ?? 0,
       imbalance: s.data?.imbalance ?? 0,
     }),
-    (a, b) => a.mid === b.mid && a.spread === b.spread && a.imbalance === b.imbalance,
+    (a, b) =>
+      a.mid === b.mid && a.spread === b.spread && a.imbalance === b.imbalance,
   );
   if (!q.mid) return <div className="hidden lg:block" />;
   return (
     <div className="hidden lg:flex items-center gap-3 text-xs font-mono">
       <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-terminal-panel border border-terminal-border">
         <span className="text-[10px] text-terminal-text-dim">MID</span>
-        <span className="font-bold tabular-nums text-sm text-terminal-text">{price(q.mid)}</span>
+        <span className="font-bold tabular-nums text-sm text-terminal-text">
+          {price(q.mid)}
+        </span>
       </div>
       <div className="flex items-center gap-1 px-2 py-1 rounded bg-terminal-panel/80 border border-terminal-border/60 text-2xs">
         <span className="text-terminal-text-dim">SPREAD:</span>
-        <span className="text-terminal-gold font-bold tabular-nums">${q.spread.toFixed(2)}</span>
+        <span className="text-terminal-gold font-bold tabular-nums">
+          ${q.spread.toFixed(2)}
+        </span>
       </div>
       <div className="flex items-center gap-1 px-2 py-1 rounded bg-terminal-panel/80 border border-terminal-border/60 text-2xs">
         <span className="text-terminal-text-dim">FLOW:</span>
@@ -538,9 +836,21 @@ const OrderFlowBadge = memo(function OrderFlowBadge() {
     return `${sign}${v.toFixed(1)}`;
   };
   const toneCvd =
-    s.cvd == null ? "text-terminal-text-dim" : s.cvd > 0 ? "text-terminal-bull" : s.cvd < 0 ? "text-terminal-bear" : "text-terminal-gold";
+    s.cvd == null
+      ? "text-terminal-text-dim"
+      : s.cvd > 0
+        ? "text-terminal-bull"
+        : s.cvd < 0
+          ? "text-terminal-bear"
+          : "text-terminal-gold";
   const toneDelta =
-    s.delta == null ? "text-terminal-text-dim" : s.delta > 0 ? "text-terminal-bull" : s.delta < 0 ? "text-terminal-bear" : "text-terminal-gold";
+    s.delta == null
+      ? "text-terminal-text-dim"
+      : s.delta > 0
+        ? "text-terminal-bull"
+        : s.delta < 0
+          ? "text-terminal-bear"
+          : "text-terminal-gold";
 
   return (
     <div className="hidden xl:flex items-center gap-2 text-2xs font-mono">
@@ -589,7 +899,11 @@ const SignalDock = memo(function SignalDock(props: {
 });
 
 /** Isolated, memoised footer. Subscribes only to telemetry counters. */
-const StatusBar = memo(function StatusBar({ timeframe }: { timeframe: Timeframe }) {
+const StatusBar = memo(function StatusBar({
+  timeframe,
+}: {
+  timeframe: Timeframe;
+}) {
   const t = useLiveField(
     (s) => ({
       sync: s.data?.telemetry?.order_book_sync_state ?? "—",
@@ -604,9 +918,14 @@ const StatusBar = memo(function StatusBar({ timeframe }: { timeframe: Timeframe 
           <span className="w-1.5 h-1.5 rounded-full bg-terminal-bull animate-pulse" />
           SCICHART GPU ENGINE
         </span>
-        <span className="hidden sm:inline">Binance USDⓈ-M Futures (XAUUSDT)</span>
+        <span className="hidden sm:inline">
+          Binance USDⓈ-M Futures (XAUUSDT)
+        </span>
         <span className="hidden md:inline">
-          • SYNC: <span className="text-terminal-gold font-bold uppercase">{t.sync}</span>
+          • SYNC:{" "}
+          <span className="text-terminal-gold font-bold uppercase">
+            {t.sync}
+          </span>
         </span>
       </div>
       <div className="hidden lg:flex items-center gap-3 text-2xs">
