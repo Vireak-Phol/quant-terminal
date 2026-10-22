@@ -104,7 +104,7 @@ class TradeCandleAggregator:
             self._sell = qty if aggressor_side == "sell" else 0.0
             return None
 
-        if bucket != self._bucket:
+        if bucket > self._bucket:
             closed = TradeCandle(
                 t=self._bucket, o=self._o, h=self._h, l=self._l, c=self._c,
                 volume=self._vol, delta=self._buy - self._sell,
@@ -117,10 +117,17 @@ class TradeCandleAggregator:
             self._sell = qty if aggressor_side == "sell" else 0.0
             return closed
 
-        # Same bucket: update the forming bar.
+        # Same bucket OR an out-of-order (late) trade whose bucket is < current.
+        # Using `>` above (not `!=`) means a trade delayed by network jitter never
+        # rewinds and prematurely re-closes the forming bar (which produced
+        # duplicate, scrambled candles). We fold its volume/delta into the current
+        # bucket; its OHLC still extends the running high/low. Close price is only
+        # moved forward by in-order (same-bucket) trades to avoid a stale print
+        # overwriting the latest close. (Audit #6)
         self._h = max(self._h, price)
         self._l = min(self._l, price)
-        self._c = price
+        if bucket == self._bucket:
+            self._c = price
         self._vol += qty
         if aggressor_side == "buy":
             self._buy += qty

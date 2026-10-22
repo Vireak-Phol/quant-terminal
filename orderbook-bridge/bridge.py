@@ -390,6 +390,14 @@ async def on_trade_received(trade: TradeEvent):
     terminal_state["trade_candle"] = forming.to_dict() if forming else None
     terminal_state["cvd"] = trade_candle_agg.cvd()
 
+    # --- Audit #5: feed the session regime baseline at each 1-minute bar close ---
+    # The closed trade candle's transacted volume is a clean per-minute sample of
+    # how thick/thin the tape currently is. Pushing it to update_session_baseline
+    # scales the absorption volume gates with the regime (thin Asia vs. hot NY),
+    # instead of leaving _vol_scale pinned at 1.0. Only runs once per closed bar.
+    if closed_tc is not None and closed_tc.volume > 0:
+        absorption_engine.update_session_baseline(closed_tc.volume)
+
     # Ingest into quantitative absorption engine
     candidate = absorption_engine.ingest_trade(
         price=float(trade.price),

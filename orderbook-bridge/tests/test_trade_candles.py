@@ -75,6 +75,27 @@ def test_forming_bucket_updates_high_low_close():
     assert f.volume == 4.0
 
 
+def test_out_of_order_trade_does_not_close_bar():
+    """A late trade (bucket < current) must NOT roll the bar or emit a candle.
+    Its volume/delta fold into the current forming bucket instead. (Audit #6)"""
+    agg = TradeCandleAggregator(60_000)
+    t0 = 1_700_000_000_000
+    # Open bucket 1 (next minute) directly.
+    agg.ingest(2000.0, 2.0, "buy", t0 + 60_000)
+    forming_before = agg.forming()
+    assert forming_before.volume == 2.0
+    # A trade from the PREVIOUS minute arrives late (network jitter).
+    late = agg.ingest(1999.0, 1.0, "sell", t0 + 100)
+    assert late is None, "late out-of-order trade must not emit a closed candle"
+    f = agg.forming()
+    # Still the same bucket; volume folded, low extended, close unchanged.
+    assert f.t == ((t0 + 60_000) // 60_000) * 60_000
+    assert abs(f.volume - 3.0) < 1e-9
+    assert f.l == 1999.0
+    assert f.c == 2000.0  # late tick does not move the close
+    assert abs(f.sell_volume - 1.0) < 1e-9
+
+
 def test_to_dict_shape_and_rounding():
     agg = TradeCandleAggregator(60_000)
     t0 = 1_700_000_000_000

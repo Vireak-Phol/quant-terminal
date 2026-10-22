@@ -80,6 +80,11 @@ class AbsorptionEngine:
         # Session baseline: rolling distribution of 4-second cluster volume, used to
         # z-normalise the absolute gates. None until enough history has accumulated.
         self._cluster_vol_history: deque = deque(maxlen=500)
+        # Timestamp of the last cluster-volume sample recorded into the history
+        # above. The history must be sampled at most once per observation window,
+        # not on every trade, or a 50 tps burst saturates the 500-slot deque with
+        # near-identical overlapping slices and corrupts _global_median(). (Audit #4)
+        self._last_cluster_record_ms: int = 0
         self._vol_scale = 1.0   # multiplicative scale on volume gates
         self._window_scale = 1.0  # multiplicative scale on observation window
 
@@ -219,8 +224,13 @@ class AbsorptionEngine:
         if total_vol < self.effective_min_cluster_vol:
             return None
 
-        # Record the observed cluster volume so the session baseline can adapt.
-        self._cluster_vol_history.append(total_vol)
+        # Record the observed cluster volume so the session baseline can adapt —
+        # but at most once per (non-overlapping) observation window. Recording on
+        # every qualifying trade would wipe the multi-hour anchor within seconds
+        # under a high-frequency burst. (Audit #4)
+        if current_time_ms - self._last_cluster_record_ms >= self.effective_window_ms:
+            self._cluster_vol_history.append(total_vol)
+            self._last_cluster_record_ms = current_time_ms
 
         # Check for directional dominance
         buy_ratio = buy_vol / total_vol

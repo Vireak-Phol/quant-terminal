@@ -43,6 +43,7 @@ import {
   EDataPointWidthMode,
   ECoordinateMode,
   EHorizontalAnchorPoint,
+  EVerticalAnchorPoint,
 } from "scichart";
 import type { CandleData } from "../lib/klines";
 import { detectHeavyAbsorptions, type HeavyAbsorptionPoint } from "../lib/absorption";
@@ -121,7 +122,7 @@ export interface BubbleHit {
 
 const PRICE_ROWS = 240; // heatmap price buckets (240×160 depth tensor)
 const HEATMAP_COLS = 160; // heatmap time columns
-const MAX_CANDLES = 500; // candle history cap
+const MAX_CANDLES = 1000; // candle history cap (retains the seeded HISTORY_LIMIT)
 const VISIBLE_CANDLES = 80; // how many candles the live view shows
 
 // Absorption bubbles are fixed-size markers (reverted from volume/zoom scaling):
@@ -449,6 +450,15 @@ export class TerminalChart {
     this.seenFootprintIds.clear();
     this.vacuumSig = "";
     this.hoplaSig = "";
+    // Reset key-level + sweep caches too, and detach their annotations — else a
+    // matching signature on the new timeframe would skip re-rendering onto the
+    // freshly cleared surface, and stale lines/markers would leak. (Audit #7)
+    this.keyLevelsSig = "";
+    this.sweepsSig = "";
+    for (const a of this.keyLevelAnnotations) this.surface?.annotations.remove(a);
+    this.keyLevelAnnotations = [];
+    for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
+    this.sweepAnnotations = [];
     this.clearBubbles();
     for (let r = 0; r < PRICE_ROWS; r++) {
       this.zGrid[r].fill(0);
@@ -462,7 +472,7 @@ export class TerminalChart {
     if (!this.surface || !frame.mid_price) return;
     this.lastFrame = frame;
     const nowSec = Math.floor((frame.timestamp ?? Date.now()) / 1000);
-    const newCandle = this.updateCandles(frame.mid_price, nowSec);
+    const newCandle = this.updateCandles(frame, nowSec);
     if (newCandle) this.rebuildHeavyAbsorptions();
     this.updateHeatmap(frame, nowSec);
     if (frame.absorption_candidates && frame.absorption_candidates.length > 0) {
@@ -479,8 +489,18 @@ export class TerminalChart {
     }
   }
 
-  /** Returns true when a new candle bucket was opened (caller rebuilds bubbles). */
-  private updateCandles(price: number, nowSec: number): boolean {
+  /** Returns true when a new candle bucket was opened (caller rebuilds bubbles).
+   *
+   *  Price action still comes from the mid-price tick (sub-second, smooth), but
+   *  VOLUME + DELTA are seeded from `frame.trade_candle` — the trade-price
+   *  aggregator in the bridge. Previously volume was hardcoded to 0, which left
+   *  the Heavy Absorption detector permanently blind (every bar had volRatio 0).
+   *  (Audit #3) The trade candle uses a fixed 60s interval and epoch-ms `t`; we
+   *  keep the chart's own timeframe bucketing for the X axis and fold the
+   *  trade-candle volume into the current chart bucket. */
+  private updateCandles(frame: ChartFrame, nowSec: number): boolean {
+    const price = frame.mid_price;
+    const tc = frame.trade_candle;
     const bucket = Math.floor(nowSec / this.tfSeconds) * this.tfSeconds;
     if (this.curOhlc === null || bucket > this.curBucket) {
       this.curBucket = bucket;
@@ -495,7 +515,7 @@ export class TerminalChart {
         high: price,
         low: price,
         close: price,
-        volume: 0,
+        volume: tc ? tc.v : 0,
       });
       while (this.historicalCandles.length > MAX_CANDLES) {
         this.historicalCandles.shift();
@@ -514,6 +534,15 @@ export class TerminalChart {
       last.high = Math.max(last.high, price);
       last.low = Math.min(last.low, price);
       last.close = price;
+      // The trade_candle is a 60s running aggregate of transacted volume. Within
+      // a chart bucket its `v` is monotonically increasing for the same minute
+      // and resets each minute, so accumulate the max seen per minute boundary.
+      // For charts at the 1m timeframe this is the exact bucket volume; for
+      // higher timeframes it approximates the folded total (good enough to keep
+      // the absorption detector live rather than blind).
+      if (tc) {
+        last.volume = Math.max(last.volume, tc.v);
+      }
     }
     return false;
   }
@@ -813,7 +842,11 @@ export class TerminalChart {
     this.keyLevelAnnotations = [];
     if (!kl) return;
 
-    const mk = (price: number | null, color: string, label: string) => {
+    // Format the label INSIDE the helper, after the null/finite guard. Passing
+    // `price.toFixed(2)` at the call site would evaluate before the guard runs
+    // (JS evaluates arguments eagerly), throwing TypeError on a null level and
+    // crashing the whole render loop on the first (null) frame. (Audit #1)
+    const mk = (price: number | null, color: string, prefix: string) => {
       if (price == null || !Number.isFinite(price)) return;
       const line = new HorizontalLineAnnotation({
         y1: price,
@@ -824,16 +857,16 @@ export class TerminalChart {
         labelPlacement: ELabelPlacement.TopLeft,
         axisLabelFill: color,
         axisLabelStroke: "#000000",
-        labelValue: label,
+        labelValue: `${prefix} ${price.toFixed(2)}`,
       });
       this.surface.annotations.add(line);
       this.keyLevelAnnotations.push(line);
     };
 
-    mk(kl.pdh, "#a855f7", `PDH ${kl.pdh!.toFixed(2)}`);
-    mk(kl.pdl, "#a855f7", `PDL ${kl.pdl!.toFixed(2)}`);
-    mk(kl.pwh, "#ec4899", `PWH ${kl.pwh!.toFixed(2)}`);
-    mk(kl.pwl, "#ec4899", `PWL ${kl.pwl!.toFixed(2)}`);
+    mk(kl.pdh, "#a855f7", "PDH");
+    mk(kl.pdl, "#a855f7", "PDL");
+    mk(kl.pwh, "#ec4899", "PWH");
+    mk(kl.pwl, "#ec4899", "PWL");
   }
 
   /** Render liquidity sweep markers (liq_sweep events) — only when signature changes. */
@@ -848,7 +881,11 @@ export class TerminalChart {
     if (sweeps.length === 0) return;
 
     for (const s of sweeps.slice(-10)) { // keep last 10 visible
-      const tSec = Math.floor(s.time / 1000);
+      // runtime.py sets StructureEvent.time = k.t, which is epoch SECONDS
+      // (data.py Kline.t). A blind /1000 would collapse it to ~1970 and push
+      // the marker 55 years off the left edge. Normalise defensively: treat
+      // values above 1e11 as epoch ms, otherwise as epoch seconds. (Audit #2)
+      const tSec = s.time > 1e11 ? Math.floor(s.time / 1000) : Math.floor(s.time);
       const color = s.dir > 0 ? "#22c55e" : "#ef4444"; // bullish sweep up, bearish down
       const marker = new TextAnnotation({
         x1: tSec,
@@ -860,6 +897,10 @@ export class TerminalChart {
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
+        // Float the label clear of the rejection wick: a bullish sweep prints at
+        // the swept low (anchor Top -> text sits below), a bearish sweep at the
+        // swept high (anchor Bottom -> text sits above). (Audit #8)
+        verticalAnchorPoint: s.dir > 0 ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
       });
       this.surface.annotations.add(marker);
       this.sweepAnnotations.push(marker);

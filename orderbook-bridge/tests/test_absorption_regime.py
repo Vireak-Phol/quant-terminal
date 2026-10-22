@@ -61,3 +61,27 @@ def test_zero_or_negative_baseline_ignored():
     eng.update_session_baseline(0.0)
     eng.update_session_baseline(-5.0)
     assert eng.effective_min_cluster_vol == 10.0
+
+
+def test_cluster_history_throttled_to_one_per_window():
+    """A high-frequency burst within one window must add at most ONE sample to
+    the cluster-volume history, not one per trade. (Audit #4)"""
+    eng = _make_engine()
+    base = 1_700_000_000_000
+    # 20 qualifying same-side trades all inside a single 4s window.
+    for i in range(20):
+        eng.ingest_trade(price=2000.0, qty=5.0, aggressor_side="buy",
+                         timestamp_ms=base + i * 100, resting_zones=[])
+    assert len(eng._cluster_vol_history) <= 1, (
+        f"burst should yield <=1 recorded sample, got {len(eng._cluster_vol_history)}"
+    )
+    # A trade a full window later is allowed to record a second sample.
+    eng.ingest_trade(price=2000.0, qty=5.0, aggressor_side="buy",
+                     timestamp_ms=base + 20 * 100 + eng.effective_window_ms,
+                     resting_zones=[])
+    # Need >=4 trades in the new window to evaluate; feed a few more.
+    for i in range(1, 5):
+        eng.ingest_trade(price=2000.0, qty=5.0, aggressor_side="buy",
+                         timestamp_ms=base + 20 * 100 + eng.effective_window_ms + i * 50,
+                         resting_zones=[])
+    assert len(eng._cluster_vol_history) <= 2

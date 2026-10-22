@@ -29,6 +29,11 @@ configureSciChart();
 const CHART_DIV_ID = "scichart-root";
 const TIMEFRAMES: Timeframe[] = ["1m", "5m", "15m"];
 
+// How many historical klines to seed the chart with on mount / timeframe switch.
+// Binance USDⓈ-M /fapi/v1/klines allows up to 1500 in a single request, and the
+// chart retains up to MAX_CANDLES (see TerminalChart.ts) — keep this <= that cap.
+const HISTORY_LIMIT = 1000;
+
 const LAYER_META: { key: ChartLayer; label: string; glyph: string; on: string }[] = [
   { key: "heatmap", label: "HEATMAP", glyph: "🔥", on: "bg-rose-500/20 text-rose-300 border border-rose-500/40 shadow-glow" },
   { key: "bubbles", label: "ABSORPTION", glyph: "🫧", on: "bg-terminal-bull/20 text-terminal-bull border border-terminal-bull/40 shadow-glow" },
@@ -114,7 +119,7 @@ export default function App() {
 
         setIsLoadingKlines(true);
         try {
-          const klines = await fetchBinanceFuturesKlines("XAUUSDT", timeframeRef.current, 200);
+          const klines = await fetchBinanceFuturesKlines("XAUUSDT", timeframeRef.current, HISTORY_LIMIT);
           if (!disposed && chartRef.current === chart && klines.length > 0) {
             chart.loadHistoricalCandles(klines);
           }
@@ -211,7 +216,7 @@ export default function App() {
       chartRef.current?.setTimeframe(tf);
       setIsLoadingKlines(true);
       try {
-        const klines = await fetchBinanceFuturesKlines("XAUUSDT", tf, 200);
+        const klines = await fetchBinanceFuturesKlines("XAUUSDT", tf, HISTORY_LIMIT);
         if (chartRef.current && timeframeRef.current === tf && klines.length > 0) {
           chartRef.current.loadHistoricalCandles(klines);
         }
