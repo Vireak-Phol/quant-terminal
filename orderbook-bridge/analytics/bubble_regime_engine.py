@@ -128,10 +128,17 @@ class BubbleRegimeEngine:
 
     # ── context feeds ─────────────────────────────────────────────────────────
     def update_open_interest(self, new_oi: float) -> None:
+        # Ignore uninitialised / non-advancing readings. REST OI polls arrive
+        # every ~15s but `process_trade` fans the same value across thousands of
+        # trades; advancing `prev_oi` on every identical reading would collapse
+        # `oi_delta` to 0.0 within a millisecond (Audit #2) and a cold-boot 0.0
+        # reading would anchor a phantom spike on the first real poll (Audit #7).
+        if new_oi <= 0 or new_oi == self.latest_oi:
+            return
         if self._has_oi:
             self.prev_oi = self.latest_oi
         else:
-            # First reading: anchor prev to itself so the first delta is 0.
+            # First real reading: anchor prev to itself so the first delta is 0.
             self.prev_oi = new_oi
             self._has_oi = True
         self.latest_oi = new_oi

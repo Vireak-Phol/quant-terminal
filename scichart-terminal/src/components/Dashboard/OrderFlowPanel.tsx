@@ -1,3 +1,4 @@
+import { memo, useEffect, useState } from 'react'
 import { useLiveField } from '../../hooks/useLiveField'
 import type { BubbleSignalData, BubbleRegime } from '../../hooks/useLiveOrderBook'
 
@@ -66,16 +67,92 @@ function timeAgo(ts: number): string {
   return `${Math.floor(mins / 60)}h`
 }
 
+/** Positioning & Delta card.
+ *
+ *  CVD updates on every trade (12-15 fps). Keeping it inside the main panel's
+ *  equality check forced the whole sweep feed to re-render, reverse arrays and
+ *  recompute the DOM at full WebSocket rate (Audit #5). This memoized
+ *  sub-component owns its own granular `useLiveField` selector, so only this
+ *  small card re-renders on CVD/OI ticks — the sweep feed re-renders only when
+ *  the bubble list actually changes. */
+const PositioningCard = memo(function PositioningCard() {
+  const p = useLiveField(
+    (snap) => {
+      const d = snap.data
+      return {
+        oi: d?.open_interest ?? null,
+        oiDelta: d?.oi_delta ?? null,
+        cvd: d?.cvd ?? null,
+      }
+    },
+    (a, b) => a.oi === b.oi && a.oiDelta === b.oiDelta && a.cvd === b.cvd,
+  )
+
+  const oiToneClass =
+    p.oiDelta == null
+      ? 'text-terminal-text-dim'
+      : p.oiDelta > 0
+        ? 'text-terminal-bull'
+        : p.oiDelta < 0
+          ? 'text-terminal-bear'
+          : 'text-terminal-gold'
+  const cvdTone =
+    p.cvd == null
+      ? 'text-terminal-text-dim'
+      : p.cvd > 0
+        ? 'text-terminal-bull'
+        : p.cvd < 0
+          ? 'text-terminal-bear'
+          : 'text-terminal-gold'
+
+  return (
+    <div className="rounded-lg bg-terminal-panel border border-terminal-border p-3 space-y-2">
+      <span className="text-2xs font-extrabold uppercase text-terminal-gold tracking-wider">
+        Positioning & Delta
+      </span>
+      <div className="grid grid-cols-3 gap-2 text-2xs pt-1">
+        <div className="bg-terminal-surface p-2 rounded border border-terminal-border/50">
+          <span className="text-terminal-text-dim text-[10px] block">OPEN INTEREST</span>
+          <span className="font-bold tabular-nums text-terminal-text">
+            {p.oi == null ? '—' : fmtQty(p.oi)}
+          </span>
+        </div>
+        <div className="bg-terminal-surface p-2 rounded border border-terminal-border/50">
+          <span className="text-terminal-text-dim text-[10px] block">OI Δ</span>
+          <span className={`font-bold tabular-nums ${oiToneClass}`}>
+            {p.oiDelta == null ? '—' : fmtSigned(p.oiDelta)}
+          </span>
+        </div>
+        <div className="bg-terminal-surface p-2 rounded border border-terminal-border/50">
+          <span className="text-terminal-text-dim text-[10px] block">CVD</span>
+          <span className={`font-bold tabular-nums ${cvdTone}`}>
+            {p.cvd == null ? '—' : fmtSigned(p.cvd)}
+          </span>
+        </div>
+      </div>
+      {/* OI narrative hint */}
+      {p.oiDelta != null && (
+        <p className="text-[10px] text-terminal-text-dim pt-0.5 leading-tight">
+          {p.oiDelta > 0
+            ? '▲ OI rising — fresh positions opening into the flow.'
+            : p.oiDelta < 0
+              ? '▼ OI falling — positions closing / forced out.'
+              : '↔ OI flat — no net positioning change.'}
+        </p>
+      )}
+    </div>
+  )
+})
+
 export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
-  // Low-frequency slice: only re-render when OI / CVD / the bubble feed change.
+  // Low-frequency slice: only re-render when the bubble feed changes. CVD/OI are
+  // intentionally NOT selected here — they live in <PositioningCard/> with their
+  // own granular selector so high-frequency CVD ticks don't thrash the feed (#5).
   const s = useLiveField(
     (snap) => {
       const d = snap.data
       const bubbles = d?.bubbles ?? []
       return {
-        oi: d?.open_interest ?? null,
-        oiDelta: d?.oi_delta ?? null,
-        cvd: d?.cvd ?? null,
         // Identity key: newest timestamp + count is enough to detect a change
         // without deep-comparing the whole array every frame.
         lastTs: bubbles.length ? bubbles[bubbles.length - 1].timestamp : 0,
@@ -83,13 +160,16 @@ export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
         bubbles,
       }
     },
-    (a, b) =>
-      a.oi === b.oi &&
-      a.oiDelta === b.oiDelta &&
-      a.cvd === b.cvd &&
-      a.lastTs === b.lastTs &&
-      a.count === b.count,
+    (a, b) => a.lastTs === b.lastTs && a.count === b.count,
   )
+
+  // Local 1s ticker so relative timestamps ("4s", "25s") keep advancing during
+  // tape pauses, when no new frame arrives to trigger a render (Audit #8).
+  const [, setNow] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => setNow((n) => n + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   // Newest first for the feed.
   const feed: BubbleSignalData[] = [...s.bubbles].reverse()
@@ -99,23 +179,6 @@ export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
     acc[b.regime] = (acc[b.regime] ?? 0) + 1
     return acc
   }, {})
-
-  const oiToneClass =
-    s.oiDelta == null
-      ? 'text-terminal-text-dim'
-      : s.oiDelta > 0
-        ? 'text-terminal-bull'
-        : s.oiDelta < 0
-          ? 'text-terminal-bear'
-          : 'text-terminal-gold'
-  const cvdTone =
-    s.cvd == null
-      ? 'text-terminal-text-dim'
-      : s.cvd > 0
-        ? 'text-terminal-bull'
-        : s.cvd < 0
-          ? 'text-terminal-bear'
-          : 'text-terminal-gold'
 
   return (
     <div className="flex flex-col h-full bg-terminal-surface/95 text-terminal-text font-mono text-xs select-none">
@@ -139,42 +202,9 @@ export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
-        {/* OI / CVD metrics */}
-        <div className="rounded-lg bg-terminal-panel border border-terminal-border p-3 space-y-2">
-          <span className="text-2xs font-extrabold uppercase text-terminal-gold tracking-wider">
-            Positioning & Delta
-          </span>
-          <div className="grid grid-cols-3 gap-2 text-2xs pt-1">
-            <div className="bg-terminal-surface p-2 rounded border border-terminal-border/50">
-              <span className="text-terminal-text-dim text-[10px] block">OPEN INTEREST</span>
-              <span className="font-bold tabular-nums text-terminal-text">
-                {s.oi == null ? '—' : fmtQty(s.oi)}
-              </span>
-            </div>
-            <div className="bg-terminal-surface p-2 rounded border border-terminal-border/50">
-              <span className="text-terminal-text-dim text-[10px] block">OI Δ</span>
-              <span className={`font-bold tabular-nums ${oiToneClass}`}>
-                {s.oiDelta == null ? '—' : fmtSigned(s.oiDelta)}
-              </span>
-            </div>
-            <div className="bg-terminal-surface p-2 rounded border border-terminal-border/50">
-              <span className="text-terminal-text-dim text-[10px] block">CVD</span>
-              <span className={`font-bold tabular-nums ${cvdTone}`}>
-                {s.cvd == null ? '—' : fmtSigned(s.cvd)}
-              </span>
-            </div>
-          </div>
-          {/* OI narrative hint */}
-          {s.oiDelta != null && (
-            <p className="text-[10px] text-terminal-text-dim pt-0.5 leading-tight">
-              {s.oiDelta > 0
-                ? '▲ OI rising — fresh positions opening into the flow.'
-                : s.oiDelta < 0
-                  ? '▼ OI falling — positions closing / forced out.'
-                  : '↔ OI flat — no net positioning change.'}
-            </p>
-          )}
-        </div>
+        {/* OI / CVD metrics — isolated in a memoized card so CVD ticks don't
+            re-render the sweep feed (Audit #5). */}
+        <PositioningCard />
 
         {/* Regime tally */}
         <div className="rounded-lg bg-terminal-panel border border-terminal-border p-3 space-y-2">
@@ -217,13 +247,13 @@ export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
             </p>
           ) : (
             <div className="space-y-1 pt-1">
-              {feed.map((b, i) => {
+              {feed.map((b) => {
                 const meta = REGIME_META[b.regime] ?? REGIME_META.standard_flow
                 const isBuy = b.aggressorSide === 'buy'
                 const liq = Number(b.liquidationQuantity)
                 return (
                   <div
-                    key={`${b.timestamp}-${i}`}
+                    key={`${b.timestamp}-${b.priceCenter}-${b.aggressorSide}-${b.totalQuantity}`}
                     className={`flex items-center gap-2 px-2 py-1.5 rounded bg-terminal-surface border ${meta.border}`}
                   >
                     <span className="text-sm leading-none">{meta.glyph}</span>

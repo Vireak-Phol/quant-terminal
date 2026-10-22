@@ -157,8 +157,7 @@ const BUBBLE_RADIUS_PX = 12; // on-screen radius (24px diameter, original size)
 
 // How often (ms) the Heavy Absorption detector may re-run against the FORMING
 // (not-yet-closed) candle so a developing absorption appears in near real-time.
-// A full sweep is O(history), so it is throttled rather than run every frame.
-const LIVE_DETECT_MS = 1500;
+// A full sweep is O(history); bubbles rebuild only on a closed candle.
 
 /**
  * A round absorption bubble. Positioned at a (time, price) point and rendered at
@@ -301,9 +300,8 @@ export class TerminalChart {
   private seenFootprintIds = new Set<string>();
   // Throttle for re-running the Heavy Absorption detector on the FORMING candle
   // so a developing absorption surfaces in near real-time instead of only when
-  // the bar finally closes. Full detector sweeps are O(history); we cap them to
-  // once per LIVE_DETECT_MS. (ms epoch of the last forming-candle sweep.)
-  private lastLiveDetectMs = 0;
+  // the bar finally closes. Full detector sweeps are O(history) and now run only
+  // on a closed candle.
   // Last applied live-view range, to skip redundant visibleRange writes.
   private lastViewFirstX = NaN;
   private lastViewLastX = NaN;
@@ -436,6 +434,10 @@ export class TerminalChart {
   private applyLayerVisibility() {
     if (this.heatmapSeries) this.heatmapSeries.isVisible = this.layers.heatmap;
     for (const b of this.bubbleAnnotations) b.isHidden = !this.layers.bubbles;
+    // The 🧱/💥/🚀 regime text markers share the `bubbles` toggle; hide them too,
+    // otherwise they leak onto the canvas after the bubble layer is toggled off
+    // until the next frame rebuild (Audit #6).
+    for (const m of this.bubbleRegimeAnnotations) m.isHidden = !this.layers.bubbles;
   }
 
   /** Load historical candles from Binance to seed price action + absorption history. */
@@ -505,18 +507,12 @@ export class TerminalChart {
     const newCandle = this.updateCandles(frame, nowSec);
     if (newCandle) {
       this.rebuildHeavyAbsorptions();
-      this.lastLiveDetectMs = frame.timestamp ?? Date.now();
-    } else {
-      // Re-run the detector against the FORMING candle on a throttle so a
-      // developing absorption (the newest/last bar) appears in near real-time
-      // rather than only once the bar closes. This is what made the latest
-      // bubble require a browser reload before. Skipped when bubbles are hidden.
-      const nowMs = frame.timestamp ?? Date.now();
-      if (this.layers.bubbles && nowMs - this.lastLiveDetectMs >= LIVE_DETECT_MS) {
-        this.lastLiveDetectMs = nowMs;
-        this.rebuildHeavyAbsorptions();
-      }
     }
+    // NOTE: the throttled forming-candle re-detect was rolled back — it called
+    // clearBubbles() + re-added every bubble on each tick, which made the whole
+    // bubble layer re-render constantly (flicker). Heavy Absorption bubbles now
+    // rebuild only when a candle closes; new live tape footprints still appear
+    // incrementally via appendLiveFootprints() below (O(new points), no churn).
     this.updateHeatmap(frame, nowSec);
     if (frame.absorption_candidates && frame.absorption_candidates.length > 0) {
       this.appendLiveFootprints(frame.absorption_candidates);

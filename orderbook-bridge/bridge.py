@@ -19,6 +19,7 @@ from collections import deque
 from decimal import Decimal
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -38,6 +39,8 @@ from analytics.liquidity_zones import LiquidityZoneDetector, LiquidityZone
 from analytics.absorption_engine import AbsorptionEngine, AbsorptionCandidate
 from analytics.vacuum_engine import VacuumEngine, Candle
 from analytics.trade_candles import TradeCandleAggregator
+from analytics.vwap_z import VwapZEngine
+from analytics.pressure_index import PressureIndexEngine
 from analytics.bubble_regime_engine import BubbleRegimeEngine, Liquidation
 from engine.sessions import session_flags as _v74_session_flags
 from replay.replay_engine import MarketRecorder, ReplayPlayer
@@ -53,6 +56,34 @@ logger = logging.getLogger("TerminalBridge")
 # `kill -USR1 <pid>` dumps all thread stacks to stderr (diagnose stalls without stopping the bridge).
 if hasattr(signal, "SIGUSR1"):
     faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+
+def safe_json_dumps(obj: Any, default=None) -> str:
+    """Serialize to STRICTLY-VALID JSON for the WS feed.
+
+    Python's ``json.dumps`` defaults to ``allow_nan=True``, which emits the bare
+    tokens ``Infinity`` / ``-Infinity`` / ``NaN``. Those are valid JavaScript but
+    NOT valid JSON, so the browser's ``JSON.parse`` throws
+    ("Unexpected token 'I', ...\"_factor\": Infinity ... is not valid JSON") and
+    the client drops the *entire* frame — freezing the terminal whenever any
+    engine ratio divides by zero.
+
+    The v7.4 engine frame is a deep ~70 KB structure where any ratio can go
+    non-finite, so we sanitize at the serialization boundary rather than chasing
+    every producer: non-finite floats become ``null`` (which the UI already
+    treats as "no value"). ``allow_nan=False`` would instead raise and drop the
+    frame, so we pre-clean with a default hook and keep the feed flowing.
+    """
+    def _clean(x: Any) -> Any:
+        if isinstance(x, float):
+            return x if math.isfinite(x) else None
+        if isinstance(x, dict):
+            return {k: _clean(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [_clean(v) for v in x]
+        return x
+
+    return json.dumps(_clean(obj), default=default)
 
 PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 SYMBOL = "XAUUSDT"
@@ -110,6 +141,11 @@ class _CandleAggregator:
 candle_agg = _CandleAggregator(VACUUM_BAR_MS)
 # Trade-price candle aggregator for OHLCV + delta + CVD (audit R1)
 trade_candle_agg = TradeCandleAggregator(interval_ms=60_000)
+# OSC v7.4 microstructure overlays, now driven by REAL transacted trade candles
+# (true volume + aggressor-tagged CVD) rather than the Pine lower-TF range proxy.
+# Both advance ONCE per CLOSED 1m trade candle, so they never repaint.
+vwap_z_engine = VwapZEngine()          # session-anchored VWAP + Cornish-Fisher dev-Z + bands
+pressure_engine = PressureIndexEngine()  # SMPI: signed pressure from CVD slope Z + absorption
 # Bubble Regime engine: OI + liquidation classifier for aggressive sweeps.
 # Fed by the live aggTrade stream, @forceOrder liquidations, and REST open interest.
 bubble_engine = BubbleRegimeEngine()
@@ -198,6 +234,9 @@ terminal_state: Dict[str, Any] = {
     # --- Audit R1: trade-price candles + CVD ---
     "trade_candle": None,  # current forming TradeCandle (closed=False)
     "cvd": 0.0,            # session-anchored cumulative volume delta (oz)
+    # --- OSC v7.4 microstructure overlays (real-data port; update on closed 1m bar) ---
+    "vwap_z": {},          # VWAP + Cornish-Fisher deviation Z-score + fat-tail bands
+    "pressure_index": {},  # SMPI signed pressure from true CVD slope Z + absorption
     # --- Bubble Regime engine: OI + liquidation classified sweeps ---
     "open_interest": 0.0,  # latest REST open interest (contracts)
     "oi_delta": 0.0,       # open_interest change between last two readings
@@ -428,6 +467,28 @@ async def on_trade_received(trade: TradeEvent):
     if closed_tc is not None and closed_tc.volume > 0:
         absorption_engine.update_session_baseline(closed_tc.volume)
 
+    # --- OSC v7.4 overlays: advance once per CLOSED 1m trade candle (no repaint) ---
+    # VWAP-Z reads true OHLC + transacted volume; SMPI reads the session CVD slope and
+    # the live absorption state for the just-closed bar. The forming bar never feeds
+    # these, so live == backtest.
+    if closed_tc is not None:
+        absorbed = len(absorption_engine.get_recent_candidates(trade.exchange_timestamp)) > 0
+        vwap_z_engine.update(
+            t_ms=closed_tc.t,
+            high=closed_tc.h,
+            low=closed_tc.l,
+            close=closed_tc.c,
+            volume=closed_tc.volume,
+        )
+        pressure_engine.update(
+            cvd=trade_candle_agg.cvd(),
+            open_=closed_tc.o,
+            close=closed_tc.c,
+            absorption=absorbed,
+        )
+        terminal_state["vwap_z"] = vwap_z_engine.to_dict()["vwap_z"]
+        terminal_state["pressure_index"] = pressure_engine.to_dict()["pressure_index"]
+
     # Ingest into quantitative absorption engine
     candidate = absorption_engine.ingest_trade(
         price=float(trade.price),
@@ -470,9 +531,9 @@ async def broadcast():
     if not CLIENTS or terminal_state["mid_price"] == 0.0:
         return
     if refresh_v74_frame():
-        msg = json.dumps(terminal_state)
+        msg = safe_json_dumps(terminal_state)
     else:
-        msg = json.dumps({k: v for k, v in terminal_state.items() if k != "v74"})
+        msg = safe_json_dumps({k: v for k, v in terminal_state.items() if k != "v74"})
     dead = set()
     for ws in CLIENTS:
         try:
@@ -504,7 +565,7 @@ async def ws_server_handler(ws):
             # broadcast() skips work while no client is connected, so refresh the
             # engine frame here or a new client would receive a stale one.
             refresh_v74_frame()
-            await ws.send(json.dumps(terminal_state))
+            await ws.send(safe_json_dumps(terminal_state))
 
         async for raw_msg in ws:
             try:
@@ -534,7 +595,7 @@ async def ws_server_handler(ws):
                     tf = cmd.get("tf")
                     tf = tf if tf in hub.tfs else None
                     limit = max(1, min(int(cmd.get("limit", 100)), 500))
-                    await ws.send(json.dumps(hub.ledger_view(tf, limit), default=str))
+                    await ws.send(safe_json_dumps(hub.ledger_view(tf, limit), default=str))
                 elif action == "set_risk_config":
                     try:
                         cfg = hub.set_risk(dict(cmd.get("config", {})))

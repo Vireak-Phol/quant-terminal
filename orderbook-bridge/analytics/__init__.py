@@ -10,6 +10,8 @@ from .bubble_regime_engine import (
     REGIME_VACUUM_SWEEP_BREAKOUT,
 )
 from .basis_mapper import CrossVenueBasisMapper
+from .vwap_z import VwapZEngine, VwapZState
+from .pressure_index import PressureIndexEngine, PressureState
 
 __all__ = [
     "LiquidityZone",
@@ -24,4 +26,8 @@ __all__ = [
     "REGIME_LIQUIDATION_EXHAUSTION_FLUSH",
     "REGIME_VACUUM_SWEEP_BREAKOUT",
     "CrossVenueBasisMapper",
+    "VwapZEngine",
+    "VwapZState",
+    "PressureIndexEngine",
+    "PressureState",
 ]
