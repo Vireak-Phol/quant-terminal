@@ -37,6 +37,8 @@ from market_data.binance_futures import BinanceFuturesProvider
 from analytics.liquidity_zones import LiquidityZoneDetector, LiquidityZone
 from analytics.absorption_engine import AbsorptionEngine, AbsorptionCandidate
 from analytics.vacuum_engine import VacuumEngine, Candle
+from analytics.trade_candles import TradeCandleAggregator
+from engine.sessions import session_flags as _v74_session_flags
 from replay.replay_engine import MarketRecorder, ReplayPlayer
 from engine.live import LiveHub
 from engine.orderflow import OrderflowSnapshot
@@ -105,6 +107,8 @@ class _CandleAggregator:
 
 
 candle_agg = _CandleAggregator(VACUUM_BAR_MS)
+# Trade-price candle aggregator for OHLCV + delta + CVD (audit R1)
+trade_candle_agg = TradeCandleAggregator(interval_ms=60_000)
 recorder = MarketRecorder(output_dir="data/recordings")
 replay_player = ReplayPlayer()
 alerts = AlertDispatcher.from_env()
@@ -187,6 +191,24 @@ terminal_state: Dict[str, Any] = {
     "vacuum_zones": [],
     "vacuum_magnet": {},
     "v74": None,
+    # --- Audit R1: trade-price candles + CVD ---
+    "trade_candle": None,  # current forming TradeCandle (closed=False)
+    "cvd": 0.0,            # session-anchored cumulative volume delta (oz)
+    # --- Audit R3: session/killzone + key levels + sweep events ---
+    "session": {
+        "london": False,
+        "ny_am": False,
+        "asia": False,
+        "london_fix": False,
+        "name": "OFF",
+    },
+    "key_levels": {
+        "pdh": None,
+        "pdl": None,
+        "pwh": None,
+        "pwl": None,
+    },
+    "sweep_events": [],  # recent liq_sweep StructureEvent from v74
     "telemetry": {
         "connection_state": "connecting",
         "order_book_sync_state": "uninitialized",
@@ -289,6 +311,37 @@ async def on_depth_update(book: LocalOrderBook):
     terminal_state["funding_rate"] = provider.funding_rate
     terminal_state["status"] = "LIVE_FEED"
 
+    # --- Audit R3: session/killzone + key levels + sweep events ---
+    now_sec = int(now_ms / 1000)
+    sess = _v74_session_flags(now_sec)
+    terminal_state["session"] = {
+        "london": sess.london,
+        "ny_am": sess.ny_am,
+        "asia": sess.asia,
+        "london_fix": sess.london_fix,
+        "name": sess.name,
+    }
+
+    # Extract key levels and recent sweep events from the v74 frame (if available)
+    v74_frame = _v74_cache.get("frame")
+    if v74_frame:
+        # Key levels come from the first ready timeframe in frames
+        for tf_name, tf_frame in (v74_frame.get("frames") or {}).items():
+            struct = tf_frame.get("structure") if tf_frame else None
+            if struct:
+                kl = struct.get("key_levels") or {}
+                terminal_state["key_levels"] = {
+                    "pdh": kl.get("pdh"),
+                    "pdl": kl.get("pdl"),
+                    "pwh": kl.get("pwh"),
+                    "pwl": kl.get("pwl"),
+                }
+                # Sweep events: keep the last 20 for the chart overlay
+                events = struct.get("events") or []
+                sweeps = [e for e in events if e.get("kind") == "liq_sweep"]
+                terminal_state["sweep_events"] = sweeps[-20:]
+                break  # use the first ready timeframe
+
     # Telemetry
     last_ex = book.last_exchange_time or now_ms
     terminal_state["telemetry"] = {
@@ -324,6 +377,18 @@ async def on_trade_received(trade: TradeEvent):
         "id": trade.trade_id,
     }
     RECENT_TRADES.append(trade_dict)
+
+    # --- Audit R1: aggregate into trade-price candles + CVD ---
+    closed_tc = trade_candle_agg.ingest(
+        price=float(trade.price),
+        qty=float(trade.quantity),
+        aggressor_side=trade.aggressor_side,
+        ts_ms=trade.exchange_timestamp,
+    )
+    # Update the forming candle in the frame on every trade (low latency)
+    forming = trade_candle_agg.forming()
+    terminal_state["trade_candle"] = forming.to_dict() if forming else None
+    terminal_state["cvd"] = trade_candle_agg.cvd()
 
     # Ingest into quantitative absorption engine
     candidate = absorption_engine.ingest_trade(

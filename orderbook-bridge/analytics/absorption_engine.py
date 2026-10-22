@@ -63,11 +63,25 @@ class AbsorptionEngine:
         window_duration_ms: int = 4000,  # 4-second observation window
         min_confidence: float = 0.50,
         retention_ms: int = 60_000,
+        # Regime-normalised thresholds: when a live session baseline is fed via
+        # update_session_baseline(), the absolute volume gates below scale by
+        # (session_median / global_median). This keeps sensitivity constant across
+        # the Asia-thin / NY-open-fat regime switch (audit F4).
+        base_min_cluster_vol: float = 10.0,
+        base_min_side_vol: float = 12.0,
     ):
         self.symbol = symbol
         self.window_duration_ms = window_duration_ms
         self.min_confidence = min_confidence
         self.retention_ms = retention_ms
+        self.base_min_cluster_vol = base_min_cluster_vol
+        self.base_min_side_vol = base_min_side_vol
+
+        # Session baseline: rolling distribution of 4-second cluster volume, used to
+        # z-normalise the absolute gates. None until enough history has accumulated.
+        self._cluster_vol_history: deque = deque(maxlen=500)
+        self._vol_scale = 1.0   # multiplicative scale on volume gates
+        self._window_scale = 1.0  # multiplicative scale on observation window
 
         # Rolling trades buffer (timestamp_ms, price, qty, aggressor_side)
         self.trades_buffer: deque = deque(maxlen=2000)
@@ -75,6 +89,54 @@ class AbsorptionEngine:
         self.price_history: deque = deque(maxlen=300)
         # Active absorption candidates
         self.active_candidates: Dict[str, AbsorptionCandidate] = {}
+
+    # ── Regime normalisation (audit F4) ─────────────────────────────────────
+    def update_session_baseline(self, median_cluster_vol: float, typical_window_ms: Optional[float] = None):
+        """Feed a live estimate of the session's typical 4-second cluster volume.
+
+        The gates scale in inverse proportion to how *thin* the current session is
+        relative to the long-run median: a quiet Asia session lowers the absolute
+        volume gates so absorption is still detectable, and a hot NY session raises
+        them so noise clusters stop firing. ``typical_window_ms`` widens/narrows the
+        observation window the same way (thinner tape needs a longer look).
+        """
+        if median_cluster_vol <= 0:
+            return
+        global_med = self._global_median()
+        if global_med <= 0:
+            # First observation: adopt it as the initial global anchor.
+            self._cluster_vol_history.append(median_cluster_vol)
+            return
+        ratio = median_cluster_vol / global_med
+        # Clamp so a single dead or manic print cannot whipsaw the gates.
+        ratio = max(0.5, min(2.0, ratio))
+        # Scale gates WITH the session: thin session (ratio<1) lowers the absolute
+        # volume gates so absorption is still detectable on thin tape; a fat NY
+        # session raises them so noise clusters stop firing.
+        self._vol_scale = ratio
+        if typical_window_ms and typical_window_ms > 0:
+            w_ratio = typical_window_ms / 4000.0
+            self._window_scale = max(0.75, min(1.5, w_ratio))
+        self._cluster_vol_history.append(median_cluster_vol)
+
+    def _global_median(self) -> float:
+        if not self._cluster_vol_history:
+            return 0.0
+        s = sorted(self._cluster_vol_history)
+        n = len(s)
+        return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+    @property
+    def effective_window_ms(self) -> int:
+        return int(self.window_duration_ms * self._window_scale)
+
+    @property
+    def effective_min_cluster_vol(self) -> float:
+        return self.base_min_cluster_vol * self._vol_scale
+
+    @property
+    def effective_min_side_vol(self) -> float:
+        return self.base_min_side_vol * self._vol_scale
 
     def ingest_price(self, price: float, timestamp_ms: int):
         """Records price tick for volatility estimation."""
@@ -143,7 +205,7 @@ class AbsorptionEngine:
         3. Stalled price movement relative to expected impact.
         4. Supporting evidence from resting liquidity walls.
         """
-        window_start = current_time_ms - self.window_duration_ms
+        window_start = current_time_ms - self.effective_window_ms
         window_trades = [t for t in self.trades_buffer if t["t"] >= window_start]
 
         if len(window_trades) < 4:
@@ -153,8 +215,12 @@ class AbsorptionEngine:
         buy_vol = sum(t["q"] for t in window_trades if t["side"] == "buy")
         sell_vol = sum(t["q"] for t in window_trades if t["side"] == "sell")
 
-        if total_vol < 10.0:  # Require meaningful cluster size (> 10 oz)
+        # Regime-scaled cluster gate (replaces fixed 10 oz; audit F4).
+        if total_vol < self.effective_min_cluster_vol:
             return None
+
+        # Record the observed cluster volume so the session baseline can adapt.
+        self._cluster_vol_history.append(total_vol)
 
         # Check for directional dominance
         buy_ratio = buy_vol / total_vol
@@ -172,7 +238,7 @@ class AbsorptionEngine:
         expected_displacement = math.sqrt(max(total_vol, 1.0)) * (local_vol * 0.10)
 
         # 1. Buy Absorption: Aggressive buyers executing heavily, but price does NOT advance
-        if buy_ratio >= 0.70 and buy_vol >= 12.0:
+        if buy_ratio >= 0.70 and buy_vol >= self.effective_min_side_vol:
             # Price stalled: price_delta is significantly less than expected
             stall_factor = max(0.0, 1.0 - (max(price_delta, 0.0) / max(expected_displacement, 0.01)))
 
@@ -211,7 +277,7 @@ class AbsorptionEngine:
                 )
 
         # 2. Sell Absorption: Aggressive sellers executing heavily, but price does NOT decline
-        elif sell_ratio >= 0.70 and sell_vol >= 12.0:
+        elif sell_ratio >= 0.70 and sell_vol >= self.effective_min_side_vol:
             stall_factor = max(0.0, 1.0 - (max(-price_delta, 0.0) / max(expected_displacement, 0.01)))
 
             near_bid_zone = False

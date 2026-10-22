@@ -2,7 +2,7 @@
 /// candlestick series, and the institutional overlays:
 ///   1. Bookmap Liquidity Heatmap  (UniformHeatmapDataSeries)
 ///   2. Price Candlesticks          (FastCandlestickRenderableSeries)
-///   3. Heavy Absorption Bubbles    (XyScatterRenderableSeries + DataLabels)
+///   3. Heavy Absorption Bubbles    (data-scaled CustomAnnotation circles)
 ///   4. Liquidity Vacuum Pockets    (v7.4 Pine Strategy structure; BoxAnnotations)
 ///   5. Vacuum Magnet Line          (HorizontalLineAnnotation + axis badge)
 ///   6. Hopla 3 / 50 / 97 range     (HorizontalLineAnnotation)
@@ -32,10 +32,8 @@ import {
   UniformHeatmapDataSeries,
   UniformHeatmapRenderableSeries,
   HeatmapColorMap,
-  XyScatterRenderableSeries,
-  XyDataSeries,
-  EllipsePointMarker,
   BoxAnnotation,
+  CustomAnnotation,
   HorizontalLineAnnotation,
   TextAnnotation,
   ELabelPlacement,
@@ -43,11 +41,8 @@ import {
   MouseWheelZoomModifier,
   ZoomExtentsModifier,
   EDataPointWidthMode,
-  EHorizontalTextPosition,
-  EVerticalTextPosition,
   ECoordinateMode,
   EHorizontalAnchorPoint,
-  EDataLabelSkipMode,
 } from "scichart";
 import type { CandleData } from "../lib/klines";
 import { detectHeavyAbsorptions, type HeavyAbsorptionPoint } from "../lib/absorption";
@@ -82,6 +77,39 @@ export interface ChartFrame {
     reason?: string;
   }>;
   v74?: V74Frame | null;
+  // --- Audit R1/R3: candles + CVD + session + key levels + sweeps ---
+  trade_candle?: {
+    t: number;
+    o: number;
+    h: number;
+    l: number;
+    c: number;
+    v: number;
+    d: number;
+    bv: number;
+    sv: number;
+    closed: boolean;
+  } | null;
+  cvd?: number;
+  session?: {
+    london: boolean;
+    ny_am: boolean;
+    asia: boolean;
+    london_fix: boolean;
+    name: string;
+  };
+  key_levels?: {
+    pdh: number | null;
+    pdl: number | null;
+    pwh: number | null;
+    pwl: number | null;
+  };
+  sweep_events?: Array<{
+    kind: "liq_sweep";
+    time: number;
+    price: number;
+    dir: number;
+  }>;
 }
 
 /** A clickable absorption bubble recorded for hit-testing. */
@@ -95,6 +123,63 @@ const PRICE_ROWS = 240; // heatmap price buckets (240×160 depth tensor)
 const HEATMAP_COLS = 160; // heatmap time columns
 const MAX_CANDLES = 500; // candle history cap
 const VISIBLE_CANDLES = 80; // how many candles the live view shows
+
+// Absorption bubbles are fixed-size markers (reverted from volume/zoom scaling):
+// every bubble is drawn at a constant pixel radius, matching the original
+// EllipsePointMarker look. `priceRadius` is retained on the annotation for
+// possible future use but is NOT used for sizing.
+const BUBBLE_RADIUS_PX = 12; // on-screen radius (24px diameter, original size)
+
+/**
+ * A round absorption bubble. Positioned at a (time, price) point and rendered at
+ * a constant pixel radius so its on-screen size is stable regardless of volume
+ * or zoom (matches the original fixed-size scatter marker).
+ */
+class VolumeBubbleAnnotation extends CustomAnnotation {
+  priceRadius: number;
+  fillColor: string;
+  strokeColor: string;
+  label: string;
+
+  constructor(opts: {
+    time: number;
+    price: number;
+    priceRadius: number;
+    fill: string;
+    stroke: string;
+    label: string;
+  }) {
+    super({
+      x1: opts.time,
+      y1: opts.price,
+      xCoordinateMode: ECoordinateMode.DataValue,
+      yCoordinateMode: ECoordinateMode.DataValue,
+      horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
+    });
+    this.priceRadius = opts.priceRadius;
+    this.fillColor = opts.fill;
+    this.strokeColor = opts.stroke;
+    this.label = opts.label;
+  }
+
+  getSvgString(annotation: CustomAnnotation): string {
+    const self = annotation as VolumeBubbleAnnotation;
+    const rPx = BUBBLE_RADIUS_PX;
+    const d = rPx * 2 + 4; // svg box with a little padding for the stroke
+    const c = d / 2;
+    const text = self.label
+      ? `<text x="${c}" y="${c}" fill="#ffffff" font-family="monospace" font-size="9" ` +
+        `text-anchor="middle" dominant-baseline="central">${self.label}</text>`
+      : "";
+    return (
+      `<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">` +
+      `<circle cx="${c}" cy="${c}" r="${rPx}" fill="${self.fillColor}" ` +
+      `stroke="${self.strokeColor}" stroke-width="1.5" />` +
+      text +
+      `</svg>`
+    );
+  }
+}
 
 export interface ChartConfig {
   tickSize: number;
@@ -115,16 +200,21 @@ export class TerminalChart {
   private heatmapData!: UniformHeatmapDataSeries;
   private heatmapSeries!: UniformHeatmapRenderableSeries;
 
-  private buyBubbleData!: XyDataSeries;
-  private sellBubbleData!: XyDataSeries;
-  private buyBubbleSeries!: XyScatterRenderableSeries;
-  private sellBubbleSeries!: XyScatterRenderableSeries;
+  // Absorption bubbles are DeepChart-style: drawn in price (data) units so they
+  // scale with the chart zoom, with radius proportional to volume. Each bubble
+  // is a VolumeBubbleAnnotation; we keep them in one list for lifecycle mgmt.
+  private bubbleAnnotations: VolumeBubbleAnnotation[] = [];
   private buyWatermark!: TextAnnotation;
   private sellWatermark!: TextAnnotation;
 
   private vacuumAnnotations: (BoxAnnotation | HorizontalLineAnnotation | TextAnnotation)[] = [];
   private hoplaAnnotations: HorizontalLineAnnotation[] = [];
   private markPriceAnnotation: HorizontalLineAnnotation | null = null;
+  // --- Audit R3: key levels + sweep markers ---
+  private keyLevelAnnotations: HorizontalLineAnnotation[] = [];
+  private sweepAnnotations: (BoxAnnotation | TextAnnotation)[] = [];
+  private keyLevelsSig = "";
+  private sweepsSig = "";
 
   // Candle history storage for the rolling absorption detector.
   private historicalCandles: CandleData[] = [];
@@ -245,52 +335,13 @@ export class TerminalChart {
     });
     this.surface.renderableSeries.add(this.candlestickSeries);
 
-    // --- Absorption Bubbles (Heavy Absorption Indicator) ---
-    // 1. Buyers Absorbed (aggressive buying rejected at high -> crimson).
-    this.buyBubbleData = new XyDataSeries(wasmContext, { dataSeriesName: "buyers_absorbed" });
-    this.buyBubbleSeries = new XyScatterRenderableSeries(wasmContext, {
-      dataSeries: this.buyBubbleData,
-      pointMarker: new EllipsePointMarker(wasmContext, {
-        width: 24,
-        height: 24,
-        strokeThickness: 1.5,
-        fill: "rgba(239, 68, 68, 0.40)",
-        stroke: "rgba(248, 113, 113, 0.95)",
-      }),
-      dataLabels: {
-        style: { fontFamily: "monospace", fontSize: 9 },
-        color: "#ffffff",
-        skipMode: EDataLabelSkipMode.ShowAll,
-        horizontalTextPosition: EHorizontalTextPosition.Center,
-        verticalTextPosition: EVerticalTextPosition.Center,
-        metaDataSelector: (md: any) => md?.text ?? "",
-      },
-    });
-    this.surface.renderableSeries.add(this.buyBubbleSeries);
+    // --- Absorption Bubbles (Heavy Absorption Indicator, DeepChart-style) ---
+    // Bubbles are drawn as VolumeBubbleAnnotations in price units (so they scale
+    // with zoom); they are created on demand in rebuildHeavyAbsorptions() and
+    // appendLiveFootprints(), not here. Buyers-absorbed = crimson, sellers =
+    // emerald. Only the static watermark labels are created at init time.
 
-    // 2. Sellers Absorbed (aggressive selling absorbed at low -> emerald).
-    this.sellBubbleData = new XyDataSeries(wasmContext, { dataSeriesName: "sellers_absorbed" });
-    this.sellBubbleSeries = new XyScatterRenderableSeries(wasmContext, {
-      dataSeries: this.sellBubbleData,
-      pointMarker: new EllipsePointMarker(wasmContext, {
-        width: 24,
-        height: 24,
-        strokeThickness: 1.5,
-        fill: "rgba(16, 185, 129, 0.40)",
-        stroke: "rgba(52, 211, 153, 0.95)",
-      }),
-      dataLabels: {
-        style: { fontFamily: "monospace", fontSize: 9 },
-        color: "#ffffff",
-        skipMode: EDataLabelSkipMode.ShowAll,
-        horizontalTextPosition: EHorizontalTextPosition.Center,
-        verticalTextPosition: EVerticalTextPosition.Center,
-        metaDataSelector: (md: any) => md?.text ?? "",
-      },
-    });
-    this.surface.renderableSeries.add(this.sellBubbleSeries);
-
-    // 3. Watermark labels.
+    // Watermark labels.
     this.buyWatermark = new TextAnnotation({
       x1: 0.98,
       y1: 0.96,
@@ -357,8 +408,7 @@ export class TerminalChart {
 
   private applyLayerVisibility() {
     if (this.heatmapSeries) this.heatmapSeries.isVisible = this.layers.heatmap;
-    if (this.buyBubbleSeries) this.buyBubbleSeries.isVisible = this.layers.bubbles;
-    if (this.sellBubbleSeries) this.sellBubbleSeries.isVisible = this.layers.bubbles;
+    for (const b of this.bubbleAnnotations) b.isHidden = !this.layers.bubbles;
     if (this.buyWatermark) this.buyWatermark.isHidden = !this.layers.bubbles;
     if (this.sellWatermark) this.sellWatermark.isHidden = !this.layers.bubbles;
   }
@@ -399,8 +449,7 @@ export class TerminalChart {
     this.seenFootprintIds.clear();
     this.vacuumSig = "";
     this.hoplaSig = "";
-    this.buyBubbleData?.clear();
-    this.sellBubbleData?.clear();
+    this.clearBubbles();
     for (let r = 0; r < PRICE_ROWS; r++) {
       this.zGrid[r].fill(0);
     }
@@ -422,6 +471,9 @@ export class TerminalChart {
     this.updateVacuum(frame);
     this.updateHopla(frame);
     this.updateMarkPrice(frame.mid_price);
+    // --- Audit R3: key levels + sweep markers ---
+    this.updateKeyLevels(frame);
+    this.updateSweeps(frame);
     if (this.liveFollow) {
       this.applyLiveView();
     }
@@ -472,22 +524,44 @@ export class TerminalChart {
    * new closed candle or a historical (re)load — NOT on every websocket frame.
    */
   private rebuildHeavyAbsorptions() {
-    if (!this.buyBubbleData || !this.sellBubbleData) return;
-    this.buyBubbleData.clear();
-    this.sellBubbleData.clear();
-    this.bubbleHits = [];
+    if (!this.surface) return;
+    this.clearBubbles();
     this.seenFootprintIds.clear();
 
     const points = detectHeavyAbsorptions(this.historicalCandles);
     for (const pt of points) {
-      const meta = { isSelected: false, text: `${pt.volRatio}` };
-      if (pt.type === "buyers_absorbed") {
-        this.buyBubbleData.append(pt.time, pt.price, meta);
-      } else {
-        this.sellBubbleData.append(pt.time, pt.price, meta);
-      }
+      this.addBubble(
+        pt.type === "buyers_absorbed" ? "buy" : "sell",
+        pt.volRatio,
+        pt.time,
+        pt.price,
+        `${pt.volRatio}`,
+      );
       this.bubbleHits.push({ x: pt.time, y: pt.price, point: pt });
     }
+  }
+
+  /** Create a fixed-size absorption bubble annotation (size no longer scales). */
+  private addBubble(
+    side: "buy" | "sell",
+    _volRatio: number,
+    time: number,
+    price: number,
+    label: string,
+  ) {
+    const fill = side === "buy" ? "rgba(239, 68, 68, 0.40)" : "rgba(16, 185, 129, 0.40)";
+    const stroke = side === "buy" ? "rgba(248, 113, 113, 0.95)" : "rgba(52, 211, 153, 0.95)";
+    const bubble = new VolumeBubbleAnnotation({ time, price, priceRadius: 0, fill, stroke, label });
+    bubble.isHidden = !this.layers.bubbles;
+    this.surface.annotations.add(bubble);
+    this.bubbleAnnotations.push(bubble);
+  }
+
+  /** Remove all bubble annotations from the surface and reset hit records. */
+  private clearBubbles() {
+    for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
+    this.bubbleAnnotations = [];
+    this.bubbleHits = [];
   }
 
   /**
@@ -496,7 +570,7 @@ export class TerminalChart {
    * not re-append. No clear(), so this is O(new points) per frame, not O(all).
    */
   private appendLiveFootprints(candidates: ChartFrame["absorption_candidates"]) {
-    if (!this.buyBubbleData || !this.sellBubbleData || !candidates) return;
+    if (!this.surface || !candidates) return;
     for (const a of candidates) {
       const t = Math.floor(a.timestamp / 1000);
       const px = Number(a.price);
@@ -504,12 +578,8 @@ export class TerminalChart {
       const id = `${a.side}-${t}-${px}`;
       if (this.seenFootprintIds.has(id)) continue;
       this.seenFootprintIds.add(id);
-      const meta = { isSelected: false, text: "ABS" };
-      if (a.side === "buy") {
-        this.buyBubbleData.append(t, px, meta);
-      } else {
-        this.sellBubbleData.append(t, px, meta);
-      }
+
+      this.addBubble(a.side === "buy" ? "buy" : "sell", 0, t, px, "ABS");
       this.bubbleHits.push({ x: t, y: px, point: null });
     }
     if (this.seenFootprintIds.size > 2000) {
@@ -732,6 +802,70 @@ export class TerminalChart {
     if (Number.isFinite(h.line_3)) mk(h.line_3, "#00b4d8", `3% ${h.line_3.toFixed(2)}`, [4, 4]);
   }
 
+  /** Render prior-day/week high/low key levels — only when signature changes. */
+  private updateKeyLevels(frame: ChartFrame) {
+    const kl = frame.key_levels;
+    const sig = kl ? `${kl.pdh}:${kl.pdl}:${kl.pwh}:${kl.pwl}` : "";
+    if (sig === this.keyLevelsSig) return;
+    this.keyLevelsSig = sig;
+
+    for (const a of this.keyLevelAnnotations) this.surface.annotations.remove(a);
+    this.keyLevelAnnotations = [];
+    if (!kl) return;
+
+    const mk = (price: number | null, color: string, label: string) => {
+      if (price == null || !Number.isFinite(price)) return;
+      const line = new HorizontalLineAnnotation({
+        y1: price,
+        stroke: color,
+        strokeThickness: 1.5,
+        strokeDashArray: [8, 4],
+        showLabel: true,
+        labelPlacement: ELabelPlacement.TopLeft,
+        axisLabelFill: color,
+        axisLabelStroke: "#000000",
+        labelValue: label,
+      });
+      this.surface.annotations.add(line);
+      this.keyLevelAnnotations.push(line);
+    };
+
+    mk(kl.pdh, "#a855f7", `PDH ${kl.pdh!.toFixed(2)}`);
+    mk(kl.pdl, "#a855f7", `PDL ${kl.pdl!.toFixed(2)}`);
+    mk(kl.pwh, "#ec4899", `PWH ${kl.pwh!.toFixed(2)}`);
+    mk(kl.pwl, "#ec4899", `PWL ${kl.pwl!.toFixed(2)}`);
+  }
+
+  /** Render liquidity sweep markers (liq_sweep events) — only when signature changes. */
+  private updateSweeps(frame: ChartFrame) {
+    const sweeps = frame.sweep_events || [];
+    const sig = sweeps.map((s) => `${s.time}:${s.price}:${s.dir}`).join("|");
+    if (sig === this.sweepsSig) return;
+    this.sweepsSig = sig;
+
+    for (const a of this.sweepAnnotations) this.surface.annotations.remove(a);
+    this.sweepAnnotations = [];
+    if (sweeps.length === 0) return;
+
+    for (const s of sweeps.slice(-10)) { // keep last 10 visible
+      const tSec = Math.floor(s.time / 1000);
+      const color = s.dir > 0 ? "#22c55e" : "#ef4444"; // bullish sweep up, bearish down
+      const marker = new TextAnnotation({
+        x1: tSec,
+        y1: s.price,
+        yCoordinateMode: ECoordinateMode.DataValue,
+        text: s.dir > 0 ? "▲ SWEEP" : "▼ SWEEP",
+        textColor: color,
+        fontSize: 9,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontWeight: "bold",
+        horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
+      });
+      this.surface.annotations.add(marker);
+      this.sweepAnnotations.push(marker);
+    }
+  }
+
   private updateMarkPrice(midPrice: number) {
     if (!this.markPriceAnnotation) {
       this.markPriceAnnotation = new HorizontalLineAnnotation({
@@ -845,6 +979,12 @@ export class TerminalChart {
     this.hoplaAnnotations = [];
     for (const a of this.vacuumAnnotations) this.surface?.annotations.remove(a);
     this.vacuumAnnotations = [];
+    for (const a of this.keyLevelAnnotations) this.surface?.annotations.remove(a);
+    this.keyLevelAnnotations = [];
+    for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
+    this.sweepAnnotations = [];
+    for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
+    this.bubbleAnnotations = [];
     if (this.markPriceAnnotation) {
       this.surface?.annotations.remove(this.markPriceAnnotation);
       this.markPriceAnnotation = null;

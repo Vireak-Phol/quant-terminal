@@ -107,6 +107,20 @@ export interface LiveOrderBookData {
   telemetry?: TelemetryData
   /** v7.4 institutional engine frame (closed-bar signals, structure, ledger). */
   v74?: V74Frame | null
+  // --- Audit R1: trade-price candles + CVD (bridge on_trade_received) ---
+  cvd?: number
+  trade_candle?: {
+    t: number; o: number; h: number; l: number; c: number
+    v: number; d: number; bv: number; sv: number; closed: boolean
+  } | null
+  // --- Audit R3: session/killzone + key levels + sweep events ---
+  session?: {
+    london: boolean; ny_am: boolean; asia: boolean; london_fix: boolean; name: string
+  }
+  key_levels?: {
+    pdh: number | null; pdl: number | null; pwh: number | null; pwl: number | null
+  }
+  sweep_events?: Array<{ kind: 'liq_sweep'; time: number; price: number; dir: number }>
   status: string
 }
 

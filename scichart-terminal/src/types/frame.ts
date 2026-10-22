@@ -102,6 +102,42 @@ export interface V74State {
   [key: string]: unknown;
 }
 
+export interface TradeCandle {
+  t: number;      // bucket open time, epoch ms
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;      // total volume (oz)
+  d: number;      // delta (buy - sell, oz)
+  bv: number;     // buy volume
+  sv: number;     // sell volume
+  closed: boolean;
+}
+
+export interface SessionFlags {
+  london: boolean;
+  ny_am: boolean;
+  asia: boolean;
+  london_fix: boolean;
+  name: string;
+}
+
+export interface KeyLevels {
+  pdh: number | null;
+  pdl: number | null;
+  pwh: number | null;
+  pwl: number | null;
+}
+
+export interface SweepEvent {
+  kind: "liq_sweep";
+  time: number;
+  price: number;
+  dir: number;
+  prob?: number | null;
+}
+
 export interface BookmapFrame {
   type: "bookmap_update";
   symbol: string;
@@ -119,6 +155,13 @@ export interface BookmapFrame {
   vacuum_zones: VacuumZone[];
   vacuum_magnet: VacuumMagnet;
   v74?: V74State;
+  // --- Audit R1: trade-price candles + CVD ---
+  trade_candle?: TradeCandle | null;
+  cvd: number;
+  // --- Audit R3: session/killzone + key levels + sweep events ---
+  session: SessionFlags;
+  key_levels: KeyLevels;
+  sweep_events: SweepEvent[];
   status: string;
 }
 
