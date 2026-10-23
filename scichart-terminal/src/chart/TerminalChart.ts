@@ -7,6 +7,7 @@
 ///   5. Vacuum Magnet Line          (HorizontalLineAnnotation + axis badge)
 ///   6. Hopla 3 / 50 / 97 range     (HorizontalLineAnnotation)
 ///   7. Mark Price Line on Axis     (HorizontalLineAnnotation with amber badge)
+///   8. Institutional Signal Markers & Active Trade Plan (ENTRY / SL / TP1 / TP2)
 ///
 /// Every overlay group is independently toggleable via setLayerVisibility() and
 /// every resource is released in delete() so React unmounts leave no WebGL leaks.
@@ -15,7 +16,7 @@
 /// (the cockpit coalesces websocket frames with requestAnimationFrame). Within a
 /// frame it does the minimum work: candle O/H/L/C in place, heatmap pushed to the
 /// GPU only when the grid changed, absorption bubbles rebuilt only on a new closed
-/// candle (live footprints appended incrementally), and vacuum/hopla annotations
+/// candle (live footprints appended incrementally), and vacuum/hopla/signal annotations
 /// rebuilt only when their v7.4 signature changes.
 
 import {
@@ -155,10 +156,6 @@ const RIGHT_OFFSET_PX = 200;
 // possible future use but is NOT used for sizing.
 const BUBBLE_RADIUS_PX = 12; // on-screen radius (24px diameter, original size)
 
-// How often (ms) the Heavy Absorption detector may re-run against the FORMING
-// (not-yet-closed) candle so a developing absorption appears in near real-time.
-// A full sweep is O(history); bubbles rebuild only on a closed candle.
-
 /**
  * A round absorption bubble. Positioned at a (time, price) point and rendered at
  * a constant pixel radius so its on-screen size is stable regardless of volume
@@ -237,13 +234,15 @@ export class TerminalChart {
   private vacuumAnnotations: (BoxAnnotation | HorizontalLineAnnotation | TextAnnotation)[] = [];
   private hoplaAnnotations: HorizontalLineAnnotation[] = [];
   private markPriceAnnotation: HorizontalLineAnnotation | null = null;
-  // --- Audit R3: key levels + sweep markers ---
+  // --- Audit R3: key levels + sweep markers + v7.5 institutional signals ---
   private keyLevelAnnotations: HorizontalLineAnnotation[] = [];
   private sweepAnnotations: (BoxAnnotation | TextAnnotation)[] = [];
   private bubbleRegimeAnnotations: TextAnnotation[] = [];
+  private signalAnnotations: (HorizontalLineAnnotation | TextAnnotation)[] = [];
   private keyLevelsSig = "";
   private sweepsSig = "";
   private bubblesSig = "";
+  private signalsSig = "";
 
   // Candle history storage for the rolling absorption detector.
   private historicalCandles: CandleData[] = [];
@@ -252,10 +251,6 @@ export class TerminalChart {
   private bubbleHits: BubbleHit[] = [];
 
   // Heatmap rolling grids [PRICE_ROWS][HEATMAP_COLS] (ring-buffered on the X axis).
-  // rawZGrid holds resting quantities; displayZGrid is what the GPU sees. The
-  // BookMap time-decay fade is DISABLED by default (restored flat look) — when
-  // off, displayZGrid simply mirrors rawZGrid. The fade machinery is retained so
-  // it can be re-enabled via setHeatmapFade() without a code change.
   private rawZGrid: number[][] = [];
   private displayZGrid: number[][] = [];
   private heatmapFadeEnabled = false;
@@ -267,14 +262,6 @@ export class TerminalChart {
   // Candle aggregation state (bucketStartSec -> ohlc).
   private curBucket = 0;
   private curOhlc: { o: number; h: number; l: number; c: number } | null = null;
-  // Running max trade-volume accumulated into the CURRENT bucket. The trade_candle
-  // is a 60s rolling aggregate whose `v` is monotonically increasing within its
-  // minute and resets at each minute boundary; we take the per-frame max so the
-  // closing bucket's FINAL volume is captured on the rollover frame (which the
-  // same-bucket `else` branch never runs on). Without this, the just-closed
-  // candle keeps a stale/partial volume and the Heavy Absorption detector drops
-  // the newest bubble — which is why it only appeared after a browser reload
-  // (reload re-seeds true volumes from Binance klines).
   private curBucketMaxVol = 0;
 
   // Live-follow control.
@@ -295,13 +282,7 @@ export class TerminalChart {
   // --- Perf: signature caches so overlays only rebuild when data changes ---
   private vacuumSig = "";
   private hoplaSig = "";
-  // Live-tape footprint dedup so identical carried-forward candidates are not
-  // re-appended; bounded so a long session cannot grow it without limit.
   private seenFootprintIds = new Set<string>();
-  // Throttle for re-running the Heavy Absorption detector on the FORMING candle
-  // so a developing absorption surfaces in near real-time instead of only when
-  // the bar finally closes. Full detector sweeps are O(history) and now run only
-  // on a closed candle.
   // Last applied live-view range, to skip redundant visibleRange writes.
   private lastViewFirstX = NaN;
   private lastViewLastX = NaN;
@@ -387,11 +368,6 @@ export class TerminalChart {
     });
     this.surface.renderableSeries.add(this.candlestickSeries);
 
-    // --- Absorption Bubbles (Heavy Absorption Indicator, DeepChart-style) ---
-    // Bubbles are drawn as VolumeBubbleAnnotations in price units (so they scale
-    // with zoom); they are created on demand in rebuildHeavyAbsorptions() and
-    // appendLiveFootprints(). Buyers-absorbed = crimson, sellers = emerald.
-
     // --- Interaction: wheel zoom, drag pan, double-click reset to live extents ---
     this.surface.chartModifiers.add(
       new ZoomPanModifier(),
@@ -436,9 +412,6 @@ export class TerminalChart {
   private applyLayerVisibility() {
     if (this.heatmapSeries) this.heatmapSeries.isVisible = this.layers.heatmap;
     for (const b of this.bubbleAnnotations) b.isHidden = !this.layers.bubbles;
-    // The 🧱/💥/🚀 regime text markers share the `bubbles` toggle; hide them too,
-    // otherwise they leak onto the canvas after the bubble layer is toggled off
-    // until the next frame rebuild (Audit #6).
     for (const m of this.bubbleRegimeAnnotations) m.isHidden = !this.layers.bubbles;
   }
 
@@ -480,15 +453,15 @@ export class TerminalChart {
     this.seenFootprintIds.clear();
     this.vacuumSig = "";
     this.hoplaSig = "";
-    // Reset key-level + sweep caches too, and detach their annotations — else a
-    // matching signature on the new timeframe would skip re-rendering onto the
-    // freshly cleared surface, and stale lines/markers would leak. (Audit #7)
     this.keyLevelsSig = "";
     this.sweepsSig = "";
+    this.signalsSig = "";
     for (const a of this.keyLevelAnnotations) this.surface?.annotations.remove(a);
     this.keyLevelAnnotations = [];
     for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
     this.sweepAnnotations = [];
+    for (const a of this.signalAnnotations) this.surface?.annotations.remove(a);
+    this.signalAnnotations = [];
     this.bubblesSig = "";
     for (const a of this.bubbleRegimeAnnotations) this.surface?.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
@@ -510,11 +483,6 @@ export class TerminalChart {
     if (newCandle) {
       this.rebuildHeavyAbsorptions();
     }
-    // NOTE: the throttled forming-candle re-detect was rolled back — it called
-    // clearBubbles() + re-added every bubble on each tick, which made the whole
-    // bubble layer re-render constantly (flicker). Heavy Absorption bubbles now
-    // rebuild only when a candle closes; new live tape footprints still appear
-    // incrementally via appendLiveFootprints() below (O(new points), no churn).
     this.updateHeatmap(frame, nowSec);
     if (frame.absorption_candidates && frame.absorption_candidates.length > 0) {
       this.appendLiveFootprints(frame.absorption_candidates);
@@ -522,40 +490,23 @@ export class TerminalChart {
     this.updateVacuum(frame);
     this.updateHopla(frame);
     this.updateMarkPrice(frame.mid_price);
-    // --- Audit R3: key levels + sweep markers ---
+    // --- Audit R3: key levels + sweep markers + v7.5 institutional signals ---
     this.updateKeyLevels(frame);
     this.updateSweeps(frame);
+    this.updateSignals(frame);
     this.updateBubbleRegimes(frame);
     if (this.liveFollow) {
       this.applyLiveView();
     }
-    // Force a redraw this frame. SciChart's internal render loop is rAF-driven
-    // and therefore paused while the tab is hidden; an explicit forced draw
-    // guarantees the active candle, heatmap and absorption bubbles advance even
-    // off-screen (the App drives update() from a timer when document.hidden).
     this.surface.invalidateElement({ force: true });
   }
 
-  /** Returns true when a new candle bucket was opened (caller rebuilds bubbles).
-   *
-   *  Price action still comes from the mid-price tick (sub-second, smooth), but
-   *  VOLUME + DELTA are seeded from `frame.trade_candle` — the trade-price
-   *  aggregator in the bridge. Previously volume was hardcoded to 0, which left
-   *  the Heavy Absorption detector permanently blind (every bar had volRatio 0).
-   *  (Audit #3) The trade candle uses a fixed 60s interval and epoch-ms `t`; we
-   *  keep the chart's own timeframe bucketing for the X axis and fold the
-   *  trade-candle volume into the current chart bucket. */
+  /** Returns true when a new candle bucket was opened (caller rebuilds bubbles). */
   private updateCandles(frame: ChartFrame, nowSec: number): boolean {
     const price = frame.mid_price;
     const tc = frame.trade_candle;
     const bucket = Math.floor(nowSec / this.tfSeconds) * this.tfSeconds;
     if (this.curOhlc === null || bucket > this.curBucket) {
-      // A bucket just rolled. Flush the CLOSING candle's final volume before
-      // opening the new one: the same-bucket `else` below never runs on this
-      // frame, so without this flush the closed candle keeps a stale/partial
-      // volume and the Heavy Absorption detector drops the newest bubble (the
-      // exact reason it only surfaced after a browser reload). `curBucketMaxVol`
-      // holds the running max trade-volume accumulated into the closing bucket.
       if (this.historicalCandles.length > 0 && this.curOhlc !== null) {
         const closing = this.historicalCandles[this.historicalCandles.length - 1];
         if (closing.time === this.curBucket) {
@@ -565,8 +516,6 @@ export class TerminalChart {
 
       this.curBucket = bucket;
       this.curOhlc = { o: price, h: price, l: price, c: price };
-      // The new bucket's running volume starts from the current trade_candle's
-      // reading (tc.v resets each minute; for a 1m chart it's this bucket's start).
       this.curBucketMaxVol = tc ? tc.v : 0;
       this.candleData.append(bucket, price, price, price, price);
       while (this.candleData.count() > MAX_CANDLES) {
@@ -597,13 +546,6 @@ export class TerminalChart {
       last.high = Math.max(last.high, price);
       last.low = Math.min(last.low, price);
       last.close = price;
-      // The trade_candle is a 60s running aggregate of transacted volume. Within
-      // a chart bucket its `v` is monotonically increasing for the same minute
-      // and resets each minute, so accumulate the max seen per minute boundary.
-      // For charts at the 1m timeframe this is the exact bucket volume; for
-      // higher timeframes it approximates the folded total (good enough to keep
-      // the absorption detector live rather than blind). Keep curBucketMaxVol in
-      // sync so the rollover flush above can commit the final volume.
       if (tc) {
         this.curBucketMaxVol = Math.max(this.curBucketMaxVol, tc.v);
         last.volume = Math.max(last.volume, tc.v);
@@ -614,8 +556,6 @@ export class TerminalChart {
 
   /**
    * Full rebuild of the Heavy Absorption bubbles from the candle history.
-   * Expensive (runs the detector over up to 500 candles), so it only runs on a
-   * new closed candle or a historical (re)load — NOT on every websocket frame.
    */
   private rebuildHeavyAbsorptions() {
     if (!this.surface) return;
@@ -659,9 +599,7 @@ export class TerminalChart {
   }
 
   /**
-   * Incrementally append only NEW live order-flow tape footprints. Deduped by a
-   * synthetic id so a frame carrying the same (carried-forward) candidates does
-   * not re-append. No clear(), so this is O(new points) per frame, not O(all).
+   * Incrementally append only NEW live order-flow tape footprints.
    */
   private appendLiveFootprints(candidates: ChartFrame["absorption_candidates"]) {
     if (!this.surface || !candidates) return;
@@ -677,9 +615,6 @@ export class TerminalChart {
       this.bubbleHits.push({ x: t, y: px, point: null });
     }
     if (this.seenFootprintIds.size > 2000) {
-      // Retain the most recent ids (insertion order) so carried-forward
-      // candidates are still recognised as seen — avoids a duplicate-append
-      // window. The next closed-bar rebuild fully re-seeds the set anyway.
       const recent = Array.from(this.seenFootprintIds).slice(-500);
       this.seenFootprintIds = new Set(recent);
     }
@@ -690,9 +625,6 @@ export class TerminalChart {
     const span = PRICE_ROWS * this.cfg.tickSize;
     let dirty = false;
 
-    // 1. Manage priceFloor and vertically translate existing rows when price floor moves.
-    // Without this row translation, historical resting levels get shifted to wrong prices
-    // whenever price wanders beyond the margin, causing broken pixels and disjointed steps.
     if (this.priceFloor === 0 || mid < this.priceFloor + 15 || mid > this.priceFloor + span - 15) {
       const oldPriceFloor = this.priceFloor;
       const newPriceFloor = Math.round((mid - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
@@ -724,8 +656,6 @@ export class TerminalChart {
       this.lastHeatmapBucket = bucket;
       for (let r = 0; r < PRICE_ROWS; r++) this.rawZGrid[r].fill(0);
 
-      // Seed historical columns based on each zone's actual firstSeenTimestamp (or recent columns),
-      // so we don't paint a giant artificial flat brick across all 160 historical columns!
       for (const z of zones) {
         const lo = Number(z.priceLow);
         const hi = Number(z.priceHigh);
@@ -754,7 +684,6 @@ export class TerminalChart {
       this.recalculateDisplayGrid();
       dirty = true;
     } else {
-      // 2. Handle bucket advancement (including multi-bucket jumps when web tab was idle/backgrounded).
       if (bucket !== this.lastHeatmapBucket) {
         const elapsed = Math.round((bucket - this.lastHeatmapBucket) / this.tfSeconds);
         if (elapsed > 0) {
@@ -769,14 +698,10 @@ export class TerminalChart {
           }
           dirty = true;
         } else {
-          // Negative or zero elapsed (clock skew, replay, or out-of-order tick):
-          // do NOT shift existing resting history forward.
           this.lastHeatmapBucket = bucket;
         }
       }
 
-      // Rebuild only the newest column from the current resting liquidity, and
-      // only push to the GPU if that column actually differs from last frame.
       for (let r = 0; r < PRICE_ROWS; r++) {
         if (this.rawZGrid[r][col] !== 0) {
           this.rawZGrid[r][col] = 0;
@@ -795,8 +720,6 @@ export class TerminalChart {
       }
     }
 
-    // setZValues marshals the whole 240×160 tensor across the WASM boundary, so
-    // only do it when something in the grid actually changed this frame.
     if (dirty) {
       this.heatmapData.setZValues(this.displayZGrid);
     }
@@ -812,8 +735,7 @@ export class TerminalChart {
     for (let c = 0; c < HEATMAP_COLS; c++) {
       let factor = 1.0;
       if (this.heatmapFadeEnabled && maxCol > 0) {
-        // BookMap time-decay: older columns (left) attenuate smoothly into the dark canvas.
-        const t = c / maxCol; // 0.0 at oldest column, 1.0 at live front
+        const t = c / maxCol;
         factor = (1 - this.heatmapFadeStrength) + this.heatmapFadeStrength * Math.pow(t, 1.35);
       }
       for (let r = 0; r < PRICE_ROWS; r++) {
@@ -887,11 +809,10 @@ export class TerminalChart {
     const vacBand = structure?.vac_band ?? 0;
     const magnet = vacBand > 0 ? structure?.vac_above : vacBand < 0 ? structure?.vac_below : null;
 
-    // Signature: the only things that affect the drawn annotations.
     const sig =
       pockets.map((v) => `${v.strength}:${v.top}:${v.bottom}:${v.price}`).join("|") +
       `#${vacBand}:${magnet ?? ""}`;
-    if (sig === this.vacuumSig) return; // unchanged → no annotation churn
+    if (sig === this.vacuumSig) return;
     this.vacuumSig = sig;
 
     for (const a of this.vacuumAnnotations) this.surface.annotations.remove(a);
@@ -966,7 +887,7 @@ export class TerminalChart {
 
     const h = this.pickV74Frame(frame)?.structure?.hopla;
     const sig = h ? `${h.line_3}:${h.line_50}:${h.line_97}` : "";
-    if (sig === this.hoplaSig) return; // unchanged → no annotation churn
+    if (sig === this.hoplaSig) return;
     this.hoplaSig = sig;
 
     for (const a of this.hoplaAnnotations) this.surface.annotations.remove(a);
@@ -1005,10 +926,6 @@ export class TerminalChart {
     this.keyLevelAnnotations = [];
     if (!kl) return;
 
-    // Format the label INSIDE the helper, after the null/finite guard. Passing
-    // `price.toFixed(2)` at the call site would evaluate before the guard runs
-    // (JS evaluates arguments eagerly), throwing TypeError on a null level and
-    // crashing the whole render loop on the first (null) frame. (Audit #1)
     const mk = (price: number | null, color: string, prefix: string) => {
       if (price == null || !Number.isFinite(price)) return;
       const line = new HorizontalLineAnnotation({
@@ -1043,13 +960,9 @@ export class TerminalChart {
     this.sweepAnnotations = [];
     if (sweeps.length === 0) return;
 
-    for (const s of sweeps.slice(-10)) { // keep last 10 visible
-      // runtime.py sets StructureEvent.time = k.t, which is epoch SECONDS
-      // (data.py Kline.t). A blind /1000 would collapse it to ~1970 and push
-      // the marker 55 years off the left edge. Normalise defensively: treat
-      // values above 1e11 as epoch ms, otherwise as epoch seconds. (Audit #2)
+    for (const s of sweeps.slice(-10)) {
       const tSec = s.time > 1e11 ? Math.floor(s.time / 1000) : Math.floor(s.time);
-      const color = s.dir > 0 ? "#22c55e" : "#ef4444"; // bullish sweep up, bearish down
+      const color = s.dir > 0 ? "#22c55e" : "#ef4444";
       const marker = new TextAnnotation({
         x1: tSec,
         y1: s.price,
@@ -1060,9 +973,6 @@ export class TerminalChart {
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
-        // Float the label clear of the rejection wick: a bullish sweep prints at
-        // the swept low (anchor Top -> text sits below), a bearish sweep at the
-        // swept high (anchor Bottom -> text sits above). (Audit #8)
         verticalAnchorPoint: s.dir > 0 ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
       });
       this.surface.annotations.add(marker);
@@ -1070,16 +980,85 @@ export class TerminalChart {
     }
   }
 
+  /** Render v7.4 / v7.5 Institutional Signal Markers (▲ A+ / ▼ A+) & Active Trade Plan (ENTRY/SL/TP1/TP2). */
+  private updateSignals(frame: ChartFrame) {
+    const tfFrame = this.pickV74Frame(frame);
+    const sigs = (tfFrame?.signals || []).filter((s) => s.tier === "A_PLUS" || s.tier === "STRUCTURAL");
+    const active = tfFrame?.active_signal || null;
+
+    const sig =
+      sigs
+        .slice(-16)
+        .map((s) => `${s.id}:${s.status}:${s.outcome ?? ""}:${s.win_rate ?? ""}`)
+        .join("|") +
+      `#active:${active ? `${active.id}:${active.plan.entry}:${active.plan.stop}:${active.plan.tp1}:${active.plan.tp2}` : "none"}`;
+    if (sig === this.signalsSig) return;
+    this.signalsSig = sig;
+
+    for (const a of this.signalAnnotations) this.surface.annotations.remove(a);
+    this.signalAnnotations = [];
+    if (sigs.length === 0 && !active) return;
+
+    for (const s of sigs.slice(-16)) {
+      if (s.entry == null || !Number.isFinite(s.entry)) continue;
+      const tSec = s.time > 1e11 ? Math.floor(s.time / 1000) : Math.floor(s.time);
+      const isLong = s.direction === "LONG";
+      const isAPlus = s.tier === "A_PLUS";
+      const color = isLong
+        ? isAPlus
+          ? "#10b981"
+          : "#34d399"
+        : isAPlus
+          ? "#f43f5e"
+          : "#fb7185";
+      const winPct = s.win_rate != null ? ` ${Math.round(s.win_rate * 100)}%` : "";
+      const tierBadge = isAPlus ? "A+" : "S";
+      const marker = new TextAnnotation({
+        x1: tSec,
+        y1: s.entry,
+        yCoordinateMode: ECoordinateMode.DataValue,
+        text: `${isLong ? "▲" : "▼"} ${tierBadge}${winPct}`,
+        textColor: color,
+        fontSize: isAPlus ? 10 : 9,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontWeight: "bold",
+        horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
+        verticalAnchorPoint: isLong ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
+      });
+      this.surface.annotations.add(marker);
+      this.signalAnnotations.push(marker);
+    }
+
+    if (active && active.plan) {
+      const mkLevel = (price: number | undefined, color: string, label: string, dash: number[]) => {
+        if (price == null || !Number.isFinite(price)) return;
+        const line = new HorizontalLineAnnotation({
+          y1: price,
+          stroke: color,
+          strokeThickness: 1.25,
+          strokeDashArray: dash,
+          showLabel: true,
+          labelPlacement: ELabelPlacement.TopLeft,
+          axisLabelFill: color,
+          axisLabelStroke: "#000000",
+          labelValue: `${label} ${price.toFixed(2)}`,
+        });
+        this.surface.annotations.add(line);
+        this.signalAnnotations.push(line);
+      };
+      mkLevel(active.plan.entry, "#38bdf8", `${active.direction} ENTRY`, [2, 2]);
+      mkLevel(active.plan.stop, "#ef4444", "SL", [4, 4]);
+      mkLevel(active.plan.tp1, "#10b981", "TP1", [4, 4]);
+      mkLevel(active.plan.tp2, "#059669", "TP2", [6, 3]);
+    }
+  }
+
   /** Bubble Regime markers: OI + liquidation classified aggressive sweeps from
-   *  the BubbleRegimeEngine. Only the "interesting" regimes are drawn (standard
-   *  flow is suppressed to avoid chart clutter). Shares the `bubbles` layer
-   *  toggle with the absorption footprints. Mirrors updateSweeps' lifecycle:
-   *  signature-gated rebuild, full detach/reattach, bounded to the last few. */
+   *  the BubbleRegimeEngine. */
   private updateBubbleRegimes(frame: ChartFrame) {
     if (!this.surface) return;
 
     const all = frame.bubbles || [];
-    // Only non-standard regimes carry a chart-worthy signal.
     const notable = all.filter((b) => b.regime !== "standard_flow");
     const sig = notable
       .slice(-8)
@@ -1101,7 +1080,6 @@ export class TerminalChart {
     for (const b of notable.slice(-8)) {
       const meta = META[b.regime];
       if (!meta) continue;
-      // timestamp is epoch ms from the bridge; the x-axis is epoch seconds.
       const tSec = b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : Math.floor(b.timestamp);
       const price = typeof b.priceCenter === "string" ? parseFloat(b.priceCenter) : b.priceCenter;
       if (!Number.isFinite(price)) continue;
@@ -1116,8 +1094,6 @@ export class TerminalChart {
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
-        // Buy aggression prints below the level, sell aggression above, so the
-        // marker clears the candle body like the sweep markers do.
         verticalAnchorPoint: isBuy ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
       });
       this.surface.annotations.add(marker);
@@ -1140,16 +1116,13 @@ export class TerminalChart {
       });
       this.surface.annotations.add(this.markPriceAnnotation);
     } else {
-      // Mutate in place — never recreate the annotation per frame.
       this.markPriceAnnotation.y1 = midPrice;
       this.markPriceAnnotation.labelValue = `MARK ${midPrice.toFixed(2)}`;
     }
   }
 
   /**
-   * Click-to-inspect hit test. Given a click point in pixel coordinates relative
-   * to the chart canvas, return the nearest absorption bubble within a pixel
-   * tolerance, or null. Used by the cockpit to open the Absorption modal.
+   * Click-to-inspect hit test.
    */
   hitTestBubble(clientX: number, clientY: number, tolerancePx = 16): BubbleHit | null {
     if (!this.surface || this.bubbleHits.length === 0 || !this.layers.bubbles) return null;
@@ -1183,9 +1156,7 @@ export class TerminalChart {
     this.lastViewHi = NaN;
   }
 
-  /** Snap the view to the latest VISIBLE_CANDLES and fit price to visible highs/lows.
-   *  Skips the axis writes when the computed range is unchanged (avoids per-frame
-   *  full relayout while price ticks inside the same window). */
+  /** Snap the view to the latest VISIBLE_CANDLES and fit price to visible highs/lows. */
   applyLiveView() {
     const n = this.candleData.count();
     if (n === 0) return;
@@ -1194,17 +1165,12 @@ export class TerminalChart {
     const firstIdx = Math.max(0, n - VISIBLE_CANDLES);
     const firstX = xVals.get(firstIdx);
 
-    // Convert the desired RIGHT_OFFSET_PX whitespace into time (data) units so
-    // the active candle sits a constant ~200px clear of the right edge.
-    // Require at least 120px room for candles beyond the 200px offset so the
-    // denominator cannot collapse to zero / near-zero when side panels open.
     const candleSpan = Math.max(lastX - firstX, this.tfSeconds);
     let pad = this.tfSeconds * 4;
     const plotWidthPx = this.surface?.seriesViewRect?.width ?? 0;
     const minSafePlot = RIGHT_OFFSET_PX + 120;
     if (plotWidthPx > minSafePlot) {
       const computedPad = (candleSpan * RIGHT_OFFSET_PX) / (plotWidthPx - RIGHT_OFFSET_PX);
-      // Cap pad to at most 1.5x candleSpan so candles never compress to hairlines
       pad = Math.min(computedPad, candleSpan * 1.5);
     }
 
@@ -1225,7 +1191,7 @@ export class TerminalChart {
     const yOk = Number.isFinite(hi) && Number.isFinite(lo) && hi > lo;
     const yChanged = yOk && (lo !== this.lastViewLo || hi !== this.lastViewHi);
 
-    if (!xChanged && !yChanged) return; // nothing moved → no axis write, no relayout
+    if (!xChanged && !yChanged) return;
 
     this.suppressRangeEvents = true;
     if (xChanged) {
@@ -1261,6 +1227,8 @@ export class TerminalChart {
     this.keyLevelAnnotations = [];
     for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
     this.sweepAnnotations = [];
+    for (const a of this.signalAnnotations) this.surface?.annotations.remove(a);
+    this.signalAnnotations = [];
     for (const a of this.bubbleRegimeAnnotations) this.surface?.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
     for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
@@ -1269,8 +1237,6 @@ export class TerminalChart {
       this.surface?.annotations.remove(this.markPriceAnnotation);
       this.markPriceAnnotation = null;
     }
-    // Surface.delete() tears down renderable series, data series, point markers,
-    // modifiers, the WebGL context and the WASM-backed buffers in one pass.
     this.surface?.delete();
     this.bubbleHits = [];
     this.lastFrame = null;

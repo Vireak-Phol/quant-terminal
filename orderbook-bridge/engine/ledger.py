@@ -11,9 +11,12 @@ Outcome rule (conservative, documented in the UI):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -147,22 +150,46 @@ class Ledger:
 
     def __init__(self, path: str = DEFAULT_DB):
         self.path = path
+        self._mirror_path: Optional[str] = None
         if path != ":memory:":
             os.makedirs(os.path.dirname(path), exist_ok=True)
         self._lock = threading.RLock()
-        self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript(SCHEMA)
+        try:
+            self.db = sqlite3.connect(path, check_same_thread=False)
+            self.db.row_factory = sqlite3.Row
+            self.db.executescript(SCHEMA)
+            self.db.execute("PRAGMA user_version = 1")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            # Fallback for FUSE / virtual mounts without POSIX advisory locks:
+            h = hashlib.md5(os.path.abspath(path).encode()).hexdigest()[:12]
+            self._mirror_path = os.path.join(tempfile.gettempdir(), f"ledger_{h}.db")
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                shutil.copy2(path, self._mirror_path)
+            self.db = sqlite3.connect(self._mirror_path, check_same_thread=False)
+            self.db.row_factory = sqlite3.Row
+            self.db.executescript(SCHEMA)
+            self._sync_mirror()
         self.open: Dict[str, SignalRecord] = {}
         for row in self.db.execute("SELECT * FROM signals WHERE status='open' AND source='live'"):
             rec = self._from_row(row)
             self.open[rec.id] = rec
+
+    def _sync_mirror(self) -> None:
+        if self._mirror_path and self.path != ":memory:":
+            self.db.commit()
+            shutil.copy2(self._mirror_path, self.path)
 
     # ── writes ──────────────────────────────────────────────────────────────
     def add(self, rec: SignalRecord, track: bool = True) -> None:
         with self._lock:
             self._upsert(rec)
             self.db.commit()
+            self._sync_mirror()
             if track and rec.status == "open":
                 self.open[rec.id] = rec
 
@@ -173,6 +200,7 @@ class Ledger:
                 self._upsert(rec)
                 n += 1
             self.db.commit()
+            self._sync_mirror()
         return n
 
     def on_bar(self, tf: str, t: int, h: float, l: float, c: float) -> List[SignalRecord]:
@@ -189,6 +217,7 @@ class Ledger:
                     closed.append(rec)
                     del self.open[rid]
             self.db.commit()
+            self._sync_mirror()
         return closed
 
     def clear_source(self, source: str, tf: Optional[str] = None) -> None:
@@ -198,6 +227,7 @@ class Ledger:
             else:
                 self.db.execute("DELETE FROM signals WHERE source=?", (source,))
             self.db.commit()
+            self._sync_mirror()
 
     def _upsert(self, rec: SignalRecord) -> None:
         self.db.execute(

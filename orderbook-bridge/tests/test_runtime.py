@@ -1,10 +1,10 @@
-"""Runtime integration: TimeframeEngine over the TradingView fixture (Pine flow mode)."""
+"""Runtime integration: TimeframeEngine over the TradingView fixture (Pine & Institutional flow modes)."""
 
 import json
 
 import pytest
 
-from engine.calibration import Calibrator
+from engine.calibration import Calibrator, compute_stat
 from engine.data import Kline
 from engine.ledger import Ledger
 from engine.backtest import report, run_backtest
@@ -79,3 +79,24 @@ def test_no_lookahead_signals_identical_when_truncated(data):
     sa = [(s.id, s.score) for s in a.signals if s.time >= start]
     sb = [(s.id, s.score) for s in sb_all if s.time >= start]
     assert sa == sb and len(sa) > 50
+
+
+def test_institutional_backtest_profitable_and_high_probability(data, tmp_path_factory):
+    five, one, four = data
+    led = Ledger(str(tmp_path_factory.mktemp("inst") / "inst.db"))
+    res = run_backtest("5m", five, one, four, led, flow_mode="taker")
+    rep = report("5m", res["closed"])
+    aplus = rep["by_tier"]["A_PLUS"]
+    struct = rep["by_tier"]["STRUCTURAL"]
+    assert aplus["n"] >= 30
+    assert aplus["win_rate"] >= 0.72
+    assert aplus["expectancy_r"] >= 0.20
+    assert aplus["profit_factor"] >= 1.80
+    assert struct["expectancy_r"] > 0.05
+    # Verify walk-forward stability across both halves of closed A_PLUS trades
+    aplus_recs = [r for r in res["closed"] if r.tier == "A_PLUS"]
+    mid = len(aplus_recs) // 2
+    h1 = compute_stat(aplus_recs[:mid])
+    h2 = compute_stat(aplus_recs[mid:])
+    assert h1.expectancy_r > 0.10
+    assert h2.expectancy_r > 0.10

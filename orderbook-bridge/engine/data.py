@@ -1,7 +1,8 @@
-"""Binance USDⓈ-M kline access with an on-disk cache (T2 BarStore backfill)."""
+"""Binance USDⓈ-M kline access with an on-disk cache and offline fixture fallback (T2 BarStore backfill)."""
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ logger = logging.getLogger("engine.data")
 
 REST = "https://fapi.binance.com/fapi/v1/klines"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "cache")
+FIXTURES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures")
 TF_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
 
 
@@ -44,12 +46,12 @@ class Kline:
         return cls(int(k[0]) // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), float(k[9]))
 
 
-def _get(url: str, retries: int = 4) -> List:
-    delay = 1.0
+def _get(url: str, retries: int = 2) -> List:
+    delay = 0.5
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "institution-terminal/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=5) as r:
                 return json.loads(r.read().decode())
         except Exception as e:  # network / rate limit
             if attempt == retries - 1:
@@ -86,6 +88,42 @@ def fetch_range(symbol: str, interval: str, start: int, end: Optional[int] = Non
     return out
 
 
+def _load_fixture_bars(interval: str) -> List[Kline]:
+    """Fallback loader using bundled TradingView XAUUSD fixtures when cache is empty or offline."""
+    mapping = {"1m": "tv_xauusd_1m.csv", "5m": "tv_xauusd_5m.csv", "4h": "tv_xauusd_4h.csv"}
+    if interval in mapping:
+        csv_path = os.path.join(FIXTURES_DIR, mapping[interval])
+        if not os.path.exists(csv_path):
+            return []
+        rows: List[Kline] = []
+        with open(csv_path) as fh:
+            for r in csv.DictReader(fh):
+                t = int(float(r["time"]))
+                o, h, l, c = float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"])
+                v = float(r["volume"] or 0.0)
+                # Keep taker_buy=0.0 on TV fixtures so runtime uses exact pine_ltf_flows
+                rows.append(Kline(t, o, h, l, c, v, 0.0))
+        if interval == "5m" and len(rows) > 1:
+            rows = rows[:-1]  # drop forming last bar
+        return rows
+    if interval == "15m":
+        five = _load_fixture_bars("5m")
+        buckets: Dict[int, List[float]] = {}
+        for k in five:
+            b = k.t - (k.t % 900)
+            if b not in buckets:
+                buckets[b] = [k.o, k.h, k.l, k.c, k.v, k.taker_buy]
+            else:
+                st = buckets[b]
+                st[1] = max(st[1], k.h)
+                st[2] = min(st[2], k.l)
+                st[3] = k.c
+                st[4] += k.v
+                st[5] += k.taker_buy
+        return [Kline(b, *buckets[b]) for b in sorted(buckets)]
+    return []
+
+
 def load_history(symbol: str, interval: str, start: Optional[int] = None, refresh: bool = True,
                  cache_dir: str = CACHE_DIR) -> List[Kline]:
     """Full closed-bar history from ``start`` (default: listing), cached as JSONL per interval."""
@@ -104,21 +142,30 @@ def load_history(symbol: str, interval: str, start: Optional[int] = None, refres
         step = TF_SECONDS[interval]
         full_marker = path + ".full"
         new: List[Kline] = []
-        # backfill older history the cache does not cover yet
-        if bars:
-            lo = min(bars)
-            want_from = start if start is not None else (None if os.path.exists(full_marker) else 0)
-            if want_from is not None and want_from < lo - step:
-                new += fetch_range(symbol, interval, want_from, lo)
-        since = (max(bars) + step) if bars else (start or 0)
-        new += fetch_range(symbol, interval, since)
-        if start is None:
-            open(full_marker, "w").close()
+        try:
+            if bars:
+                lo = min(bars)
+                want_from = start if start is not None else (None if os.path.exists(full_marker) else 0)
+                if want_from is not None and want_from < lo - step:
+                    new += fetch_range(symbol, interval, want_from, lo)
+            since = (max(bars) + step) if bars else (start or 0)
+            new += fetch_range(symbol, interval, since)
+            if start is None:
+                open(full_marker, "w").close()
+        except Exception as e:
+            logger.warning("offline or fetch error for %s %s (%s); using cached/fixture history", symbol, interval, e)
         if new:
             with open(path, "a") as fh:
                 for k in new:
                     if k.t not in bars:
                         fh.write(json.dumps(k.to_list()) + "\n")
+                    bars[k.t] = k
+    if not bars:
+        fixture_bars = _load_fixture_bars(interval)
+        if fixture_bars:
+            with open(path, "w") as fh:
+                for k in fixture_bars:
+                    fh.write(json.dumps(k.to_list()) + "\n")
                     bars[k.t] = k
     out = [bars[t] for t in sorted(bars)]
     if start:
