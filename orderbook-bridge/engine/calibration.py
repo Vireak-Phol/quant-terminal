@@ -6,7 +6,9 @@ For a candidate signal we look up closed ledger records of the same kind and rep
   * expectancy in net R (after costs) and profit factor
   * warm-up flag until n >= ``min_samples`` (default 15)
 
-Bucket fallback, most specific first: setup x tier x score_bin -> setup x tier -> tier.
+Bucket fallback, most specific first: setup x tier -> tier. (The model score is a
+heuristic and was measured anti-correlated with outcome on the institutional engine,
+so it is deliberately NOT a calibration level — see Calibrator.keys.)
 Backtest and live records are calibrated separately; the displayed number prefers live
 once it has enough samples, otherwise backtest, otherwise warm-up.
 """
@@ -103,8 +105,17 @@ class Calibrator:
 
     @staticmethod
     def keys(tf: str, setup: str, tier: str, sbin: int) -> List[Tuple[str, Key]]:
+        # NOTE: ``score_bin`` is intentionally NOT a calibration level. The model score
+        # is a hand-anchored heuristic, and a reliability study on the institutional
+        # engine measured it as ANTI-correlated with the realised outcome
+        # (Spearman(score, net R) ~= -0.32; the top 95-100 bin won LESS than the 85-90
+        # bin). Stratifying the displayed probability by ``score_bin`` would therefore
+        # make the headline number *less* honest, not more. We calibrate at the
+        # setup x tier level (then tier) where the measured rate is meaningful, and
+        # expose the raw score-bin breakdown only in reliability() as a diagnostic so
+        # the non-monotonicity is visible rather than silently trusted.
+        # ``sbin`` is retained in the signature for the index key the DB still stores.
         return [
-            ("setup_tier_bin", (tf, setup, tier, str(sbin))),
             ("setup_tier", (tf, setup, tier)),
             ("tier", (tf, tier)),
         ]
