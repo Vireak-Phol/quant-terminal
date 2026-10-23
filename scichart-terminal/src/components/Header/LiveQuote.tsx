@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { useLiveField } from "../../hooks/useLiveField";
 import { price } from "../../lib/format";
+import { Stat, StatStrip } from "./Stat";
 
 /** Isolated, memoised live-quote strip. Subscribes only to mid/spread/imbalance
  *  so it re-renders on price changes without reconciling the whole header. */
@@ -14,39 +15,29 @@ export const LiveQuote = memo(function LiveQuote() {
     (a, b) =>
       a.mid === b.mid && a.spread === b.spread && a.imbalance === b.imbalance,
   );
-  if (!q.mid) return <div className="hidden lg:block" />;
+  if (!q.mid) return null;
+
+  const pct = Math.round(q.imbalance * 100);
+  const flowTone =
+    q.imbalance > 0.15
+      ? "text-terminal-bull"
+      : q.imbalance < -0.15
+        ? "text-terminal-bear"
+        : "text-terminal-text";
+
   return (
-    <div className="hidden lg:flex items-center gap-3 text-xs font-mono">
-      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-terminal-panel border border-terminal-border">
-        <span className="text-[10px] text-terminal-text-dim">MID</span>
-        <span className="font-bold tabular-nums text-sm text-terminal-text">
-          {price(q.mid)}
+    <StatStrip className="hidden lg:flex">
+      <Stat label="Mid" title="Mid price">
+        <span className="text-[13px] text-terminal-text">{price(q.mid)}</span>
+      </Stat>
+      <Stat label="Spr" title="Bid/ask spread (USD)">
+        <span className="text-terminal-text">{q.spread.toFixed(2)}</span>
+      </Stat>
+      <Stat label="Book" title="Top-of-book imbalance (bid vs ask resting size)" className="hidden min-[1600px]:flex">
+        <span className={flowTone}>
+          {pct > 0 ? `+${pct}%` : `${pct}%`}
         </span>
-      </div>
-      <div className="flex items-center gap-1 px-2 py-1 rounded bg-terminal-panel/80 border border-terminal-border/60 text-2xs">
-        <span className="text-terminal-text-dim">SPREAD:</span>
-        <span className="text-terminal-gold font-bold tabular-nums">
-          ${q.spread.toFixed(2)}
-        </span>
-      </div>
-      <div className="flex items-center gap-1 px-2 py-1 rounded bg-terminal-panel/80 border border-terminal-border/60 text-2xs">
-        <span className="text-terminal-text-dim">FLOW:</span>
-        <span
-          className={`font-bold uppercase ${
-            q.imbalance > 0.15
-              ? "text-terminal-bull"
-              : q.imbalance < -0.15
-                ? "text-terminal-bear"
-                : "text-terminal-gold"
-          }`}
-        >
-          {q.imbalance > 0
-            ? `+${(q.imbalance * 100).toFixed(0)}% BULL`
-            : q.imbalance < 0
-              ? `${(q.imbalance * 100).toFixed(0)}% BEAR`
-              : "BALANCED"}
-        </span>
-      </div>
-    </div>
+      </Stat>
+    </StatStrip>
   );
 });

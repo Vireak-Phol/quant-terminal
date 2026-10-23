@@ -97,6 +97,8 @@ export interface ChartFrame {
     timestamp: number;
     executedQuantity?: string | number;
     reason?: string;
+    /** Aggression traded into a resting liquidity wall (square marker). */
+    wall?: boolean;
   }>;
   v74?: V74Frame | null;
   // --- Audit R1/R3: candles + CVD + session + key levels + sweeps ---
@@ -169,29 +171,53 @@ const VISIBLE_CANDLES = 80; // how many candles the live view shows
 // timeframe or zoom.
 const RIGHT_OFFSET_PX = 200;
 
-// Absorption bubbles are fixed-size markers (reverted from volume/zoom scaling):
-// every bubble is drawn at a constant pixel radius, matching the original
-// EllipsePointMarker look. `priceRadius` is retained on the annotation for
-// possible future use but is NOT used for sizing.
-const BUBBLE_RADIUS_PX = 12; // on-screen radius (24px diameter, original size)
+// ── Absorption markers ──────────────────────────────────────────────────────
+// Always a numbered circle. Each visual channel carries one fact:
+//   COLOUR = aggressor side — blue: aggressive BUYERS, pink: aggressive SELLERS
+//            (DeepCharts convention; distinct from the green/red candles).
+//   SIZE   = strength tier:
+//            "circle"  (r 12) — absorption
+//            "square"  (r 15) — aggression traded into a resting liquidity wall
+//            "diamond" (r 18, bright + white ring) — "battle": absorbed AND open
+//                       interest rose (fresh passive positions defending the level)
+//            (tier names kept from the DeepCharts shape mapping they replace)
+//   NUMBER = volume: the candle detector's volume ratio (% of average) when known,
+//            otherwise the live absorbed size in oz.
+// One marker per candle per side; the tier only upgrades.
+export type AbsorbShape = "circle" | "square" | "diamond";
+const SHAPE_RANK: Record<AbsorbShape, number> = { circle: 0, square: 1, diamond: 2 };
+const MARKER_PX: Record<AbsorbShape, number> = { circle: 12, square: 15, diamond: 18 };
+const MARKER_FONT: Record<AbsorbShape, number> = { circle: 9, square: 10, diamond: 11 };
 
-/**
- * A round absorption bubble. Positioned at a (time, price) point and rendered at
- * a constant pixel radius so its on-screen size is stable regardless of volume
- * or zoom (matches the original fixed-size scatter marker).
- */
+// DeepCharts palette: BLUE = aggressive buyers, PINK = aggressive sellers. Kept
+// deliberately distinct from the green/red candles so markers never blend into bars.
+const ABSORB_COLORS = {
+  buy: { fill: "rgba(59, 130, 246, 0.55)", stroke: "rgba(96, 165, 250, 1)" },
+  sell: { fill: "rgba(236, 72, 153, 0.55)", stroke: "rgba(244, 114, 182, 1)" },
+  // Battle tier: brighter fill and a light ring so it pops at a glance.
+  buyBattle: { fill: "rgba(37, 99, 235, 0.9)", stroke: "rgba(239, 246, 255, 0.95)" },
+  sellBattle: { fill: "rgba(219, 39, 119, 0.9)", stroke: "rgba(253, 242, 248, 0.95)" },
+};
+
+/** Compact number for inside the circle: 87, 130, 1.2k. */
+function absorbLabel(v: number): string {
+  if (!Number.isFinite(v) || v <= 0) return "";
+  if (v >= 1000) return `${(v / 1000).toFixed(v >= 10_000 ? 0 : 1)}k`;
+  return v >= 10 ? `${Math.round(v)}` : v.toFixed(1);
+}
+
+/** A fixed-pixel-size numbered absorption circle centred on (time, price). */
 class VolumeBubbleAnnotation extends CustomAnnotation {
   priceRadius: number;
-  fillColor: string;
-  strokeColor: string;
+  side: "buy" | "sell";
+  shape: AbsorbShape;
   label: string;
 
   constructor(opts: {
     time: number;
     price: number;
-    priceRadius: number;
-    fill: string;
-    stroke: string;
+    side: "buy" | "sell";
+    shape: AbsorbShape;
     label: string;
   }) {
     super({
@@ -200,26 +226,29 @@ class VolumeBubbleAnnotation extends CustomAnnotation {
       xCoordinateMode: ECoordinateMode.DataValue,
       yCoordinateMode: ECoordinateMode.DataValue,
       horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
+      verticalAnchorPoint: EVerticalAnchorPoint.Center,
     });
-    this.priceRadius = opts.priceRadius;
-    this.fillColor = opts.fill;
-    this.strokeColor = opts.stroke;
+    this.priceRadius = 0;
+    this.side = opts.side;
+    this.shape = opts.shape;
     this.label = opts.label;
   }
 
   getSvgString(annotation: CustomAnnotation): string {
     const self = annotation as VolumeBubbleAnnotation;
-    const rPx = BUBBLE_RADIUS_PX;
-    const d = rPx * 2 + 4; // svg box with a little padding for the stroke
+    const r = MARKER_PX[self.shape];
+    const battle = self.shape === "diamond";
+    const sw = battle ? 2 : 1.5;
+    const d = r * 2 + 4;
     const c = d / 2;
+    const col = ABSORB_COLORS[battle ? (self.side === "buy" ? "buyBattle" : "sellBattle") : self.side];
     const text = self.label
-      ? `<text x="${c}" y="${c}" fill="#ffffff" font-family="monospace" font-size="9" ` +
-        `text-anchor="middle" dominant-baseline="central">${self.label}</text>`
+      ? `<text x="${c}" y="${c}" fill="#ffffff" font-family="monospace" font-weight="bold" ` +
+        `font-size="${MARKER_FONT[self.shape]}" text-anchor="middle" dominant-baseline="central">${self.label}</text>`
       : "";
     return (
       `<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">` +
-      `<circle cx="${c}" cy="${c}" r="${rPx}" fill="${self.fillColor}" ` +
-      `stroke="${self.strokeColor}" stroke-width="1.5" />` +
+      `<circle cx="${c}" cy="${c}" r="${r}" fill="${col.fill}" stroke="${col.stroke}" stroke-width="${sw}"/>` +
       text +
       `</svg>`
     );
@@ -451,7 +480,15 @@ export class TerminalChart {
   // Live ABS episodes merged per (side, candle) — see appendLiveFootprints.
   private liveAbsGroups = new Map<
     string,
-    { bubble: VolumeBubbleAnnotation; hit: BubbleHit; count: number; pxQty: number; qty: number }
+    {
+      bubble: VolumeBubbleAnnotation;
+      hit: BubbleHit;
+      pxQty: number;
+      qty: number;
+      fixed: boolean;
+      /** Candle-detector volume ratio (% of avg); preferred number when present. */
+      ratio: number | null;
+    }
   >();
   // Last applied live-view range, to skip redundant visibleRange writes.
   private lastViewFirstX = NaN;
@@ -481,13 +518,11 @@ export class TerminalChart {
 
     // --- X = time (DateTime), Y = price ---
     this.xAxis = new DateTimeNumericAxis(wasmContext, {
-      axisTitle: "Time",
       drawMajorGridLines: true,
       labelProvider: new SmartDateLabelProvider(),
       autoRange: EAutoRange.Never,
     });
     this.yAxis = new NumericAxis(wasmContext, {
-      axisTitle: "Price (USDT)",
       axisAlignment: EAxisAlignment.Right,
       growBy: new NumberRange(0.08, 0.08),
       autoRange: EAutoRange.Never,
@@ -805,37 +840,75 @@ export class TerminalChart {
 
     const points = detectHeavyAbsorptions(this.historicalCandles);
     for (const pt of points) {
-      this.addBubble(
-        pt.type === "buyers_absorbed" ? "buy" : "sell",
-        pt.volRatio,
-        pt.time,
-        pt.price,
-        `${pt.volRatio}`,
-      );
-      this.bubbleHits.push({ x: pt.time, y: pt.price, point: pt });
+      // buyers_absorbed = aggressive BUYERS were absorbed → aggressor side "buy".
+      const side: "buy" | "sell" = pt.type === "buyers_absorbed" ? "buy" : "sell";
+      this.upsertAbsorb(side, pt.time, pt.price, "circle", pt, 0, true, pt.volRatio);
     }
+    // Groups were rebuilt, so let regime "battle" upgrades re-apply on this frame.
+    this.bubblesSig = "";
   }
 
-  /** Create a fixed-size absorption bubble annotation (size no longer scales). */
+  /**
+   * One absorption marker per (candle, side). New evidence for the same candle/side
+   * upgrades the size tier (absorb → wall → battle) and updates the number instead
+   * of stacking a second marker. Live evidence moves the marker to the episode's
+   * volume-weighted price; markers from the bar-close detector stay at their wick.
+   */
+  private upsertAbsorb(
+    side: "buy" | "sell",
+    timeSec: number,
+    price: number,
+    shape: AbsorbShape,
+    point: HeavyAbsorptionPoint | null,
+    qty: number,
+    fixed: boolean,
+    volRatio?: number,
+  ) {
+    const bar = Math.floor(timeSec / this.tfSeconds) * this.tfSeconds;
+    const key = `${side}-${bar}`;
+    const g = this.liveAbsGroups.get(key);
+    if (g) {
+      if (qty > 0) {
+        g.qty += qty;
+        if (!g.fixed) {
+          g.pxQty += price * qty;
+          g.hit.y = g.pxQty / g.qty;
+          g.bubble.y1 = g.hit.y;
+        }
+      }
+      if (volRatio != null && g.ratio == null) g.ratio = volRatio;
+      if (point && !g.hit.point) g.hit.point = point;
+      const nextShape =
+        SHAPE_RANK[shape] > SHAPE_RANK[g.bubble.shape] ? shape : g.bubble.shape;
+      const nextLabel = absorbLabel(g.ratio ?? g.qty);
+      if (nextShape !== g.bubble.shape || nextLabel !== g.bubble.label) {
+        // Size and number are baked into the SVG, so swap the annotation to repaint.
+        const next = this.addBubble(side, bar, g.bubble.y1, nextShape, nextLabel);
+        this.surface.annotations.remove(g.bubble);
+        this.bubbleAnnotations = this.bubbleAnnotations.filter((b) => b !== g.bubble);
+        g.bubble = next;
+      }
+      return;
+    }
+    const hit: BubbleHit = { x: bar, y: price, point };
+    this.bubbleHits.push(hit);
+    const q = Math.max(qty, 0);
+    const ratio = volRatio ?? null;
+    const bubble = this.addBubble(side, bar, price, shape, absorbLabel(ratio ?? q));
+    this.liveAbsGroups.set(key, {
+      bubble, hit, pxQty: q > 0 ? price * q : 0, qty: q, fixed, ratio,
+    });
+  }
+
+  /** Create one fixed-size numbered absorption circle. */
   private addBubble(
     side: "buy" | "sell",
-    _volRatio: number,
     time: number,
     price: number,
+    shape: AbsorbShape,
     label: string,
   ) {
-    const fill =
-      side === "buy" ? "rgba(239, 68, 68, 0.40)" : "rgba(16, 185, 129, 0.40)";
-    const stroke =
-      side === "buy" ? "rgba(248, 113, 113, 0.95)" : "rgba(52, 211, 153, 0.95)";
-    const bubble = new VolumeBubbleAnnotation({
-      time,
-      price,
-      priceRadius: 0,
-      fill,
-      stroke,
-      label,
-    });
+    const bubble = new VolumeBubbleAnnotation({ time, price, side, shape, label });
     bubble.isHidden = !this.layers.bubbles;
     this.surface.annotations.add(bubble);
     this.bubbleAnnotations.push(bubble);
@@ -851,15 +924,13 @@ export class TerminalChart {
   }
 
   /**
-   * Incrementally append live order-flow absorption footprints, merged to ONE
-   * bubble per (candle, side).
+   * Incrementally append live order-flow absorption footprints.
    *
-   * The bridge re-evaluates its rolling absorption window on every trade and keys
-   * each hit by (2-second bucket, avg price in cents). One sustained absorption
-   * episode therefore emits many near-identical candidates a few cents apart, which
-   * used to stack as overlapping "ABS" bubbles on the same candle. They are the
-   * same event, so we merge them: the bubble sits at the volume-weighted price of
-   * the episode and the label shows how many re-detections confirmed it ("A×n").
+   * The bridge re-evaluates its rolling absorption window on every trade, so one
+   * sustained episode emits many near-identical candidates a few cents apart. They
+   * are the same event and merge into the single marker for that candle/side.
+   * `wall` (aggression traded into a resting liquidity wall) upgrades it to the
+   * larger "wall" circle.
    */
   private appendLiveFootprints(
     candidates: ChartFrame["absorption_candidates"],
@@ -874,25 +945,8 @@ export class TerminalChart {
       this.seenFootprintIds.add(id);
 
       const side: "buy" | "sell" = a.side === "buy" ? "buy" : "sell";
-      const bar = Math.floor(t / this.tfSeconds) * this.tfSeconds;
-      const key = `${side}-${bar}`;
       const qty = Math.max(Number(a.executedQuantity ?? 0) || 0, 1e-9);
-      const g = this.liveAbsGroups.get(key);
-      if (g) {
-        g.count += 1;
-        g.pxQty += px * qty;
-        g.qty += qty;
-        // Replace the existing bubble with the updated merged one.
-        this.surface.annotations.remove(g.bubble);
-        this.bubbleAnnotations = this.bubbleAnnotations.filter((b) => b !== g.bubble);
-        g.hit.y = g.pxQty / g.qty;
-        g.bubble = this.addBubble(side, 0, bar, g.hit.y, `A×${Math.min(g.count, 99)}`);
-      } else {
-        const hit: BubbleHit = { x: bar, y: px, point: null };
-        this.bubbleHits.push(hit);
-        const bubble = this.addBubble(side, 0, bar, px, "ABS");
-        this.liveAbsGroups.set(key, { bubble, hit, count: 1, pxQty: px * qty, qty });
-      }
+      this.upsertAbsorb(side, t, px, a.wall ? "square" : "circle", null, qty, false);
     }
     if (this.seenFootprintIds.size > 2000) {
       const recent = Array.from(this.seenFootprintIds).slice(-500);
@@ -1140,11 +1194,9 @@ export class TerminalChart {
 
     const vacFrame = this.pickV74Frame(frame);
     const structure = vacFrame?.structure;
-    // The engine only runs 5m/15m. On a 1m chart the pockets come from the 5m engine
-    // (sized by 5m ATR, ~3x a 1m ATR), so tag them to avoid comparing against a 1m
-    // TradingView chart.
+    // Note: the engine only runs 5m/15m, so on a 1m chart these pockets come from the
+    // 5m engine (sized by 5m ATR). No on-chart tag is shown, by user preference.
     const srcTf = (vacFrame as { tf?: string } | undefined)?.tf;
-    const tfTag = srcTf && srcTf !== this.cfg.timeframe ? ` [${srcTf}]` : "";
     const pockets = structure?.vacuum ?? [];
     const vacBand = structure?.vac_band ?? 0;
     const magnet =
@@ -1207,7 +1259,7 @@ export class TerminalChart {
         y1: (top + bot) / 2,
         yCoordinateMode: ECoordinateMode.DataValue,
         verticalAnchorPoint: EVerticalAnchorPoint.Center,
-        text: `VAC${v.strength} ${v.price.toFixed(2)}${tfTag}`,
+        text: `🌀 ${v.price.toFixed(2)}`,
         textColor: color,
         fontSize: 10,
         fontFamily: "'JetBrains Mono', monospace",
@@ -1218,7 +1270,6 @@ export class TerminalChart {
     }
 
     if (magnet != null) {
-      const dir = vacBand > 0 ? "↑" : "↓";
       const line = new HorizontalLineAnnotation({
         y1: magnet,
         stroke: "#00E5FF",
@@ -1228,7 +1279,7 @@ export class TerminalChart {
         labelPlacement: ELabelPlacement.TopRight,
         axisLabelFill: "#00E5FF",
         axisLabelStroke: "#000000",
-        labelValue: `MAGNET ${dir} ${magnet.toFixed(2)}${tfTag}`,
+        labelValue: `🧲 ${magnet.toFixed(2)}`,
       });
       this.surface.annotations.add(line);
       this.vacuumAnnotations.push(line);
@@ -1339,9 +1390,9 @@ export class TerminalChart {
         x1: tSec,
         y1: s.price,
         yCoordinateMode: ECoordinateMode.DataValue,
-        text: s.dir > 0 ? "▲ SWEEP" : "▼ SWEEP",
+        text: "🎯",
         textColor: color,
-        fontSize: 9,
+        fontSize: 13,
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
@@ -1463,19 +1514,26 @@ export class TerminalChart {
     this.bubbleRegimeAnnotations = [];
     if (!this.layers.bubbles || notable.length === 0) return;
 
+    // Single-glyph markers, no text. Regime absorption is NOT drawn here: it is the
+    // largest "battle" circle tier of the per-candle absorption marker (upsertAbsorb).
     const META: Record<string, { glyph: string; color: string }> = {
-      institutional_absorption_open: { glyph: "🧱 ABSORB", color: "#22d3ee" },
-      liquidation_exhaustion_flush: { glyph: "💥 LIQ", color: "#f43f5e" },
-      vacuum_sweep_breakout: { glyph: "🚀 SWEEP", color: "#f59e0b" },
+      liquidation_exhaustion_flush: { glyph: "💥", color: "#f43f5e" },
+      vacuum_sweep_breakout: { glyph: "⚡", color: "#f59e0b" },
     };
 
     for (const b of notable.slice(-8)) {
+      const tSec0 =
+        b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : Math.floor(b.timestamp);
+      if (b.regime === "institutional_absorption_open") {
+        const p0 = typeof b.priceCenter === "string" ? parseFloat(b.priceCenter) : b.priceCenter;
+        if (Number.isFinite(p0)) {
+          this.upsertAbsorb(b.aggressorSide === "buy" ? "buy" : "sell", tSec0, p0, "diamond", null, 0, true);
+        }
+        continue;
+      }
       const meta = META[b.regime];
       if (!meta) continue;
-      const tSec =
-        b.timestamp > 1e11
-          ? Math.floor(b.timestamp / 1000)
-          : Math.floor(b.timestamp);
+      const tSec = tSec0;
       const price =
         typeof b.priceCenter === "string"
           ? parseFloat(b.priceCenter)
@@ -1486,9 +1544,9 @@ export class TerminalChart {
         x1: tSec,
         y1: price,
         yCoordinateMode: ECoordinateMode.DataValue,
-        text: `${isBuy ? "▲" : "▼"} ${meta.glyph}`,
+        text: meta.glyph,
         textColor: meta.color,
-        fontSize: 9,
+        fontSize: 13,
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,

@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef } from "react";
+import { Icon } from "./Icon";
 
 export interface HeatmapFadeMenuProps {
   heatmapEnabled: boolean;
@@ -41,55 +42,55 @@ export const HeatmapFadeMenu = memo(function HeatmapFadeMenu({
   }, [showMenu, onCloseMenu]);
 
   return (
-    <div
-      className="relative flex items-center ml-1 pl-1 border-l border-terminal-border/60"
-      ref={menuRef}
-    >
-      <button
-        onClick={onToggleFade}
-        aria-pressed={heatmapFade}
-        disabled={!heatmapEnabled}
-        className={`px-2 py-0.5 rounded-l font-bold transition-all flex items-center gap-1 ${
-          !heatmapEnabled
-            ? "opacity-35 cursor-not-allowed text-terminal-text-dim"
-            : heatmapFade
-              ? "bg-indigo-500/25 text-indigo-300 border border-indigo-500/50 shadow-glow"
-              : "text-terminal-text-dim hover:text-terminal-text"
-        }`}
-        title={
-          heatmapEnabled
-            ? `Toggle BookMap Historical Heatmap Fade (${heatmapFade ? "Active" : "Off"})`
-            : "Enable HEATMAP layer first to activate BookMap Fade"
-        }
+    <div className="relative flex items-center" ref={menuRef}>
+      <div
+        className={`flex items-center h-7 rounded-md transition-colors ${
+          heatmapFade && heatmapEnabled
+            ? "ring-1 ring-inset bg-terminal-info/15 text-terminal-info ring-terminal-info/40"
+            : "text-terminal-text-dim"
+        } ${!heatmapEnabled ? "opacity-35" : ""}`}
       >
-        <span>🌫️</span>
-        <span>FADE</span>
-        {heatmapFade && heatmapEnabled && (
-          <span className="text-3xs opacity-80 tabular-nums">
-            {Math.round(fadeStrength * 100)}%
-          </span>
-        )}
-      </button>
-      <button
-        onClick={onToggleMenu}
-        disabled={!heatmapEnabled}
-        className={`px-1 py-0.5 rounded-r border-l border-terminal-border/40 text-terminal-text-dim hover:text-terminal-text hover:bg-white/5 transition-all text-2xs ${
-          !heatmapEnabled
-            ? "opacity-35 cursor-not-allowed"
-            : showMenu
-              ? "bg-white/10 text-terminal-gold"
-              : ""
-        }`}
-        title="Configure BookMap Heatmap Fade Decay & Palette"
-      >
-        ▾
-      </button>
+        <button
+          type="button"
+          onClick={onToggleFade}
+          aria-pressed={heatmapFade}
+          disabled={!heatmapEnabled}
+          className="inline-flex items-center gap-1.5 h-7 pl-2 pr-1.5 rounded-l-md text-2xs font-semibold tracking-wide whitespace-nowrap hover:text-terminal-text disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-terminal-accent/70"
+          title={
+            heatmapEnabled
+              ? `Heatmap time-decay fade — ${heatmapFade ? `on (${Math.round(fadeStrength * 100)}%)` : "off"}`
+              : "Enable the Heatmap layer first"
+          }
+        >
+          <Icon name="fade" />
+          <span className="hidden min-[2000px]:inline">Fade</span>
+          {heatmapFade && heatmapEnabled && (
+            <span className="hidden min-[2000px]:inline tabular-nums opacity-80">
+              {Math.round(fadeStrength * 100)}%
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={onToggleMenu}
+          disabled={!heatmapEnabled}
+          aria-expanded={showMenu}
+          aria-haspopup="dialog"
+          className={`inline-flex items-center h-7 px-1 rounded-r-md border-l border-terminal-border/60 hover:text-terminal-text hover:bg-terminal-text/5 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-terminal-accent/70 ${
+            showMenu ? "text-terminal-gold" : ""
+          }`}
+          title="Heatmap fade settings"
+          aria-label="Heatmap fade settings"
+        >
+          <Icon name="chevron" className="w-3 h-3" />
+        </button>
+      </div>
 
       {showMenu && heatmapEnabled && (
-        <div className="absolute top-full mt-2 right-0 z-50 w-64 p-3 rounded-lg bg-terminal-surface/98 border border-terminal-border shadow-2xl backdrop-blur-md text-2xs font-mono space-y-2.5">
+        <div className="absolute top-full mt-2 right-0 z-50 w-72 p-3 rounded-lg bg-terminal-surface/98 border border-terminal-border shadow-2xl backdrop-blur-md text-2xs font-mono space-y-2.5">
           <div className="flex items-center justify-between border-b border-terminal-border/60 pb-1.5">
             <span className="font-bold text-terminal-gold flex items-center gap-1.5">
-              <span>🔥</span> BOOKMAP HEATMAP FADE
+              <Icon name="heatmap" /> HEATMAP FADE
             </span>
             <button
               onClick={onCloseMenu}
@@ -129,14 +130,14 @@ export const HeatmapFadeMenu = memo(function HeatmapFadeMenu({
               onChange={(e) => onChangeStrength(parseFloat(e.target.value))}
               className="w-full h-1.5 bg-terminal-panel rounded-lg appearance-none cursor-pointer accent-indigo-500"
             />
-            <div className="flex justify-between text-3xs text-terminal-text-dim">
+            <div className="flex justify-between text-2xs text-terminal-text-dim">
               <span>Subtle (10%)</span>
               <span>Balanced (70%)</span>
               <span>Steep (95%)</span>
             </div>
           </div>
 
-          <div className="p-1.5 rounded bg-terminal-panel/80 border border-terminal-border/60 text-3xs text-terminal-text-dim space-y-1">
+          <div className="p-1.5 rounded bg-terminal-panel/80 border border-terminal-border/60 text-2xs text-terminal-text-dim space-y-1">
             <div className="flex items-center justify-between text-terminal-text">
               <span>Palette</span>
               <span className="text-terminal-gold font-bold">

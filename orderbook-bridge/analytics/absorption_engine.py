@@ -37,6 +37,9 @@ class AbsorptionCandidate:
     status: str  # "candidate" | "confirmed"
     timestamp: int
     reason: str
+    # True when the absorbed aggression traded into a detected resting liquidity
+    # wall on the passive side (ask wall for buy absorption, bid wall for sell).
+    wall: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -53,6 +56,7 @@ class AbsorptionCandidate:
             "status": self.status,
             "timestamp": self.timestamp,
             "reason": self.reason,
+            "wall": self.wall,
         }
 
 
@@ -284,6 +288,7 @@ class AbsorptionEngine:
                     status="confirmed" if confidence >= 0.75 else "candidate",
                     timestamp=current_time_ms,
                     reason=f"{buy_vol:.1f} oz aggressive buy volume absorbed at ask with {price_delta:+.2f} USD response",
+                    wall=near_ask_zone,
                 )
 
         # 2. Sell Absorption: Aggressive sellers executing heavily, but price does NOT decline
@@ -320,6 +325,7 @@ class AbsorptionEngine:
                     status="confirmed" if confidence >= 0.75 else "candidate",
                     timestamp=current_time_ms,
                     reason=f"{sell_vol:.1f} oz aggressive sell volume absorbed at bid with {price_delta:+.2f} USD response",
+                    wall=near_bid_zone,
                 )
 
         return None

@@ -1,4 +1,6 @@
 import type { Timeframe, ChartLayer } from "../../chart/TerminalChart";
+import type { IconName } from "./Icon";
+import type { Tone } from "./ToolbarButton";
 
 export const CHART_DIV_ID = "scichart-root";
 
@@ -12,39 +14,15 @@ export const HISTORY_LIMIT = 1000;
 export interface LayerMeta {
   key: ChartLayer;
   label: string;
-  glyph: string;
-  on: string;
+  icon: IconName;
+  tone: Tone;
+  description: string;
 }
 
 export const LAYER_META: LayerMeta[] = [
-  {
-    key: "heatmap",
-    label: "HEATMAP",
-    glyph: "🔥",
-    on: "bg-rose-500/20 text-rose-300 border border-rose-500/40 shadow-glow",
-  },
-  {
-    key: "bubbles",
-    label: "ABSORPTION",
-    glyph: "🫧",
-    on: "bg-terminal-bull/20 text-terminal-bull border border-terminal-bull/40 shadow-glow",
-  },
-  {
-    key: "vacuum",
-    label: "VACUUM",
-    glyph: "🧲",
-    on: "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-glow",
-  },
-  {
-    key: "hopla",
-    label: "HOPLA",
-    glyph: "📐",
-    on: "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow",
-  },
-  {
-    key: "delta",
-    label: "DELTA",
-    glyph: "Δ",
-    on: "bg-violet-500/20 text-violet-300 border border-violet-500/40 shadow-glow",
-  },
+  { key: "heatmap", label: "Heatmap", icon: "heatmap", tone: "bear", description: "Resting-liquidity heatmap" },
+  { key: "bubbles", label: "Absorb", icon: "absorb", tone: "bull", description: "Absorption bubbles & regime markers" },
+  { key: "vacuum", label: "Vacuum", icon: "vacuum", tone: "info", description: "Liquidity vacuum pockets & magnet" },
+  { key: "hopla", label: "Hopla", icon: "hopla", tone: "gold", description: "Hopla 3 / 50 / 97 range" },
+  { key: "delta", label: "Delta", icon: "delta", tone: "accent", description: "Volume-delta candle colouring" },
 ];

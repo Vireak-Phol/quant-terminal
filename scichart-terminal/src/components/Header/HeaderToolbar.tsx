@@ -5,6 +5,7 @@ import { TIMEFRAMES, LAYER_META } from "./constants";
 import { LiveQuote } from "./LiveQuote";
 import { OrderFlowBadge } from "./OrderFlowBadge";
 import { HeatmapFadeMenu } from "./HeatmapFadeMenu";
+import { ToolbarButton, ToolbarDivider, ToolbarGroup } from "./ToolbarButton";
 
 export interface HeaderToolbarProps {
   timeframe: Timeframe;
@@ -40,10 +41,22 @@ export interface HeaderToolbarProps {
   onCycleTheme: () => void;
 }
 
-/** Top cockpit header. Pure/controlled: every bit of state lives in App and is
- *  passed down, so the toolbar re-renders only when a toggle actually changes —
- *  the high-frequency price/CVD feeds are isolated inside <LiveQuote/> and
- *  <OrderFlowBadge/>, which self-subscribe and never reconcile the whole bar. */
+const CONNECTION: Record<ConnectionState, { dot: string; text: string; label: string }> = {
+  connected: { dot: "bg-terminal-bull", text: "text-terminal-bull", label: "Live" },
+  connecting: { dot: "bg-terminal-warn animate-pulse", text: "text-terminal-warn", label: "Connecting" },
+  disconnected: { dot: "bg-terminal-bear", text: "text-terminal-bear", label: "Offline" },
+};
+
+/** Top cockpit header.
+ *
+ *  Layout is a 3-column grid (identity | market data | controls). The centre column
+ *  is `minmax(0,1fr)` + overflow-hidden, so when the window narrows the market-data
+ *  strip shrinks/hides instead of pushing buttons onto a second line. Every button
+ *  is `whitespace-nowrap` with a fixed h-7, and toggle labels collapse to icon-only
+ *  below the 2xl breakpoint (the tooltip keeps the name).
+ *
+ *  Pure/controlled: all state lives in App. The high-frequency price/CVD feeds are
+ *  isolated inside <LiveQuote/> and <OrderFlowBadge/>, which self-subscribe. */
 export const HeaderToolbar = memo(function HeaderToolbar({
   timeframe,
   isLoadingKlines,
@@ -72,77 +85,72 @@ export const HeaderToolbar = memo(function HeaderToolbar({
   theme,
   onCycleTheme,
 }: HeaderToolbarProps) {
+  const conn = CONNECTION[connectionState] ?? CONNECTION.disconnected;
+
   return (
-    <header className="h-12 flex items-center justify-between px-3 border-b border-terminal-border bg-terminal-surface/95 backdrop-blur-md shrink-0 font-mono text-xs z-30">
-      {/* Left: identity + timeframe pills + loading */}
-      <div className="flex items-center gap-2 sm:gap-2.5">
-        <div className="flex items-center gap-2 px-2.5 py-1 rounded bg-terminal-panel border border-terminal-border shadow-xs">
-          <div className="w-2 h-2 rounded-full bg-terminal-gold shadow-glow animate-pulse" />
-          <span className="font-extrabold tracking-wider text-sm text-terminal-text">
-            XAUUSDT
-          </span>
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-terminal-surface border border-terminal-border text-terminal-gold font-bold">
-            GPU · USDⓈ-M
+    <header className="h-12 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-3 border-b border-terminal-border bg-terminal-surface/95 backdrop-blur-md shrink-0 font-mono text-xs z-30">
+      {/* ── Left: instrument + timeframe ─────────────────────────────── */}
+      <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2 h-8 pl-2.5 pr-2 rounded-lg bg-terminal-panel border border-terminal-border">
+          <span className="w-1.5 h-1.5 rounded-full bg-terminal-gold" aria-hidden="true" />
+          <span className="font-bold tracking-wider text-[13px] text-terminal-text">XAUUSDT</span>
+          <span className="hidden sm:inline text-2xs px-1.5 rounded bg-terminal-surface border border-terminal-border text-terminal-text-dim font-semibold">
+            PERP
           </span>
         </div>
 
-        <div className="h-4 w-px bg-terminal-border/80 mx-0.5" />
-
-        <div className="flex items-center bg-terminal-panel rounded border border-terminal-border p-0.5">
+        <ToolbarGroup label="Timeframe">
           {TIMEFRAMES.map((tf) => (
-            <button
+            <ToolbarButton
               key={tf}
+              label={tf}
+              active={tf === timeframe}
+              tone="gold"
+              title={`${tf} candles`}
               onClick={() => onChangeTimeframe(tf)}
-              className={`px-2 py-0.5 rounded font-bold transition-all text-2xs ${
-                tf === timeframe
-                  ? "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow"
-                  : "text-terminal-text-dim hover:text-terminal-text hover:bg-terminal-surface"
-              }`}
-            >
-              {tf}
-            </button>
+              className="min-w-[2.25rem]"
+            />
           ))}
-          <button
+          <ToolbarDivider className="mx-0.5 !h-4" />
+          <ToolbarButton
+            icon="live"
+            label="Live"
+            collapseLabel
+            title="Snap back to the live edge"
             onClick={onResetView}
-            title="Snap back to live edge"
-            className="px-2 py-0.5 rounded font-bold text-2xs text-terminal-text-dim hover:text-terminal-text hover:bg-terminal-surface"
-          >
-            ⟳ LIVE
-          </button>
-        </div>
+          />
+        </ToolbarGroup>
 
         {isLoadingKlines && (
-          <span className="text-2xs text-terminal-info flex items-center gap-1">
-            <span className="animate-pulse">●</span> loading
+          <span className="flex items-center gap-1.5 text-2xs text-terminal-info whitespace-nowrap" role="status">
+            <span className="w-1.5 h-1.5 rounded-full bg-terminal-info animate-pulse" />
+            Loading
           </span>
         )}
       </div>
 
-      {/* Center: live quote (isolated subscriber, re-renders only on price change) */}
-      <LiveQuote />
+      {/* ── Centre: market data (shrinks / hides first on narrow screens) ── */}
+      <div className="flex items-center justify-center gap-2 min-w-0 overflow-hidden">
+        <LiveQuote />
+        <OrderFlowBadge />
+      </div>
 
-      {/* Center-right: CVD + delta readout and v7.4 pipeline diagnostic badge */}
-      <OrderFlowBadge />
-
-      {/* Right: layer + panel toggles, sound, status, theme */}
-      <div className="flex items-center gap-1.5 sm:gap-2">
-        <div className="hidden md:flex items-center bg-terminal-panel rounded border border-terminal-border p-0.5 text-2xs">
+      {/* ── Right: chart layers · panels · system ─────────────────────── */}
+      <div className="flex items-center gap-2 shrink-0">
+        <ToolbarGroup label="Chart layers">
           {LAYER_META.map((l) => (
-            <button
+            <ToolbarButton
               key={l.key}
+              icon={l.icon}
+              label={l.label}
+              collapseLabel
+              active={layers[l.key]}
+              tone={l.tone}
+              title={`${l.description} — ${layers[l.key] ? "on" : "off"}`}
               onClick={() => onToggleLayer(l.key)}
-              aria-pressed={layers[l.key]}
-              className={`px-2 py-0.5 rounded font-bold transition-all ${
-                layers[l.key]
-                  ? l.on
-                  : "text-terminal-text-dim hover:text-terminal-text"
-              }`}
-              title={`Toggle ${l.label} layer`}
-            >
-              {l.glyph} {l.label}
-            </button>
+            />
           ))}
-
+          <ToolbarDivider className="mx-0.5 !h-4" />
           <HeatmapFadeMenu
             heatmapEnabled={layers.heatmap}
             heatmapFade={heatmapFade}
@@ -153,97 +161,71 @@ export const HeaderToolbar = memo(function HeaderToolbar({
             onToggleFade={onToggleHeatmapFade}
             onChangeStrength={onChangeFadeStrength}
           />
-        </div>
+        </ToolbarGroup>
 
-        <div className="h-4 w-px bg-terminal-border/80 mx-0.5 hidden md:block" />
-
-        <div className="flex items-center bg-terminal-panel rounded border border-terminal-border p-0.5 text-2xs">
-          <button
+        <ToolbarGroup label="Panels">
+          <ToolbarButton
+            icon="signals"
+            label="Signals"
+            collapseLabel
+            active={showSignals}
+            tone="gold"
+            title="v7.4 institutional signals panel"
             onClick={onToggleSignals}
-            aria-pressed={showSignals}
-            className={`px-2 py-0.5 rounded font-bold transition-all ${
-              showSignals
-                ? "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow"
-                : "text-terminal-text-dim hover:text-terminal-text"
-            }`}
-            title="Toggle v7.4 Institutional Signals Panel"
-          >
-            ★ SIGNALS
-          </button>
-          <button
-            onClick={onToggleDomLadder}
-            aria-pressed={showDomLadder}
-            className={`px-2 py-0.5 rounded font-bold transition-all ${
-              showDomLadder
-                ? "bg-cyan-500/20 text-cyan-400 border border-cyan-500/50 shadow-glow"
-                : "text-terminal-text-dim hover:text-terminal-text"
-            }`}
-            title="Toggle L2 Order Book DOM Ladder (Alt+D)"
-          >
-            📊 DOM
-          </button>
-          <button
-            onClick={onToggleDiagnostics}
-            aria-pressed={showDiagnostics}
-            className={`px-2 py-0.5 rounded font-bold transition-all ${
-              showDiagnostics
-                ? "bg-purple-500/25 text-purple-300 border border-purple-500/50 shadow-glow"
-                : "text-terminal-text-dim hover:text-terminal-text"
-            }`}
-            title="Toggle Diagnostics & Telemetry Panel"
-          >
-            🩺 DIAGS
-          </button>
-          <button
-            onClick={onToggleOrderFlow}
-            aria-pressed={showOrderFlow}
-            className={`px-2 py-0.5 rounded font-bold transition-all ${
-              showOrderFlow
-                ? "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow"
-                : "text-terminal-text-dim hover:text-terminal-text"
-            }`}
-            title="Toggle Order Flow · Bubble Regime Panel (OI + liquidation classified sweeps)"
-          >
-            🫧 FLOW
-          </button>
-          <button
-            onClick={onToggleSound}
-            aria-pressed={soundOn}
-            className={`px-2 py-0.5 rounded font-bold transition-all ${
-              soundOn
-                ? "text-terminal-gold"
-                : "text-terminal-text-dim hover:text-terminal-text"
-            }`}
-            title={soundOn ? "Mute A+ alert sound" : "Unmute A+ alert sound"}
-            aria-label={soundOn ? "Mute alert sound" : "Unmute alert sound"}
-          >
-            {soundOn ? "🔔" : "🔕"}
-          </button>
-        </div>
-
-        <div className="h-4 w-px bg-terminal-border/80 mx-0.5" />
-
-        <div className="flex items-center gap-1.5 px-2 py-1 rounded text-2xs font-semibold bg-terminal-panel border border-terminal-border">
-          <span
-            className={`w-2 h-2 rounded-full ${
-              connectionState === "connected"
-                ? "bg-terminal-bull animate-pulse"
-                : connectionState === "connecting"
-                  ? "bg-terminal-gold animate-bounce"
-                  : "bg-terminal-bear"
-            }`}
           />
-        </div>
+          <ToolbarButton
+            icon="dom"
+            label="DOM"
+            collapseLabel
+            active={showDomLadder}
+            tone="info"
+            title="L2 order book ladder (Alt+D)"
+            onClick={onToggleDomLadder}
+          />
+          <ToolbarButton
+            icon="flow"
+            label="Flow"
+            collapseLabel
+            active={showOrderFlow}
+            tone="bull"
+            title="Order flow · bubble regime panel (OI + liquidation sweeps)"
+            onClick={onToggleOrderFlow}
+          />
+          <ToolbarButton
+            icon="diags"
+            label="Diags"
+            collapseLabel
+            active={showDiagnostics}
+            tone="accent"
+            title="Diagnostics & telemetry panel"
+            onClick={onToggleDiagnostics}
+          />
+        </ToolbarGroup>
 
-        <button
-          onClick={onCycleTheme}
-          className="px-2 py-1 text-2xs font-medium text-terminal-text-dim hover:text-terminal-text bg-terminal-panel hover:bg-terminal-surface border border-terminal-border rounded transition-all"
-          title={`Current theme: ${theme}`}
-        >
-          <span className="text-terminal-accent uppercase font-bold">
-            {theme}
-          </span>
-        </button>
+        <ToolbarGroup label="System">
+          <ToolbarButton
+            icon={soundOn ? "bell" : "bellOff"}
+            active={soundOn}
+            tone="gold"
+            title={soundOn ? "Mute A+ alert sound" : "Unmute A+ alert sound"}
+            onClick={onToggleSound}
+          />
+          <ToolbarButton
+            icon="theme"
+            title={`Theme: ${theme} (click to cycle)`}
+            onClick={onCycleTheme}
+          >
+            <span className="hidden xl:inline uppercase">{theme}</span>
+          </ToolbarButton>
+          <div
+            className={`flex items-center gap-1.5 h-7 px-2 text-2xs font-semibold whitespace-nowrap ${conn.text}`}
+            role="status"
+            title={`Bridge connection: ${conn.label}`}
+          >
+            <span className={`w-2 h-2 rounded-full ${conn.dot}`} aria-hidden="true" />
+            <span className="hidden lg:inline uppercase tracking-wide">{conn.label}</span>
+          </div>
+        </ToolbarGroup>
       </div>
     </header>
   );

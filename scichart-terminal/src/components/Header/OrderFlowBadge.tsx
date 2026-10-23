@@ -1,5 +1,6 @@
 import { memo } from "react";
 import { useLiveField } from "../../hooks/useLiveField";
+import { Stat, StatStrip } from "./Stat";
 
 /** Isolated CVD + delta readout and a v7.4 pipeline diagnostic badge. Subscribes
  *  only to the low-frequency order-flow fields (cvd, forming-candle delta, v74
@@ -44,7 +45,7 @@ export const OrderFlowBadge = memo(function OrderFlowBadge() {
         ? "text-terminal-bull"
         : s.cvd < 0
           ? "text-terminal-bear"
-          : "text-terminal-gold";
+          : "text-terminal-text";
   const toneDelta =
     s.delta == null
       ? "text-terminal-text-dim"
@@ -52,42 +53,32 @@ export const OrderFlowBadge = memo(function OrderFlowBadge() {
         ? "text-terminal-bull"
         : s.delta < 0
           ? "text-terminal-bear"
-          : "text-terminal-gold";
+          : "text-terminal-text";
 
   return (
-    <div className="hidden xl:flex items-center gap-2 text-2xs font-mono">
-      <div
-        className="flex items-center gap-1 px-2 py-1 rounded bg-terminal-panel/80 border border-terminal-border/60"
-        title="Session-anchored Cumulative Volume Delta (buy − sell, oz, resets 00:00 UTC)"
+    <StatStrip className="hidden min-[1440px]:flex">
+      <Stat label="CVD" title="Session-anchored cumulative volume delta (buy − sell, oz; resets 00:00 UTC)">
+        <span className={toneCvd}>{s.cvd == null ? "—" : fmt(s.cvd)}</span>
+      </Stat>
+      <Stat label="Δ" title="Forming 1-minute trade-candle delta (buy − sell, oz)">
+        <span className={toneDelta}>{s.delta == null ? "—" : fmt(s.delta)}</span>
+      </Stat>
+      <Stat
+        label="v7.4"
+        title="Engine pipeline: warm state · key levels in frame · recent liquidity sweeps"
+        className="hidden min-[1700px]:flex"
       >
-        <span className="text-terminal-text-dim">CVD:</span>
-        <span className={`font-bold tabular-nums ${toneCvd}`}>
-          {s.cvd == null ? "—" : fmt(s.cvd)}
+        <span className="inline-flex items-center gap-1.5">
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${s.v74Warm ? "bg-terminal-bull" : "bg-terminal-muted"}`}
+            aria-label={s.v74Warm ? "warm" : "warming up"}
+          />
+          <span className="text-terminal-text-dim font-normal">KL</span>
+          <span className="text-terminal-text">{s.klCount}</span>
+          <span className="text-terminal-text-dim font-normal">SW</span>
+          <span className="text-terminal-text">{s.sweeps}</span>
         </span>
-      </div>
-      <div
-        className="flex items-center gap-1 px-2 py-1 rounded bg-terminal-panel/80 border border-terminal-border/60"
-        title="Forming trade-candle delta (buy − sell volume, oz)"
-      >
-        <span className="text-terminal-text-dim">Δ:</span>
-        <span className={`font-bold tabular-nums ${toneDelta}`}>
-          {s.delta == null ? "—" : fmt(s.delta)}
-        </span>
-      </div>
-      <div
-        className={`flex items-center gap-1.5 px-2 py-1 rounded border text-2xs ${
-          s.v74Warm
-            ? "bg-terminal-bull/10 border-terminal-bull/40 text-terminal-bull"
-            : "bg-terminal-panel/80 border-terminal-border/60 text-terminal-text-dim"
-        }`}
-        title="v7.4 engine pipeline: warm state · key levels in frame · recent liq sweeps"
-      >
-        <span className="font-bold">{s.v74Warm ? "v74●" : "v74○"}</span>
-        <span className="text-terminal-text-dim">KL</span>
-        <span className="font-bold tabular-nums">{s.klCount}</span>
-        <span className="text-terminal-text-dim">SW</span>
-        <span className="font-bold tabular-nums">{s.sweeps}</span>
-      </div>
-    </div>
+      </Stat>
+    </StatStrip>
   );
 });

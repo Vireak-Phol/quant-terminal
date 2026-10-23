@@ -39,6 +39,8 @@ export interface AbsorptionCandidate {
   status: "candidate" | "confirmed";
   timestamp: number;
   reason: string;
+  /** Aggression traded into a resting liquidity wall on the passive side. */
+  wall?: boolean;
 }
 
 export interface VacuumZone {

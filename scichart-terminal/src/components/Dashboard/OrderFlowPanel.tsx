@@ -14,7 +14,7 @@ const REGIME_META: Record<
 > = {
   institutional_absorption_open: {
     label: 'ABSORPTION OPEN',
-    glyph: '🧱',
+    glyph: '◉',
     dot: 'bg-cyan-400',
     text: 'text-cyan-300',
     border: 'border-cyan-500/40',
@@ -28,7 +28,7 @@ const REGIME_META: Record<
   },
   vacuum_sweep_breakout: {
     label: 'VACUUM SWEEP',
-    glyph: '🚀',
+    glyph: '⚡',
     dot: 'bg-terminal-gold',
     text: 'text-terminal-gold',
     border: 'border-terminal-gold/40',
