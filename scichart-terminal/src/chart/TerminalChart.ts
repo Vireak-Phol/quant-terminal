@@ -45,9 +45,21 @@ import {
   ECoordinateMode,
   EHorizontalAnchorPoint,
   EVerticalAnchorPoint,
+  EFillPaletteMode,
+  EStrokePaletteMode,
+  EValueName,
+  parseColorToUIntArgb,
+} from "scichart";
+import type {
+  IFillPaletteProvider,
+  IStrokePaletteProvider,
+  IRenderableSeries,
 } from "scichart";
 import type { CandleData } from "../lib/klines";
-import { detectHeavyAbsorptions, type HeavyAbsorptionPoint } from "../lib/absorption";
+import {
+  detectHeavyAbsorptions,
+  type HeavyAbsorptionPoint,
+} from "../lib/absorption";
 import type { V74Frame, TimeframeFrame } from "../types/v74";
 
 export type Timeframe = "1m" | "5m" | "15m";
@@ -59,7 +71,7 @@ export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
 };
 
 /** Overlay groups the UI can switch on/off. */
-export type ChartLayer = "heatmap" | "bubbles" | "vacuum" | "hopla";
+export type ChartLayer = "heatmap" | "bubbles" | "vacuum" | "hopla" | "delta";
 
 /** Minimal shape the chart needs from a live frame. Structurally compatible with
  *  both the bridge `bookmap_update` frame and the `LiveOrderBookData` snapshot. */
@@ -72,6 +84,13 @@ export interface ChartFrame {
     displayedQuantity: string | number;
     firstSeenTimestamp?: number;
   }>;
+  /** Dense per-bin resting depth for the live heatmap column (Bookmap gradient).
+   *  bins[i] is the total resting volume at price priceMin + i*binSize. */
+  heatmap_column?: {
+    priceMin: number;
+    binSize: number;
+    bins: number[];
+  } | null;
   absorption_candidates?: Array<{
     side: "buy" | "sell";
     price: string | number;
@@ -212,6 +231,133 @@ export interface ChartConfig {
   timeframe: Timeframe;
 }
 
+// --- Volume Delta Candle coloring (LuxAlgo "Volume Delta Candles" style) ------
+// BODY  = sign of the bar's aggressor delta (taker buy − taker sell), brightness
+//         scaled by |delta| relative to the mean |delta| of the loaded bars, so weak
+//         imbalance bars fade and heavy-imbalance bars are saturated.
+// WICK/OUTLINE = price direction (close vs open). A green outline with a red body is a
+//         delta divergence: price rose while sellers were the aggressors (absorption).
+//
+// Historical bars get real delta from REST kline taker-buy volume; the forming bar
+// sums the bridge's live 1-minute trade buckets.
+//
+// IMPORTANT: for the candlestick series, returning `undefined` from an override does
+// NOT fall back to brushUp/brushDown — the native draw path passes fill=undefined as
+// the fallback, which renders NEUTRAL (white). So when enabled we return an explicit
+// color for every candle.
+const DELTA_UP_COLOR = "#26a69a"; // buyers in control
+const DELTA_DOWN_COLOR = "#ef5350"; // sellers in control
+
+class DeltaPaletteProvider
+  implements IFillPaletteProvider, IStrokePaletteProvider
+{
+  readonly fillPaletteMode = EFillPaletteMode.SOLID;
+  readonly strokePaletteMode = EStrokePaletteMode.SOLID;
+  readonly isRangeIndependant = true;
+
+  /** Delta per candle, index-aligned with the OhlcDataSeries. */
+  private deltas: number[];
+  /** When false, overrides are disabled and the series uses its default coloring. */
+  enabled = false;
+  /** |delta| <= deadband is treated as neutral (use close-vs-open fallback). */
+  private readonly deadband: number;
+
+  private readonly upArgb = parseColorToUIntArgb(DELTA_UP_COLOR);
+  private readonly downArgb = parseColorToUIntArgb(DELTA_DOWN_COLOR);
+  /** Low-delta body color (bars with weak imbalance fade toward this). */
+  private readonly dimArgb = parseColorToUIntArgb("#2a2e39");
+
+  constructor(deltas: number[], deadband = 0) {
+    this.deltas = deltas;
+    this.deadband = deadband;
+  }
+
+  /** Swap the backing array (e.g. after a timeframe reset reallocates it). */
+  setDeltas(deltas: number[]) {
+    this.deltas = deltas;
+  }
+
+  onAttached(_parentSeries: IRenderableSeries): void {}
+  onDetached(): void {}
+  /** Mean |delta| over the loaded bars, refreshed once per render pass. */
+  private meanAbs = 0;
+  /** Called once before the per-point loop. Always recompute while enabled so live
+   *  delta changes repaint (a state-dependent return let SciChart reuse a stale
+   *  palette cache). Also refreshes the intensity normaliser here, not per point. */
+  shouldUpdatePalette(): boolean {
+    if (this.enabled) {
+      let s = 0;
+      let n = 0;
+      for (const d of this.deltas) {
+        if (Number.isFinite(d) && d !== 0) {
+          s += Math.abs(d);
+          n++;
+        }
+      }
+      this.meanAbs = n > 0 ? s / n : 0;
+    }
+    return true;
+  }
+
+  /** Linear blend of two ARGB colors (t=0 → a, t=1 → b), alpha forced opaque. */
+  private static mix(a: number, b: number, t: number): number {
+    const ch = (c: number, sh: number) => (c >>> sh) & 0xff;
+    const r = Math.round(ch(a, 16) + (ch(b, 16) - ch(a, 16)) * t);
+    const g = Math.round(ch(a, 8) + (ch(b, 8) - ch(a, 8)) * t);
+    const bl = Math.round(ch(a, 0) + (ch(b, 0) - ch(a, 0)) * t);
+    return ((0xff << 24) | (r << 16) | (g << 8) | bl) >>> 0;
+  }
+
+  private priceUp(index: number, close: number, otherValues?: Map<string, Float64Array>): boolean | undefined {
+    const open = otherValues?.get(EValueName.Open)?.[index];
+    if (open === undefined || !Number.isFinite(open)) return undefined;
+    return close >= open;
+  }
+
+  /** Body: delta sign, brightness scaled by |delta| vs the mean (weak = dim). */
+  private fillFor(index: number, close: number, otherValues?: Map<string, Float64Array>): number | undefined {
+    if (!this.enabled) return undefined;
+    const d = this.deltas[index];
+    if (d === undefined || !Number.isFinite(d) || Math.abs(d) <= this.deadband || this.meanAbs <= 0) {
+      // No delta for this bar: plain close-vs-open color so it never renders white.
+      const up = this.priceUp(index, close, otherValues);
+      return up === undefined ? undefined : up ? this.upArgb : this.downArgb;
+    }
+    // |delta| = 2x mean or more → full color; tiny delta → mostly the dim base.
+    const t = Math.min(1, 0.2 + 0.8 * (Math.abs(d) / (2 * this.meanAbs)));
+    return DeltaPaletteProvider.mix(this.dimArgb, d > 0 ? this.upArgb : this.downArgb, t);
+  }
+
+  /** Outline/wick: price direction, so a body that disagrees with it = delta divergence. */
+  private strokeFor(index: number, close: number, otherValues?: Map<string, Float64Array>): number | undefined {
+    if (!this.enabled) return undefined;
+    const up = this.priceUp(index, close, otherValues);
+    return up === undefined ? undefined : up ? this.upArgb : this.downArgb;
+  }
+
+  overrideFillArgb(
+    _x: number,
+    yValue: number,
+    index: number,
+    _opacity?: number,
+    _metadata?: unknown,
+    otherValues?: Map<string, Float64Array>,
+  ): number | undefined {
+    return this.fillFor(index, yValue, otherValues);
+  }
+
+  overrideStrokeArgb(
+    _x: number,
+    yValue: number,
+    index: number,
+    _opacity?: number,
+    _metadata?: unknown,
+    otherValues?: Map<string, Float64Array>,
+  ): number | undefined {
+    return this.strokeFor(index, yValue, otherValues);
+  }
+}
+
 export class TerminalChart {
   private surface!: SciChartSurface;
   private cfg: ChartConfig;
@@ -222,6 +368,10 @@ export class TerminalChart {
 
   private candleData!: OhlcDataSeries;
   private candlestickSeries!: FastCandlestickRenderableSeries;
+  // Per-candle order-flow delta (oz), index-aligned with candleData, for the
+  // Volume Delta Candle coloring. Mutated in lockstep with candle append/remove.
+  private candleDelta: number[] = [];
+  private deltaPalette!: DeltaPaletteProvider;
 
   private heatmapData!: UniformHeatmapDataSeries;
   private heatmapSeries!: UniformHeatmapRenderableSeries;
@@ -231,7 +381,11 @@ export class TerminalChart {
   // is a VolumeBubbleAnnotation; we keep them in one list for lifecycle mgmt.
   private bubbleAnnotations: VolumeBubbleAnnotation[] = [];
 
-  private vacuumAnnotations: (BoxAnnotation | HorizontalLineAnnotation | TextAnnotation)[] = [];
+  private vacuumAnnotations: (
+    | BoxAnnotation
+    | HorizontalLineAnnotation
+    | TextAnnotation
+  )[] = [];
   private hoplaAnnotations: HorizontalLineAnnotation[] = [];
   private markPriceAnnotation: HorizontalLineAnnotation | null = null;
   // --- Audit R3: key levels + sweep markers + v7.5 institutional signals ---
@@ -254,7 +408,7 @@ export class TerminalChart {
   private rawZGrid: number[][] = [];
   private displayZGrid: number[][] = [];
   private heatmapFadeEnabled = false;
-  private heatmapFadeStrength = 0.70;
+  private heatmapFadeStrength = 0.7;
   private priceFloor = 0;
   private lastHeatmapBucket = 0;
   private heatmapInitialized = false;
@@ -263,6 +417,16 @@ export class TerminalChart {
   private curBucket = 0;
   private curOhlc: { o: number; h: number; l: number; c: number } | null = null;
   private curBucketMaxVol = 0;
+
+  // Live delta accumulation for the forming chart bar. The bridge's trade candle is a
+  // fixed 1-minute bucket, so on 5m/15m charts the bar delta is the sum of every
+  // minute bucket inside it. `barDeltaBase` is the REST (taker-buy) delta seeded at
+  // load time; `minuteBaseline` removes the part of the load-minute that REST already
+  // counted, so nothing is double-counted.
+  private minuteDelta = new Map<number, number>();
+  private minuteBaseline = new Map<number, number>();
+  private barDeltaBase = 0;
+  private deltaSeedMinuteMs = -1;
 
   // Live-follow control.
   private liveFollow = true;
@@ -274,6 +438,7 @@ export class TerminalChart {
     bubbles: true,
     vacuum: true,
     hopla: true,
+    delta: false,
   };
 
   // Last frame kept so toggles can re-render overlays without a new tick.
@@ -283,6 +448,11 @@ export class TerminalChart {
   private vacuumSig = "";
   private hoplaSig = "";
   private seenFootprintIds = new Set<string>();
+  // Live ABS episodes merged per (side, candle) — see appendLiveFootprints.
+  private liveAbsGroups = new Map<
+    string,
+    { bubble: VolumeBubbleAnnotation; hit: BubbleHit; count: number; pxQty: number; qty: number }
+  >();
   // Last applied live-view range, to skip redundant visibleRange writes.
   private lastViewFirstX = NaN;
   private lastViewLastX = NaN;
@@ -301,9 +471,12 @@ export class TerminalChart {
   }
 
   async init(rootElement: string | HTMLDivElement) {
-    const { sciChartSurface, wasmContext } = await SciChartSurface.create(rootElement, {
-      theme: new SciChartJsNavyTheme(),
-    });
+    const { sciChartSurface, wasmContext } = await SciChartSurface.create(
+      rootElement,
+      {
+        theme: new SciChartJsNavyTheme(),
+      },
+    );
     this.surface = sciChartSurface;
 
     // --- X = time (DateTime), Y = price ---
@@ -356,6 +529,8 @@ export class TerminalChart {
 
     // --- Candlesticks ---
     this.candleData = new OhlcDataSeries(wasmContext);
+    this.deltaPalette = new DeltaPaletteProvider(this.candleDelta);
+    this.deltaPalette.enabled = this.layers.delta;
     this.candlestickSeries = new FastCandlestickRenderableSeries(wasmContext, {
       dataSeries: this.candleData,
       strokeThickness: 1,
@@ -365,6 +540,7 @@ export class TerminalChart {
       strokeDown: "#ef5350",
       dataPointWidth: 0.7,
       dataPointWidthMode: EDataPointWidthMode.Relative,
+      paletteProvider: this.deltaPalette,
     });
     this.surface.renderableSeries.add(this.candlestickSeries);
 
@@ -377,7 +553,7 @@ export class TerminalChart {
           this.resetView();
           return false;
         },
-      })
+      }),
     );
 
     // Apply initial layer visibility now that series exist.
@@ -412,7 +588,13 @@ export class TerminalChart {
   private applyLayerVisibility() {
     if (this.heatmapSeries) this.heatmapSeries.isVisible = this.layers.heatmap;
     for (const b of this.bubbleAnnotations) b.isHidden = !this.layers.bubbles;
-    for (const m of this.bubbleRegimeAnnotations) m.isHidden = !this.layers.bubbles;
+    for (const m of this.bubbleRegimeAnnotations)
+      m.isHidden = !this.layers.bubbles;
+    if (this.deltaPalette) {
+      this.deltaPalette.enabled = this.layers.delta;
+      // Force the candlestick series to repaint with/without the delta override.
+      this.surface?.invalidateElement({ force: true });
+    }
   }
 
   /** Load historical candles from Binance to seed price action + absorption history. */
@@ -420,17 +602,28 @@ export class TerminalChart {
     if (!this.surface || candles.length === 0) return;
     this.historicalCandles = [...candles];
     this.candleData.clear();
+    this.candleDelta.length = 0;
     for (const c of candles) {
       this.candleData.append(c.time, c.open, c.high, c.low, c.close);
+      // Real aggressor delta from REST taker-buy volume (0 if the field is absent).
+      this.candleDelta.push(c.delta ?? 0);
     }
     const last = candles[candles.length - 1];
     this.curBucket = last.time;
     this.curOhlc = { o: last.open, h: last.high, l: last.low, c: last.close };
     this.curBucketMaxVol = last.volume;
+    // The last REST bar is still forming: its delta covers trades up to fetch time.
+    // Live minute deltas are added on top, minus what the fetch-minute already held.
+    this.barDeltaBase = last.delta ?? 0;
+    this.deltaSeedMinuteMs = Math.floor(Date.now() / 60_000) * 60_000;
+    this.minuteDelta.clear();
+    this.minuteBaseline.clear();
 
     if (this.priceFloor === 0) {
       const span = PRICE_ROWS * this.cfg.tickSize;
-      this.priceFloor = Math.round((last.close - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
+      this.priceFloor =
+        Math.round((last.close - span / 2) / this.cfg.tickSize) *
+        this.cfg.tickSize;
     }
 
     this.rebuildHeavyAbsorptions();
@@ -446,6 +639,11 @@ export class TerminalChart {
     this.curOhlc = null;
     this.curBucket = 0;
     this.curBucketMaxVol = 0;
+    this.candleDelta.length = 0;
+    this.minuteDelta.clear();
+    this.minuteBaseline.clear();
+    this.barDeltaBase = 0;
+    this.deltaSeedMinuteMs = -1;
     this.heatmapInitialized = false;
     this.lastHeatmapBucket = 0;
     this.historicalCandles = [];
@@ -456,14 +654,16 @@ export class TerminalChart {
     this.keyLevelsSig = "";
     this.sweepsSig = "";
     this.signalsSig = "";
-    for (const a of this.keyLevelAnnotations) this.surface?.annotations.remove(a);
+    for (const a of this.keyLevelAnnotations)
+      this.surface?.annotations.remove(a);
     this.keyLevelAnnotations = [];
     for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
     this.sweepAnnotations = [];
     for (const a of this.signalAnnotations) this.surface?.annotations.remove(a);
     this.signalAnnotations = [];
     this.bubblesSig = "";
-    for (const a of this.bubbleRegimeAnnotations) this.surface?.annotations.remove(a);
+    for (const a of this.bubbleRegimeAnnotations)
+      this.surface?.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
     this.clearBubbles();
     for (let r = 0; r < PRICE_ROWS; r++) {
@@ -501,6 +701,32 @@ export class TerminalChart {
     this.surface.invalidateElement({ force: true });
   }
 
+  /**
+   * Delta of the forming chart bar. The bridge streams a fixed 1-minute trade candle,
+   * so a 5m/15m bar's delta is the sum of the minute buckets inside it, plus the REST
+   * taker-buy delta seeded at load (minus the fetch-minute portion REST already had).
+   */
+  private liveBarDelta(tc: ChartFrame["trade_candle"]): number {
+    if (tc) {
+      if (tc.t === this.deltaSeedMinuteMs && !this.minuteBaseline.has(tc.t)) {
+        this.minuteBaseline.set(tc.t, tc.d);
+      }
+      this.minuteDelta.set(tc.t, tc.d);
+    }
+    const startMs = this.curBucket * 1000;
+    const endMs = startMs + this.tfSeconds * 1000;
+    let sum = this.barDeltaBase;
+    for (const [t, d] of this.minuteDelta) {
+      if (t < startMs) {
+        this.minuteDelta.delete(t); // older bars are final; drop
+        this.minuteBaseline.delete(t);
+      } else if (t < endMs) {
+        sum += d - (this.minuteBaseline.get(t) ?? 0);
+      }
+    }
+    return sum;
+  }
+
   /** Returns true when a new candle bucket was opened (caller rebuilds bubbles). */
   private updateCandles(frame: ChartFrame, nowSec: number): boolean {
     const price = frame.mid_price;
@@ -508,7 +734,8 @@ export class TerminalChart {
     const bucket = Math.floor(nowSec / this.tfSeconds) * this.tfSeconds;
     if (this.curOhlc === null || bucket > this.curBucket) {
       if (this.historicalCandles.length > 0 && this.curOhlc !== null) {
-        const closing = this.historicalCandles[this.historicalCandles.length - 1];
+        const closing =
+          this.historicalCandles[this.historicalCandles.length - 1];
         if (closing.time === this.curBucket) {
           closing.volume = Math.max(closing.volume, this.curBucketMaxVol);
         }
@@ -517,9 +744,14 @@ export class TerminalChart {
       this.curBucket = bucket;
       this.curOhlc = { o: price, h: price, l: price, c: price };
       this.curBucketMaxVol = tc ? tc.v : 0;
+      this.barDeltaBase = 0; // a bar opened live has no REST-seeded portion
       this.candleData.append(bucket, price, price, price, price);
+      // Keep the delta array index-aligned with candleData: append this bar's
+      // starting delta, then trim from the front in lockstep with removeAt(0).
+      this.candleDelta.push(this.liveBarDelta(tc));
       while (this.candleData.count() > MAX_CANDLES) {
         this.candleData.removeAt(0);
+        this.candleDelta.shift();
       }
       this.historicalCandles.push({
         time: bucket,
@@ -539,7 +771,16 @@ export class TerminalChart {
     this.curOhlc.c = price;
     const idx = this.candleData.count() - 1;
     if (idx >= 0) {
-      this.candleData.update(idx, this.curOhlc.o, this.curOhlc.h, this.curOhlc.l, this.curOhlc.c);
+      this.candleData.update(
+        idx,
+        this.curOhlc.o,
+        this.curOhlc.h,
+        this.curOhlc.l,
+        this.curOhlc.c,
+      );
+      // Refresh the forming bar's delta (sum of every 1m trade bucket in this bar)
+      // so the candle color tracks the live buy/sell imbalance.
+      if (tc) this.candleDelta[idx] = this.liveBarDelta(tc);
     }
     if (this.historicalCandles.length > 0) {
       const last = this.historicalCandles[this.historicalCandles.length - 1];
@@ -583,12 +824,22 @@ export class TerminalChart {
     price: number,
     label: string,
   ) {
-    const fill = side === "buy" ? "rgba(239, 68, 68, 0.40)" : "rgba(16, 185, 129, 0.40)";
-    const stroke = side === "buy" ? "rgba(248, 113, 113, 0.95)" : "rgba(52, 211, 153, 0.95)";
-    const bubble = new VolumeBubbleAnnotation({ time, price, priceRadius: 0, fill, stroke, label });
+    const fill =
+      side === "buy" ? "rgba(239, 68, 68, 0.40)" : "rgba(16, 185, 129, 0.40)";
+    const stroke =
+      side === "buy" ? "rgba(248, 113, 113, 0.95)" : "rgba(52, 211, 153, 0.95)";
+    const bubble = new VolumeBubbleAnnotation({
+      time,
+      price,
+      priceRadius: 0,
+      fill,
+      stroke,
+      label,
+    });
     bubble.isHidden = !this.layers.bubbles;
     this.surface.annotations.add(bubble);
     this.bubbleAnnotations.push(bubble);
+    return bubble;
   }
 
   /** Remove all bubble annotations from the surface and reset hit records. */
@@ -596,12 +847,23 @@ export class TerminalChart {
     for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
     this.bubbleAnnotations = [];
     this.bubbleHits = [];
+    this.liveAbsGroups.clear();
   }
 
   /**
-   * Incrementally append only NEW live order-flow tape footprints.
+   * Incrementally append live order-flow absorption footprints, merged to ONE
+   * bubble per (candle, side).
+   *
+   * The bridge re-evaluates its rolling absorption window on every trade and keys
+   * each hit by (2-second bucket, avg price in cents). One sustained absorption
+   * episode therefore emits many near-identical candidates a few cents apart, which
+   * used to stack as overlapping "ABS" bubbles on the same candle. They are the
+   * same event, so we merge them: the bubble sits at the volume-weighted price of
+   * the episode and the label shows how many re-detections confirmed it ("A×n").
    */
-  private appendLiveFootprints(candidates: ChartFrame["absorption_candidates"]) {
+  private appendLiveFootprints(
+    candidates: ChartFrame["absorption_candidates"],
+  ) {
     if (!this.surface || !candidates) return;
     for (const a of candidates) {
       const t = Math.floor(a.timestamp / 1000);
@@ -611,8 +873,26 @@ export class TerminalChart {
       if (this.seenFootprintIds.has(id)) continue;
       this.seenFootprintIds.add(id);
 
-      this.addBubble(a.side === "buy" ? "buy" : "sell", 0, t, px, "ABS");
-      this.bubbleHits.push({ x: t, y: px, point: null });
+      const side: "buy" | "sell" = a.side === "buy" ? "buy" : "sell";
+      const bar = Math.floor(t / this.tfSeconds) * this.tfSeconds;
+      const key = `${side}-${bar}`;
+      const qty = Math.max(Number(a.executedQuantity ?? 0) || 0, 1e-9);
+      const g = this.liveAbsGroups.get(key);
+      if (g) {
+        g.count += 1;
+        g.pxQty += px * qty;
+        g.qty += qty;
+        // Replace the existing bubble with the updated merged one.
+        this.surface.annotations.remove(g.bubble);
+        this.bubbleAnnotations = this.bubbleAnnotations.filter((b) => b !== g.bubble);
+        g.hit.y = g.pxQty / g.qty;
+        g.bubble = this.addBubble(side, 0, bar, g.hit.y, `A×${Math.min(g.count, 99)}`);
+      } else {
+        const hit: BubbleHit = { x: bar, y: px, point: null };
+        this.bubbleHits.push(hit);
+        const bubble = this.addBubble(side, 0, bar, px, "ABS");
+        this.liveAbsGroups.set(key, { bubble, hit, count: 1, pxQty: px * qty, qty });
+      }
     }
     if (this.seenFootprintIds.size > 2000) {
       const recent = Array.from(this.seenFootprintIds).slice(-500);
@@ -625,11 +905,18 @@ export class TerminalChart {
     const span = PRICE_ROWS * this.cfg.tickSize;
     let dirty = false;
 
-    if (this.priceFloor === 0 || mid < this.priceFloor + 15 || mid > this.priceFloor + span - 15) {
+    if (
+      this.priceFloor === 0 ||
+      mid < this.priceFloor + 15 ||
+      mid > this.priceFloor + span - 15
+    ) {
       const oldPriceFloor = this.priceFloor;
-      const newPriceFloor = Math.round((mid - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
+      const newPriceFloor =
+        Math.round((mid - span / 2) / this.cfg.tickSize) * this.cfg.tickSize;
       if (oldPriceFloor !== 0 && oldPriceFloor !== newPriceFloor) {
-        const rowDelta = Math.round((newPriceFloor - oldPriceFloor) / this.cfg.tickSize);
+        const rowDelta = Math.round(
+          (newPriceFloor - oldPriceFloor) / this.cfg.tickSize,
+        );
         for (let c = 0; c < HEATMAP_COLS; c++) {
           const colData = new Array(PRICE_ROWS).fill(0);
           for (let r = 0; r < PRICE_ROWS; r++) {
@@ -666,16 +953,21 @@ export class TerminalChart {
         if (rLo > PRICE_ROWS - 1 || rHi < 0) continue;
 
         const firstSeen = z.firstSeenTimestamp
-          ? (z.firstSeenTimestamp > 1e11 ? Math.floor(z.firstSeenTimestamp / 1000) : z.firstSeenTimestamp)
+          ? z.firstSeenTimestamp > 1e11
+            ? Math.floor(z.firstSeenTimestamp / 1000)
+            : z.firstSeenTimestamp
           : null;
 
         for (let c = 0; c < HEATMAP_COLS; c++) {
           const colTime = bucket - (HEATMAP_COLS - 1 - c) * this.tfSeconds;
-          const shouldPaint = firstSeen != null
-            ? colTime >= firstSeen
-            : c >= HEATMAP_COLS - 20;
+          const shouldPaint =
+            firstSeen != null ? colTime >= firstSeen : c >= HEATMAP_COLS - 20;
           if (shouldPaint) {
-            for (let r = Math.max(0, rLo); r <= Math.min(PRICE_ROWS - 1, rHi); r++) {
+            for (
+              let r = Math.max(0, rLo);
+              r <= Math.min(PRICE_ROWS - 1, rHi);
+              r++
+            ) {
               this.rawZGrid[r][c] = Math.max(this.rawZGrid[r][c], qty);
             }
           }
@@ -685,7 +977,9 @@ export class TerminalChart {
       dirty = true;
     } else {
       if (bucket !== this.lastHeatmapBucket) {
-        const elapsed = Math.round((bucket - this.lastHeatmapBucket) / this.tfSeconds);
+        const elapsed = Math.round(
+          (bucket - this.lastHeatmapBucket) / this.tfSeconds,
+        );
         if (elapsed > 0) {
           const shiftCount = Math.min(HEATMAP_COLS, elapsed);
           this.lastHeatmapBucket = bucket;
@@ -693,7 +987,9 @@ export class TerminalChart {
             if (shiftCount >= HEATMAP_COLS) {
               this.rawZGrid[r].fill(0);
             } else {
-              this.rawZGrid[r] = this.rawZGrid[r].slice(shiftCount).concat(new Array(shiftCount).fill(0));
+              this.rawZGrid[r] = this.rawZGrid[r]
+                .slice(shiftCount)
+                .concat(new Array(shiftCount).fill(0));
             }
           }
           dirty = true;
@@ -707,6 +1003,12 @@ export class TerminalChart {
           this.rawZGrid[r][col] = 0;
           dirty = true;
         }
+      }
+      // Dense Bookmap gradient: paint every binned depth level into the live
+      // column so the map reads continuously at any timeframe, not just the
+      // handful of thresholded zones. Zones then highlight on top via max().
+      if (this.paintDenseColumn(frame.heatmap_column, col)) {
+        dirty = true;
       }
       this.paintZones(zones, (r, qty) => {
         const v = Math.max(this.rawZGrid[r][col], qty);
@@ -736,7 +1038,10 @@ export class TerminalChart {
       let factor = 1.0;
       if (this.heatmapFadeEnabled && maxCol > 0) {
         const t = c / maxCol;
-        factor = (1 - this.heatmapFadeStrength) + this.heatmapFadeStrength * Math.pow(t, 1.35);
+        factor =
+          1 -
+          this.heatmapFadeStrength +
+          this.heatmapFadeStrength * Math.pow(t, 1.35);
       }
       for (let r = 0; r < PRICE_ROWS; r++) {
         this.displayZGrid[r][c] = this.rawZGrid[r][c] * factor;
@@ -782,6 +1087,34 @@ export class TerminalChart {
     }
   }
 
+  /** Paint the dense per-bin depth column from the bridge into one heatmap time
+   *  column. Each bin maps to a price row via (priceMin + i*binSize). Returns
+   *  true if any cell changed. This is the Bookmap continuous-gradient source;
+   *  it fills every resting level rather than only the thresholded zones, which
+   *  is what makes small timeframes read densely instead of sparse. */
+  private paintDenseColumn(
+    dense: ChartFrame["heatmap_column"],
+    col: number,
+  ): boolean {
+    if (!dense || !dense.bins || dense.bins.length === 0) return false;
+    const { priceMin, binSize, bins } = dense;
+    if (!Number.isFinite(priceMin) || !(binSize > 0)) return false;
+    let changed = false;
+    for (let i = 0; i < bins.length; i++) {
+      const qty = bins[i];
+      if (!(qty > 0)) continue;
+      const price = priceMin + i * binSize;
+      const r = Math.floor((price - this.priceFloor) / this.cfg.tickSize);
+      if (r < 0 || r > PRICE_ROWS - 1) continue;
+      const v = Math.max(this.rawZGrid[r][col], qty);
+      if (v !== this.rawZGrid[r][col]) {
+        this.rawZGrid[r][col] = v;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
   /** Pick the v7.4 timeframe frame matching the chart timeframe, falling back. */
   private pickV74Frame(frame: ChartFrame): TimeframeFrame | undefined {
     const frames = frame.v74?.frames;
@@ -797,21 +1130,34 @@ export class TerminalChart {
   private updateVacuum(frame: ChartFrame) {
     if (!this.layers.vacuum) {
       if (this.vacuumAnnotations.length) {
-        for (const a of this.vacuumAnnotations) this.surface.annotations.remove(a);
+        for (const a of this.vacuumAnnotations)
+          this.surface.annotations.remove(a);
         this.vacuumAnnotations = [];
       }
       this.vacuumSig = "__off__";
       return;
     }
 
-    const structure = this.pickV74Frame(frame)?.structure;
+    const vacFrame = this.pickV74Frame(frame);
+    const structure = vacFrame?.structure;
+    // The engine only runs 5m/15m. On a 1m chart the pockets come from the 5m engine
+    // (sized by 5m ATR, ~3x a 1m ATR), so tag them to avoid comparing against a 1m
+    // TradingView chart.
+    const srcTf = (vacFrame as { tf?: string } | undefined)?.tf;
+    const tfTag = srcTf && srcTf !== this.cfg.timeframe ? ` [${srcTf}]` : "";
     const pockets = structure?.vacuum ?? [];
     const vacBand = structure?.vac_band ?? 0;
-    const magnet = vacBand > 0 ? structure?.vac_above : vacBand < 0 ? structure?.vac_below : null;
+    const magnet =
+      vacBand > 0
+        ? structure?.vac_above
+        : vacBand < 0
+          ? structure?.vac_below
+          : null;
 
     const sig =
-      pockets.map((v) => `${v.strength}:${v.top}:${v.bottom}:${v.price}`).join("|") +
-      `#${vacBand}:${magnet ?? ""}`;
+      pockets
+        .map((v) => `${v.strength}:${v.top}:${v.bottom}:${v.price}:${v.birth_time}`)
+        .join("|") + `#${vacBand}:${magnet ?? ""}:${srcTf ?? ""}:${this.curBucket}`;
     if (sig === this.vacuumSig) return;
     this.vacuumSig = sig;
 
@@ -819,34 +1165,49 @@ export class TerminalChart {
     this.vacuumAnnotations = [];
     if (pockets.length === 0 && magnet == null) return;
 
-    const strengthColor = (s: number) => (s === 3 ? "#FF5252" : s === 2 ? "#FFA726" : "#8B9BB4");
+    const strengthColor = (s: number) =>
+      s === 3 ? "#FF5252" : s === 2 ? "#FFA726" : "#8B9BB4";
+
+    // Pine: box.new(bar_index, top, bar_index + 10, bottom) at birth, right edge
+    // trailed to bar_index + 10 on the last bar. Mirror that instead of a full-width band.
+    const latestTime =
+      this.curBucket ||
+      (this.candleData.count() > 0
+        ? this.candleData.getNativeXValues().get(this.candleData.count() - 1)
+        : Math.floor(Date.now() / 1000));
+    const rightEdge = latestTime + 10 * this.tfSeconds;
 
     for (const v of pockets) {
       const color = strengthColor(v.strength);
       const top = Math.max(v.top, v.bottom);
       const bot = Math.min(v.top, v.bottom);
+      const birthSec =
+        v.birth_time > 1e11 ? Math.floor(v.birth_time / 1000) : Math.floor(v.birth_time || 0);
+      const leftEdge = birthSec > 0 && birthSec <= latestTime ? birthSec : latestTime;
 
       const box = new BoxAnnotation({
-        x1: 0,
-        x2: 1,
-        xCoordinateMode: ECoordinateMode.Relative,
+        x1: leftEdge,
+        x2: rightEdge,
+        xCoordinateMode: ECoordinateMode.DataValue,
         yCoordinateMode: ECoordinateMode.DataValue,
         y1: top,
         y2: bot,
         fill: color + "1a",
         stroke: color + "88",
         strokeThickness: 1,
+        strokeDashArray: [4, 4],
       });
       this.surface.annotations.add(box);
       this.vacuumAnnotations.push(box);
 
       const label = new TextAnnotation({
-        x1: 0.98,
-        xCoordinateMode: ECoordinateMode.Relative,
-        horizontalAnchorPoint: EHorizontalAnchorPoint.Right,
+        x1: rightEdge,
+        xCoordinateMode: ECoordinateMode.DataValue,
+        horizontalAnchorPoint: EHorizontalAnchorPoint.Left,
         y1: (top + bot) / 2,
         yCoordinateMode: ECoordinateMode.DataValue,
-        text: `VAC${v.strength} ${v.price.toFixed(2)}`,
+        verticalAnchorPoint: EVerticalAnchorPoint.Center,
+        text: `VAC${v.strength} ${v.price.toFixed(2)}${tfTag}`,
         textColor: color,
         fontSize: 10,
         fontFamily: "'JetBrains Mono', monospace",
@@ -867,7 +1228,7 @@ export class TerminalChart {
         labelPlacement: ELabelPlacement.TopRight,
         axisLabelFill: "#00E5FF",
         axisLabelStroke: "#000000",
-        labelValue: `MAGNET ${dir} ${magnet.toFixed(2)}`,
+        labelValue: `MAGNET ${dir} ${magnet.toFixed(2)}${tfTag}`,
       });
       this.surface.annotations.add(line);
       this.vacuumAnnotations.push(line);
@@ -878,7 +1239,8 @@ export class TerminalChart {
   private updateHopla(frame: ChartFrame) {
     if (!this.layers.hopla) {
       if (this.hoplaAnnotations.length) {
-        for (const a of this.hoplaAnnotations) this.surface.annotations.remove(a);
+        for (const a of this.hoplaAnnotations)
+          this.surface.annotations.remove(a);
         this.hoplaAnnotations = [];
       }
       this.hoplaSig = "__off__";
@@ -894,7 +1256,12 @@ export class TerminalChart {
     this.hoplaAnnotations = [];
     if (!h) return;
 
-    const mk = (price: number, color: string, label: string, dash: number[]) => {
+    const mk = (
+      price: number,
+      color: string,
+      label: string,
+      dash: number[],
+    ) => {
       const line = new HorizontalLineAnnotation({
         y1: price,
         stroke: color,
@@ -910,9 +1277,12 @@ export class TerminalChart {
       this.hoplaAnnotations.push(line);
     };
 
-    if (Number.isFinite(h.line_97)) mk(h.line_97, "#ff3b30", `97% ${h.line_97.toFixed(2)}`, [4, 4]);
-    if (Number.isFinite(h.line_50)) mk(h.line_50, "#94a3b8", `EQ ${h.line_50.toFixed(2)}`, [1, 4]);
-    if (Number.isFinite(h.line_3)) mk(h.line_3, "#00b4d8", `3% ${h.line_3.toFixed(2)}`, [4, 4]);
+    if (Number.isFinite(h.line_97))
+      mk(h.line_97, "#ff3b30", `97% ${h.line_97.toFixed(2)}`, [4, 4]);
+    if (Number.isFinite(h.line_50))
+      mk(h.line_50, "#94a3b8", `EQ ${h.line_50.toFixed(2)}`, [1, 4]);
+    if (Number.isFinite(h.line_3))
+      mk(h.line_3, "#00b4d8", `3% ${h.line_3.toFixed(2)}`, [4, 4]);
   }
 
   /** Render prior-day/week high/low key levels — only when signature changes. */
@@ -922,7 +1292,8 @@ export class TerminalChart {
     if (sig === this.keyLevelsSig) return;
     this.keyLevelsSig = sig;
 
-    for (const a of this.keyLevelAnnotations) this.surface.annotations.remove(a);
+    for (const a of this.keyLevelAnnotations)
+      this.surface.annotations.remove(a);
     this.keyLevelAnnotations = [];
     if (!kl) return;
 
@@ -961,7 +1332,8 @@ export class TerminalChart {
     if (sweeps.length === 0) return;
 
     for (const s of sweeps.slice(-10)) {
-      const tSec = s.time > 1e11 ? Math.floor(s.time / 1000) : Math.floor(s.time);
+      const tSec =
+        s.time > 1e11 ? Math.floor(s.time / 1000) : Math.floor(s.time);
       const color = s.dir > 0 ? "#22c55e" : "#ef4444";
       const marker = new TextAnnotation({
         x1: tSec,
@@ -973,7 +1345,8 @@ export class TerminalChart {
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
-        verticalAnchorPoint: s.dir > 0 ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
+        verticalAnchorPoint:
+          s.dir > 0 ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
       });
       this.surface.annotations.add(marker);
       this.sweepAnnotations.push(marker);
@@ -983,13 +1356,17 @@ export class TerminalChart {
   /** Render v7.4 / v7.5 Institutional Signal Markers (▲ A+ / ▼ A+) & Active Trade Plan (ENTRY/SL/TP1/TP2). */
   private updateSignals(frame: ChartFrame) {
     const tfFrame = this.pickV74Frame(frame);
-    const sigs = (tfFrame?.signals || []).filter((s) => s.tier === "A_PLUS" || s.tier === "STRUCTURAL");
+    const sigs = (tfFrame?.signals || []).filter(
+      (s) => s.tier === "A_PLUS" || s.tier === "STRUCTURAL",
+    );
     const active = tfFrame?.active_signal || null;
 
     const sig =
       sigs
         .slice(-16)
-        .map((s) => `${s.id}:${s.status}:${s.outcome ?? ""}:${s.win_rate ?? ""}`)
+        .map(
+          (s) => `${s.id}:${s.status}:${s.outcome ?? ""}:${s.win_rate ?? ""}`,
+        )
         .join("|") +
       `#active:${active ? `${active.id}:${active.plan.entry}:${active.plan.stop}:${active.plan.tp1}:${active.plan.tp2}` : "none"}`;
     if (sig === this.signalsSig) return;
@@ -1001,7 +1378,8 @@ export class TerminalChart {
 
     for (const s of sigs.slice(-16)) {
       if (s.entry == null || !Number.isFinite(s.entry)) continue;
-      const tSec = s.time > 1e11 ? Math.floor(s.time / 1000) : Math.floor(s.time);
+      const tSec =
+        s.time > 1e11 ? Math.floor(s.time / 1000) : Math.floor(s.time);
       const isLong = s.direction === "LONG";
       const isAPlus = s.tier === "A_PLUS";
       const color = isLong
@@ -1011,7 +1389,8 @@ export class TerminalChart {
         : isAPlus
           ? "#f43f5e"
           : "#fb7185";
-      const winPct = s.win_rate != null ? ` ${Math.round(s.win_rate * 100)}%` : "";
+      const winPct =
+        s.win_rate != null ? ` ${Math.round(s.win_rate * 100)}%` : "";
       const tierBadge = isAPlus ? "A+" : "S";
       const marker = new TextAnnotation({
         x1: tSec,
@@ -1023,14 +1402,21 @@ export class TerminalChart {
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
-        verticalAnchorPoint: isLong ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
+        verticalAnchorPoint: isLong
+          ? EVerticalAnchorPoint.Top
+          : EVerticalAnchorPoint.Bottom,
       });
       this.surface.annotations.add(marker);
       this.signalAnnotations.push(marker);
     }
 
     if (active && active.plan) {
-      const mkLevel = (price: number | undefined, color: string, label: string, dash: number[]) => {
+      const mkLevel = (
+        price: number | undefined,
+        color: string,
+        label: string,
+        dash: number[],
+      ) => {
         if (price == null || !Number.isFinite(price)) return;
         const line = new HorizontalLineAnnotation({
           y1: price,
@@ -1046,7 +1432,12 @@ export class TerminalChart {
         this.surface.annotations.add(line);
         this.signalAnnotations.push(line);
       };
-      mkLevel(active.plan.entry, "#38bdf8", `${active.direction} ENTRY`, [2, 2]);
+      mkLevel(
+        active.plan.entry,
+        "#38bdf8",
+        `${active.direction} ENTRY`,
+        [2, 2],
+      );
       mkLevel(active.plan.stop, "#ef4444", "SL", [4, 4]);
       mkLevel(active.plan.tp1, "#10b981", "TP1", [4, 4]);
       mkLevel(active.plan.tp2, "#059669", "TP2", [6, 3]);
@@ -1067,7 +1458,8 @@ export class TerminalChart {
     if (sig === this.bubblesSig) return;
     this.bubblesSig = sig;
 
-    for (const a of this.bubbleRegimeAnnotations) this.surface.annotations.remove(a);
+    for (const a of this.bubbleRegimeAnnotations)
+      this.surface.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
     if (!this.layers.bubbles || notable.length === 0) return;
 
@@ -1080,8 +1472,14 @@ export class TerminalChart {
     for (const b of notable.slice(-8)) {
       const meta = META[b.regime];
       if (!meta) continue;
-      const tSec = b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : Math.floor(b.timestamp);
-      const price = typeof b.priceCenter === "string" ? parseFloat(b.priceCenter) : b.priceCenter;
+      const tSec =
+        b.timestamp > 1e11
+          ? Math.floor(b.timestamp / 1000)
+          : Math.floor(b.timestamp);
+      const price =
+        typeof b.priceCenter === "string"
+          ? parseFloat(b.priceCenter)
+          : b.priceCenter;
       if (!Number.isFinite(price)) continue;
       const isBuy = b.aggressorSide === "buy";
       const marker = new TextAnnotation({
@@ -1094,7 +1492,9 @@ export class TerminalChart {
         fontFamily: "'JetBrains Mono', monospace",
         fontWeight: "bold",
         horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
-        verticalAnchorPoint: isBuy ? EVerticalAnchorPoint.Top : EVerticalAnchorPoint.Bottom,
+        verticalAnchorPoint: isBuy
+          ? EVerticalAnchorPoint.Top
+          : EVerticalAnchorPoint.Bottom,
       });
       this.surface.annotations.add(marker);
       this.bubbleRegimeAnnotations.push(marker);
@@ -1124,8 +1524,13 @@ export class TerminalChart {
   /**
    * Click-to-inspect hit test.
    */
-  hitTestBubble(clientX: number, clientY: number, tolerancePx = 16): BubbleHit | null {
-    if (!this.surface || this.bubbleHits.length === 0 || !this.layers.bubbles) return null;
+  hitTestBubble(
+    clientX: number,
+    clientY: number,
+    tolerancePx = 16,
+  ): BubbleHit | null {
+    if (!this.surface || this.bubbleHits.length === 0 || !this.layers.bubbles)
+      return null;
     const rect = this.surface.domCanvasWebGL?.getBoundingClientRect?.();
     if (!rect) return null;
     const px = clientX - rect.left;
@@ -1170,7 +1575,8 @@ export class TerminalChart {
     const plotWidthPx = this.surface?.seriesViewRect?.width ?? 0;
     const minSafePlot = RIGHT_OFFSET_PX + 120;
     if (plotWidthPx > minSafePlot) {
-      const computedPad = (candleSpan * RIGHT_OFFSET_PX) / (plotWidthPx - RIGHT_OFFSET_PX);
+      const computedPad =
+        (candleSpan * RIGHT_OFFSET_PX) / (plotWidthPx - RIGHT_OFFSET_PX);
       pad = Math.min(computedPad, candleSpan * 1.5);
     }
 
@@ -1187,7 +1593,11 @@ export class TerminalChart {
 
     const widthChanged = Math.abs(plotWidthPx - this.lastViewWidth) > 8;
     const padChanged = Math.abs(pad - this.lastViewPad) > this.tfSeconds * 0.5;
-    const xChanged = firstX !== this.lastViewFirstX || lastX !== this.lastViewLastX || widthChanged || padChanged;
+    const xChanged =
+      firstX !== this.lastViewFirstX ||
+      lastX !== this.lastViewLastX ||
+      widthChanged ||
+      padChanged;
     const yOk = Number.isFinite(hi) && Number.isFinite(lo) && hi > lo;
     const yChanged = yOk && (lo !== this.lastViewLo || hi !== this.lastViewHi);
 
@@ -1223,13 +1633,15 @@ export class TerminalChart {
     this.hoplaAnnotations = [];
     for (const a of this.vacuumAnnotations) this.surface?.annotations.remove(a);
     this.vacuumAnnotations = [];
-    for (const a of this.keyLevelAnnotations) this.surface?.annotations.remove(a);
+    for (const a of this.keyLevelAnnotations)
+      this.surface?.annotations.remove(a);
     this.keyLevelAnnotations = [];
     for (const a of this.sweepAnnotations) this.surface?.annotations.remove(a);
     this.sweepAnnotations = [];
     for (const a of this.signalAnnotations) this.surface?.annotations.remove(a);
     this.signalAnnotations = [];
-    for (const a of this.bubbleRegimeAnnotations) this.surface?.annotations.remove(a);
+    for (const a of this.bubbleRegimeAnnotations)
+      this.surface?.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
     for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
     this.bubbleAnnotations = [];

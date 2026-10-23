@@ -88,6 +88,12 @@ def safe_json_dumps(obj: Any, default=None) -> str:
 PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 SYMBOL = "XAUUSDT"
 
+# Dense heatmap depth-column geometry. Must stay in lockstep with the frontend
+# TerminalChart grid (PRICE_ROWS rows at tickSize each) so each emitted bin maps
+# directly onto one heatmap row without client-side resampling.
+HEATMAP_PRICE_ROWS = 240       # == PRICE_ROWS in TerminalChart.ts
+HEATMAP_BIN_SIZE = 0.5         # == ChartConfig.tickSize in App.tsx
+
 # Connected frontend clients
 CLIENTS: Set = set()
 
@@ -222,6 +228,9 @@ terminal_state: Dict[str, Any] = {
     "ask_total_vol": 0.0,
     "resting_walls": [],
     "liquidity_zones": [],
+    # Dense per-bin resting depth for the live heatmap column (Bookmap gradient).
+    # priceMin/binSize let the client map bins[i] -> price priceMin + i*binSize.
+    "heatmap_column": None,  # {"priceMin": float, "binSize": float, "bins": [float,...]}
     "absorption_candidates": [],
     "recent_trades": [],
     "price_history": [],
@@ -353,6 +362,21 @@ async def on_depth_update(book: LocalOrderBook):
     terminal_state["imbalance_score"] = imbalance_score
     terminal_state["resting_walls"] = resting_walls
     terminal_state["liquidity_zones"] = [z.to_dict() for z in CURRENT_ZONES]
+    # Dense depth column centred on mid, aligned to the frontend heatmap grid.
+    price_min = (
+        round((mid_price - (HEATMAP_PRICE_ROWS / 2.0) * HEATMAP_BIN_SIZE) / HEATMAP_BIN_SIZE)
+        * HEATMAP_BIN_SIZE
+    )
+    price_max = price_min + HEATMAP_PRICE_ROWS * HEATMAP_BIN_SIZE
+    depth_bins = book.get_binned_depth_column(price_min, price_max, HEATMAP_BIN_SIZE)
+    if depth_bins:
+        terminal_state["heatmap_column"] = {
+            "priceMin": round(price_min, 2),
+            "binSize": HEATMAP_BIN_SIZE,
+            "bins": [round(v, 3) for v in depth_bins],
+        }
+    else:
+        terminal_state["heatmap_column"] = None
     terminal_state["price_history"] = list(PRICE_HISTORY)
     terminal_state["v6_flow_signal"] = flow_signal
     terminal_state["mark_price"] = provider.mark_price

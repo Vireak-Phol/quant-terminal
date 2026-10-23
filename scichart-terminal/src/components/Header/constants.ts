@@ -41,4 +41,10 @@ export const LAYER_META: LayerMeta[] = [
     glyph: "📐",
     on: "bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/50 shadow-glow",
   },
+  {
+    key: "delta",
+    label: "DELTA",
+    glyph: "Δ",
+    on: "bg-violet-500/20 text-violet-300 border border-violet-500/40 shadow-glow",
+  },
 ];

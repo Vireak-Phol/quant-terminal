@@ -245,6 +245,39 @@ class LocalOrderBook:
 
         return out_bids, out_asks
 
+    def get_binned_depth_column(
+        self,
+        price_min: float,
+        price_max: float,
+        bin_size: float,
+    ) -> List[float]:
+        """
+        Dense Bookmap-style depth column: total resting limit volume per price bin
+        across the full [price_min, price_max) window, from both book sides.
+
+        Unlike the thresholded liquidity zones (which keep only ~20 large walls),
+        this returns the continuous depth gradient at every bin so the heatmap
+        reads like Bookmap at any timeframe. Returns a list of length `num_bins`.
+        Lifespan/spoof weighting is intentionally omitted here because the
+        synchronized L2 book does not track per-level age.
+        """
+        if bin_size <= 0 or price_max <= price_min:
+            return []
+        num_bins = int(round((price_max - price_min) / bin_size))
+        if num_bins <= 0:
+            return []
+
+        bins = [0.0] * num_bins
+        for book_side in (self.bids, self.asks):
+            for p_dec, q_dec in book_side.items():
+                p = float(p_dec)
+                if p < price_min or p >= price_max:
+                    continue
+                idx = int((p - price_min) // bin_size)
+                if 0 <= idx < num_bins:
+                    bins[idx] += float(q_dec)
+        return bins
+
     def get_imbalance(self, depth: int = 5) -> Tuple[float, int]:
         """
         Calculates order flow imbalance across top N levels:

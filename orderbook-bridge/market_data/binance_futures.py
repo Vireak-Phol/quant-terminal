@@ -38,7 +38,10 @@ logger = logging.getLogger("BinanceFuturesProvider")
 
 class BinanceFuturesProvider(MarketDataProvider):
     REST_BASE_URL = "https://fapi.binance.com"
-    WS_STREAM_URL = "wss://fstream.binance.com/stream"
+    # Routed entry points (Binance WebSocket base-URL split). The legacy un-routed
+    # "/stream" only serves /public data (depth); trades/kline/mark/liquidations are /market.
+    WS_PUBLIC_URL = "wss://fstream.binance.com/public/stream"
+    WS_MARKET_URL = "wss://fstream.binance.com/market/stream"
 
     def __init__(self, symbol: str = "XAUUSDT"):
         self.symbol = symbol.upper()
@@ -295,14 +298,33 @@ class BinanceFuturesProvider(MarketDataProvider):
                 break
 
     async def _stream_loop(self):
-        """Main resilient WebSocket streaming loop with exponential backoff & jitter."""
-        stream_path = f"{self.symbol.lower()}@depth@100ms/{self.symbol.lower()}@aggTrade/{self.symbol.lower()}@kline_1m/{self.symbol.lower()}@markPrice@1s/{self.symbol.lower()}@forceOrder"
-        ws_url = f"{self.WS_STREAM_URL}?streams={stream_path}"
+        """Run the two routed Binance connections concurrently.
+
+        Binance split the USDⓈ-M stream host into routed entry points: depth lives on
+        ``/public`` while aggTrade / kline / markPrice / forceOrder live on ``/market``.
+        The legacy un-routed ``/stream`` URL now only delivers ``/public`` data, which
+        silently starved every trade-driven feature (trade candles, delta, CVD, bubbles,
+        absorption, liquidations). Each route gets its own resilient loop.
+        """
+        s = self.symbol.lower()
+        await asyncio.gather(
+            self._route_loop(self.WS_PUBLIC_URL, [f"{s}@depth@100ms"], is_book=True),
+            self._route_loop(
+                self.WS_MARKET_URL,
+                [f"{s}@aggTrade", f"{s}@kline_1m", f"{s}@markPrice@1s", f"{s}@forceOrder"],
+                is_book=False,
+            ),
+        )
+
+    async def _route_loop(self, base_url: str, streams: List[str], is_book: bool):
+        """Resilient WebSocket loop for one route with exponential backoff & jitter."""
+        ws_url = f"{base_url}?streams={'/'.join(streams)}"
         backoff_sec = 1.0
 
         while self._running:
             try:
-                self._connection_state = ConnectionState.CONNECTING
+                if is_book:
+                    self._connection_state = ConnectionState.CONNECTING
                 logger.info(f"Connecting to Binance USDⓈ-M Futures stream: {ws_url}")
 
                 async with websockets.connect(
@@ -311,12 +333,14 @@ class BinanceFuturesProvider(MarketDataProvider):
                     ping_timeout=15,
                     max_size=10 * 1024 * 1024,
                 ) as ws:
-                    logger.info("Connected to Binance Futures! Initiating order book synchronization...")
-                    self.reconnect_count += 1
                     backoff_sec = 1.0
-
-                    # Trigger snapshot resync task concurrently
-                    asyncio.create_task(self._resynchronize_order_book())
+                    if is_book:
+                        logger.info("Connected to Binance Futures depth! Initiating order book synchronization...")
+                        self.reconnect_count += 1
+                        # Trigger snapshot resync task concurrently
+                        asyncio.create_task(self._resynchronize_order_book())
+                    else:
+                        logger.info("Connected to Binance Futures market streams (aggTrade/kline/markPrice/forceOrder).")
 
                     while self._running:
                         msg = await ws.recv()
@@ -358,8 +382,9 @@ class BinanceFuturesProvider(MarketDataProvider):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self._connection_state = ConnectionState.RECONNECTING
-                logger.warning(f"WebSocket error: {e}. Backing off {backoff_sec:.1f}s...")
+                if is_book:
+                    self._connection_state = ConnectionState.RECONNECTING
+                logger.warning(f"WebSocket error ({base_url}): {e}. Backing off {backoff_sec:.1f}s...")
                 await asyncio.sleep(backoff_sec + random.uniform(0.1, 0.5))
                 backoff_sec = min(backoff_sec * 2.0, 30.0)
 

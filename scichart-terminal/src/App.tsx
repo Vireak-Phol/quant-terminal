@@ -60,6 +60,7 @@ export default function App() {
     bubbles: true,
     vacuum: true,
     hopla: true,
+    delta: false,
   });
 
   const [heatmapFade, setHeatmapFade] = useState<boolean>(() => {
