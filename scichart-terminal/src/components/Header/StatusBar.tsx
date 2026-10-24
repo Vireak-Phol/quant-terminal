@@ -15,7 +15,8 @@ export const StatusBar = memo(function StatusBar({
   const t = useLiveField(
     (s) => ({
       sync: s.data?.telemetry?.order_book_sync_state ?? "—",
-      events: s.data?.telemetry?.total_updates_processed ?? 0,
+      // Batch updates to every 50 events so React is not forced to reconcile 15x/sec
+      events: Math.floor((s.data?.telemetry?.total_updates_processed ?? 0) / 50) * 50,
     }),
     (a, b) => a.sync === b.sync && a.events === b.events,
   );
