@@ -137,9 +137,10 @@ Only these keys are read from `.env`:
 | Button | Layer | How to read it |
 | --- | --- | --- |
 | **Heatmap** | Resting limit-order liquidity over time | Brighter = more size resting at that price. Walls that persist are levels the market respects or has to absorb. The ▾ next to it sets the **fade**: older liquidity dims so the live edge stands out |
-| **Absorb** | Absorption bubbles | Aggressive orders that hit resting liquidity **without moving price**. Blue = buyers absorbed (often near highs), pink = sellers absorbed (often near lows). Size = strength: normal → **wall** (hit a resting wall) → **battle** (absorbed while open interest rose; brightest, with a light ring). The number is the candle's volume as % of its 20-bar average, or the absorbed size in oz for live-tape bubbles. **Click a bubble** for details |
+| **Absorb** | Absorption bubbles | Aggressive orders that hit resting liquidity **without moving price**. Blue = buyers absorbed (often near highs), pink = sellers absorbed (often near lows). **Size scales with volume effort** (sm: 70–120% → md: 120–200% / resting wall → lg: 200–350% → xl: ≥350% or battle where open interest rose; brightest with a light ring). The number is the candle's volume as % of its 20-bar average, or the absorbed size in oz for live-tape bubbles. **Click a bubble** for details |
 | **Vacuum** | Liquidity-vacuum pockets + 🧲 magnet | Untraded price pockets that price tends to move through quickly. Red = equal highs/lows (strongest), orange = unfilled gaps (FVGs), grey = jumps between bars. The cyan 🧲 line is the nearest pocket in the direction of pull |
 | **Hopla** | 3 % / 50 % / 97 % range | Session range extremes and equilibrium |
+| **VWAP** | Institutional VWAP & Fib Bands | Session-anchored VWAP (gold line), ±1σ guides (sky blue / pink), and fat-tail Cornish-Fisher Fibonacci deviation zones (red Supply zone: +1.618σ to +2.618σ; green Demand zone: -1.618σ to -2.618σ) matching REG v7.4 |
 | **Delta** | Volume-delta candle colouring | Body colour = sign of aggressor delta, brightness = size of the imbalance. Wick/outline = price direction. **A green outline with a red body** means price rose while sellers were the aggressors (absorption/divergence) |
 
 Always on: the **MARK** price line, prior-day/week highs and lows (**PDH/PDL/PWH/PWL**),

@@ -96,6 +96,7 @@ export default function App() {
     bubbles: true,
     vacuum: true,
     hopla: true,
+    vwap: true,
     delta: false,
   });
 
@@ -108,6 +109,7 @@ export default function App() {
       bubbles: null,
       vacuum: null,
       hopla: null,
+      vwap: null,
       delta: caps.delta === "exchange" ? null : `${venue.label} has no aggressor (taker) volume`,
     };
   }, [venue]);

@@ -147,9 +147,26 @@ export interface LiveOrderBookData {
    *  selector keys its re-render off this so a new bubble is never dropped at
    *  ring-buffer capacity when a same-signature fill repeats (Audit #1). */
   bubblesRev?: number
+  // --- REG v7.4 Cornish-Fisher VWAP & Fib deviation bands ---
+  vwap_z?: VwapZData | null
   /** Active market-data venue + capability flags (absent on pre-venue bridges). */
   venue?: VenueInfo
   status: string
+}
+
+export interface VwapZData {
+  vwap?: number | null
+  z?: number | null
+  rawZ?: number | null
+  sigma?: number | null
+  sigmaAdj?: number | null
+  cfValid?: boolean
+  upper1?: number | null
+  lower1?: number | null
+  fibUpper1?: number | null
+  fibUpper2?: number | null
+  fibLower1?: number | null
+  fibLower2?: number | null
 }
 
 export type ConnectionState = 'connected' | 'connecting' | 'disconnected'

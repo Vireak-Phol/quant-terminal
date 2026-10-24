@@ -7,6 +7,7 @@ export type IconName =
   | "absorb"
   | "vacuum"
   | "hopla"
+  | "vwap"
   | "delta"
   | "fade"
   | "chevron"
@@ -47,6 +48,13 @@ const PATHS: Record<IconName, JSX.Element> = {
       <path d="M2 3.5h12" />
       <path d="M2 8h12" strokeDasharray="2 2" />
       <path d="M2 12.5h12" />
+    </>
+  ),
+  vwap: (
+    <>
+      <path d="M2 5c3-1.2 5 1.2 8 0s3-1.2 4-.8" opacity=".45" />
+      <path d="M2 8c3-1.2 5 1.2 8 0s3-1.2 4-.8" />
+      <path d="M2 11c3-1.2 5 1.2 8 0s3-1.2 4-.8" opacity=".45" />
     </>
   ),
   delta: <path d="M8 2.5 14 13.5H2Z" />,

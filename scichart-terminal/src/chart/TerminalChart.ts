@@ -45,6 +45,9 @@ import {
   EChart2DModifierType,
   translateFromCanvasToSeriesViewRect,
   XyDataSeries,
+  XyyDataSeries,
+  FastLineRenderableSeries,
+  FastBandRenderableSeries,
   XyScatterRenderableSeries,
   EllipsePointMarker,
   XyTextDataSeries,
@@ -75,7 +78,20 @@ import {
   type HeavyAbsorptionPoint,
 } from "../lib/absorption";
 import type { V74Frame, TimeframeFrame } from "../types/v74";
+import type { VwapZData } from "../hooks/useLiveOrderBook";
 import { DEFAULT_CHART_STYLE, bubblePaint, type ChartStyle } from "../lib/chartStyle";
+import {
+  computeDailyVwapBars,
+  computeVwapBandsFromCandles,
+  type VwapBandsLevels,
+  type DailyVwapBar,
+} from "../lib/vwap";
+export {
+  computeDailyVwapBars,
+  computeVwapBandsFromCandles,
+  type VwapBandsLevels,
+  type DailyVwapBar,
+};
 
 export type Timeframe = "1m" | "5m" | "15m";
 
@@ -86,13 +102,14 @@ export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
 };
 
 /** Overlay groups the UI can switch on/off. */
-export type ChartLayer = "heatmap" | "bubbles" | "vacuum" | "hopla" | "delta";
+export type ChartLayer = "heatmap" | "bubbles" | "vacuum" | "hopla" | "vwap" | "delta";
 
 /** Minimal shape the chart needs from a live frame. Structurally compatible with
  *  both the bridge `bookmap_update` frame and the `LiveOrderBookData` snapshot. */
 export interface ChartFrame {
   mid_price: number;
   timestamp: number;
+  vwap_z?: VwapZData | null;
   liquidity_zones?: Array<{
     priceLow: string | number;
     priceHigh: string | number;
@@ -227,18 +244,21 @@ const RIGHT_OFFSET_PX = 200;
 // Always a numbered circle. Each visual channel carries one fact:
 //   COLOUR = aggressor side — blue: aggressive BUYERS, pink: aggressive SELLERS
 //            (DeepCharts convention; distinct from the green/red candles).
-//   SIZE   = strength tier:
-//            "circle"  (r 12) — absorption
-//            "square"  (r 15) — aggression traded into a resting liquidity wall
-//            "diamond" (r 18, bright + white ring) — "battle": absorbed AND open
-//                       interest rose (fresh passive positions defending the level)
-//            (tier names kept from the DeepCharts shape mapping they replace)
+//   SIZE   = volume-scaled effort tier (quantized dynamic radius, capped at 36px
+//            so candles and wicks are never occluded):
+//            "sm" (18px) — standard absorption (~70–119% of 20-bar avg)
+//            "md" (24px) — elevated absorption (120–199% or wall)
+//            "lg" (30px) — heavy absorption (200–349%)
+//            "xl" (36px, bright + white ring) — extreme (>=350%) or "battle"
+//                       (absorbed while open interest rose)
 //   NUMBER = volume: the candle detector's volume ratio (% of average) when known,
 //            otherwise the live absorbed size in oz.
-// One marker per candle per side; the tier only upgrades.
-export type AbsorbShape = "circle" | "square" | "diamond";
-const MARKER_PX: Record<AbsorbShape, number> = { circle: 12, square: 15, diamond: 18 };
-const MARKER_FONT: Record<AbsorbShape, number> = { circle: 9, square: 10, diamond: 11 };
+// One marker per candle per side; size scales dynamically with volume effort.
+export type AbsorbTier = "sm" | "md" | "lg" | "xl";
+export type AbsorbShape = AbsorbTier; // backward-compat alias
+const ABSORB_TIERS: AbsorbTier[] = ["sm", "md", "lg", "xl"];
+const TIER_DIAMETER_PX: Record<AbsorbTier, number> = { sm: 18, md: 24, lg: 30, xl: 36 };
+const TIER_FONT_SIZE: Record<AbsorbTier, number> = { sm: 8, md: 9, lg: 10, xl: 11 };
 
 // Bubble + candle colours are user settings (lib/chartStyle.ts). Defaults keep the
 // DeepCharts palette: BLUE = aggressive buyers, PINK = aggressive sellers — distinct
@@ -268,8 +288,14 @@ interface AbsorbGroup {
   battlePx: number | null;
 }
 
-function groupShape(g: AbsorbGroup): AbsorbShape {
-  return g.battle ? "diamond" : g.wall ? "square" : "circle";
+function groupTier(g: AbsorbGroup): AbsorbTier {
+  if (g.battle) return "xl";
+  const volRatio = g.detector?.volRatio ?? 0;
+  const qty = g.liveQty;
+  if (volRatio >= 350 || qty >= 1500) return "xl";
+  if (volRatio >= 200 || qty >= 500) return "lg";
+  if (volRatio >= 120 || qty >= 150 || g.wall) return "md";
+  return "sm";
 }
 
 /** Detector markers stay on their wick; live-only markers sit at the episode VWAP. */
@@ -283,7 +309,6 @@ function groupLabel(g: AbsorbGroup): string {
   return absorbLabel(g.detector?.volRatio ?? g.liveQty);
 }
 
-const ABSORB_SHAPES: AbsorbShape[] = ["circle", "square", "diamond"];
 const ABSORB_SIDES: Array<"buy" | "sell"> = ["buy", "sell"];
 
 interface AbsorbLayer {
@@ -448,7 +473,7 @@ export class TerminalChart {
 
   // Absorption markers: model (one group per side×candle) + GPU series per size tier.
   private absorbGroups = new Map<string, AbsorbGroup>();
-  private absorbLayers!: Record<AbsorbShape, AbsorbLayer>;
+  private absorbLayers!: Record<AbsorbTier, AbsorbLayer>;
   private absorbDirty = false;
 
   // Crosshair + pointer tracking (hover readout / click hit-test).
@@ -465,6 +490,18 @@ export class TerminalChart {
     | TextAnnotation
   )[] = [];
   private hoplaAnnotations: HorizontalLineAnnotation[] = [];
+  // Daily VWAP + Cornish-Fisher Fibonacci bands (continuous series, REG v7.4)
+  private vwapDataSeries!: XyDataSeries;
+  private vwapLineSeries!: FastLineRenderableSeries;
+  private supplyBandDataSeries!: XyyDataSeries;
+  private supplyBandSeries!: FastBandRenderableSeries;
+  private demandBandDataSeries!: XyyDataSeries;
+  private demandBandSeries!: FastBandRenderableSeries;
+  private upper1DataSeries!: XyDataSeries;
+  private upper1LineSeries!: FastLineRenderableSeries;
+  private lower1DataSeries!: XyDataSeries;
+  private lower1LineSeries!: FastLineRenderableSeries;
+  private vwapAxisAnnotation: HorizontalLineAnnotation | null = null;
   private markPriceAnnotation: HorizontalLineAnnotation | null = null;
   // --- Audit R3: key levels + sweep markers + v7.5 institutional signals ---
   private keyLevelAnnotations: HorizontalLineAnnotation[] = [];
@@ -517,6 +554,7 @@ export class TerminalChart {
     bubbles: true,
     vacuum: true,
     hopla: true,
+    vwap: true,
     delta: false,
   };
 
@@ -599,6 +637,41 @@ export class TerminalChart {
     });
     this.surface.renderableSeries.add(this.heatmapSeries);
 
+    // --- Daily VWAP Fibonacci Bands (GPU ribbons behind candles, REG v7.4) ---
+    this.supplyBandDataSeries = new XyyDataSeries(wasmContext, {
+      containsNaN: true,
+      isSorted: true,
+    });
+    this.supplyBandSeries = new FastBandRenderableSeries(wasmContext, {
+      dataSeries: this.supplyBandDataSeries,
+      fill: "rgba(239, 68, 68, 0.12)",
+      fillY1: "rgba(239, 68, 68, 0.12)",
+      stroke: "rgba(239, 68, 68, 0.35)",
+      strokeY1: "rgba(239, 68, 68, 0.35)",
+      strokeThickness: 1,
+      strokeDashArray: [2, 2],
+      strokeY1DashArray: [2, 2],
+      isVisible: this.layers.vwap,
+    });
+    this.surface.renderableSeries.add(this.supplyBandSeries);
+
+    this.demandBandDataSeries = new XyyDataSeries(wasmContext, {
+      containsNaN: true,
+      isSorted: true,
+    });
+    this.demandBandSeries = new FastBandRenderableSeries(wasmContext, {
+      dataSeries: this.demandBandDataSeries,
+      fill: "rgba(16, 185, 129, 0.12)",
+      fillY1: "rgba(16, 185, 129, 0.12)",
+      stroke: "rgba(16, 185, 129, 0.35)",
+      strokeY1: "rgba(16, 185, 129, 0.35)",
+      strokeThickness: 1,
+      strokeDashArray: [2, 2],
+      strokeY1DashArray: [2, 2],
+      isVisible: this.layers.vwap,
+    });
+    this.surface.renderableSeries.add(this.demandBandSeries);
+
     // --- Candlesticks ---
     // Candles are strictly time-ordered and never NaN: these flags let SciChart use
     // its fast resampling / binary-search paths instead of scanning.
@@ -621,16 +694,69 @@ export class TerminalChart {
     });
     this.surface.renderableSeries.add(this.candlestickSeries);
 
-    // --- Absorption markers (GPU): per size tier one scatter series per side plus
+    // --- Daily VWAP Curves and ±1σ Guides (REG v7.4) ---
+    this.upper1DataSeries = new XyDataSeries(wasmContext, {
+      containsNaN: true,
+      isSorted: true,
+    });
+    this.upper1LineSeries = new FastLineRenderableSeries(wasmContext, {
+      dataSeries: this.upper1DataSeries,
+      stroke: "rgba(0, 191, 255, 0.75)",
+      strokeThickness: 1,
+      strokeDashArray: [3, 3],
+      isVisible: this.layers.vwap,
+    });
+    this.surface.renderableSeries.add(this.upper1LineSeries);
+
+    this.lower1DataSeries = new XyDataSeries(wasmContext, {
+      containsNaN: true,
+      isSorted: true,
+    });
+    this.lower1LineSeries = new FastLineRenderableSeries(wasmContext, {
+      dataSeries: this.lower1DataSeries,
+      stroke: "rgba(255, 105, 180, 0.75)",
+      strokeThickness: 1,
+      strokeDashArray: [3, 3],
+      isVisible: this.layers.vwap,
+    });
+    this.surface.renderableSeries.add(this.lower1LineSeries);
+
+    this.vwapDataSeries = new XyDataSeries(wasmContext, {
+      containsNaN: true,
+      isSorted: true,
+    });
+    this.vwapLineSeries = new FastLineRenderableSeries(wasmContext, {
+      dataSeries: this.vwapDataSeries,
+      stroke: "#ff9800",
+      strokeThickness: 2,
+      isVisible: this.layers.vwap,
+    });
+    this.surface.renderableSeries.add(this.vwapLineSeries);
+
+    // Dynamic Axis Badge for live Daily VWAP
+    this.vwapAxisAnnotation = new HorizontalLineAnnotation({
+      y1: 0,
+      stroke: "transparent",
+      strokeThickness: 0,
+      showLabel: true,
+      labelValue: "d-VWAP",
+      labelPlacement: ELabelPlacement.Axis,
+      axisLabelFill: "#ff9800",
+      axisLabelStroke: "#000000",
+      isHidden: !this.layers.vwap,
+    });
+    this.surface.annotations.add(this.vwapAxisAnnotation);
+
+    // --- Absorption markers (GPU): per volume/effort tier one scatter series per side plus
     //     one text series for the numbers. Hundreds of markers cost one draw call per
     //     series instead of one SVG DOM node each, and pan/zoom no longer relayouts.
-    this.absorbLayers = {} as Record<AbsorbShape, AbsorbLayer>;
-    for (const shape of ABSORB_SHAPES) {
-      const battle = shape === "diamond";
-      const size = MARKER_PX[shape] * 2;
+    this.absorbLayers = {} as Record<AbsorbTier, AbsorbLayer>;
+    for (const tier of ABSORB_TIERS) {
+      const isXl = tier === "xl";
+      const size = TIER_DIAMETER_PX[tier];
       const scatter = {} as AbsorbLayer["scatter"];
       for (const side of ABSORB_SIDES) {
-        const col = bubblePaint(this.style, side, battle);
+        const col = bubblePaint(this.style, side, isXl);
         const data = new XyDataSeries(wasmContext, { containsNaN: false, isSorted: false });
         const rs = new XyScatterRenderableSeries(wasmContext, {
           dataSeries: data,
@@ -639,7 +765,7 @@ export class TerminalChart {
             height: size,
             fill: col.fill,
             stroke: col.stroke,
-            strokeThickness: col.strokeThickness,
+            strokeThickness: isXl ? 2 : tier === "lg" ? 1.8 : tier === "md" ? 1.5 : 1.2,
           }),
         });
         this.surface.renderableSeries.add(rs);
@@ -649,7 +775,7 @@ export class TerminalChart {
       const trs = new FastTextRenderableSeries(wasmContext, {
         dataSeries: tdata,
         dataLabels: {
-          style: { fontFamily: "Arial", fontSize: MARKER_FONT[shape] },
+          style: { fontFamily: "Arial", fontSize: TIER_FONT_SIZE[tier] },
           color: this.style.bubbleText,
           horizontalTextPosition: EHorizontalTextPosition.Center,
           verticalTextPosition: EVerticalTextPosition.Center,
@@ -657,7 +783,7 @@ export class TerminalChart {
         },
       });
       this.surface.renderableSeries.add(trs);
-      this.absorbLayers[shape] = { scatter, text: { data: tdata, rs: trs } };
+      this.absorbLayers[tier] = { scatter, text: { data: tdata, rs: trs } };
     }
 
     // --- Crosshair: native cursor (lines + axis badges), no SciChart tooltip — the
@@ -698,13 +824,17 @@ export class TerminalChart {
     this.layers[layer] = visible;
     this.applyLayerVisibility();
     // Vacuum + Hopla are annotation-based; force a rebuild from the last frame.
-    if ((layer === "vacuum" || layer === "hopla") && this.lastFrame) {
+    if (layer === "vacuum" || layer === "hopla") {
       if (layer === "vacuum") {
         this.vacuumSig = "";
-        this.updateVacuum(this.lastFrame);
-      } else {
+        if (this.lastFrame) this.updateVacuum(this.lastFrame);
+      } else if (layer === "hopla") {
         this.hoplaSig = "";
-        this.updateHopla(this.lastFrame);
+        if (this.lastFrame) this.updateHopla(this.lastFrame);
+      }
+    } else if (layer === "vwap" && visible) {
+      if (this.vwapDataSeries && this.vwapDataSeries.count() === 0 && this.historicalCandles.length > 0) {
+        this.rebuildDailyVwap();
       }
     }
     // Bubble-regime markers share the `bubbles` toggle; rebuild from last frame.
@@ -730,8 +860,8 @@ export class TerminalChart {
       }
     }
     if (this.absorbLayers) {
-      for (const shape of ABSORB_SHAPES) {
-        const l = this.absorbLayers[shape];
+      for (const tier of ABSORB_TIERS) {
+        const l = this.absorbLayers[tier];
         l.scatter.buy.rs.isVisible = this.layers.bubbles;
         l.scatter.sell.rs.isVisible = this.layers.bubbles;
         l.text.rs.isVisible = this.layers.bubbles;
@@ -739,6 +869,16 @@ export class TerminalChart {
     }
     for (const m of this.bubbleRegimeAnnotations)
       m.isHidden = !this.layers.bubbles;
+    if (this.supplyBandSeries) {
+      this.supplyBandSeries.isVisible = this.layers.vwap;
+      this.demandBandSeries.isVisible = this.layers.vwap;
+      this.upper1LineSeries.isVisible = this.layers.vwap;
+      this.lower1LineSeries.isVisible = this.layers.vwap;
+      this.vwapLineSeries.isVisible = this.layers.vwap;
+    }
+    if (this.vwapAxisAnnotation) {
+      this.vwapAxisAnnotation.isHidden = !this.layers.vwap || this.vwapAxisAnnotation.y1 <= 0;
+    }
     if (this.deltaPalette && this.candlestickSeries) {
       this.deltaPalette.enabled = this.layers.delta;
       const want = this.layers.delta ? this.deltaPalette : this.plainPalette;
@@ -758,15 +898,16 @@ export class TerminalChart {
     cs.strokeUp = style.candleUpWick;
     cs.strokeDown = style.candleDownWick;
     this.deltaPalette.setColors(style.candleUpBody, style.candleDownBody);
-    for (const shape of ABSORB_SHAPES) {
-      const layer = this.absorbLayers[shape];
+    for (const tier of ABSORB_TIERS) {
+      const layer = this.absorbLayers[tier];
+      const isXl = tier === "xl";
       for (const side of ABSORB_SIDES) {
-        const paint = bubblePaint(style, side, shape === "diamond");
+        const paint = bubblePaint(style, side, isXl);
         const pm = layer.scatter[side].rs.pointMarker;
         if (pm) {
           pm.fill = paint.fill;
           pm.stroke = paint.stroke;
-          pm.strokeThickness = paint.strokeThickness;
+          pm.strokeThickness = isXl ? 2 : tier === "lg" ? 1.8 : tier === "md" ? 1.5 : 1.2;
         }
       }
       layer.text.rs.dataLabelProvider.color = style.bubbleText;
@@ -874,6 +1015,7 @@ export class TerminalChart {
     }
 
     this.rebuildHeavyAbsorptions();
+    this.rebuildDailyVwap();
     this.liveFollow = true;
     this.invalidateView();
     this.applyLiveView();
@@ -907,6 +1049,15 @@ export class TerminalChart {
     this.sweepAnnotations = [];
     for (const a of this.signalAnnotations) this.surface?.annotations.remove(a);
     this.signalAnnotations = [];
+    this.vwapDataSeries?.clear();
+    this.upper1DataSeries?.clear();
+    this.lower1DataSeries?.clear();
+    this.supplyBandDataSeries?.clear();
+    this.demandBandDataSeries?.clear();
+    if (this.vwapAxisAnnotation) {
+      this.vwapAxisAnnotation.isHidden = true;
+      this.vwapAxisAnnotation.y1 = 0;
+    }
     this.bubblesSig = "";
     for (const a of this.bubbleRegimeAnnotations)
       this.surface?.annotations.remove(a);
@@ -932,6 +1083,15 @@ export class TerminalChart {
     this.vacuumAnnotations = [];
     this.hoplaAnnotations.forEach((a) => this.surface?.annotations.remove(a));
     this.hoplaAnnotations = [];
+    this.vwapDataSeries?.clear();
+    this.upper1DataSeries?.clear();
+    this.lower1DataSeries?.clear();
+    this.supplyBandDataSeries?.clear();
+    this.demandBandDataSeries?.clear();
+    if (this.vwapAxisAnnotation) {
+      this.vwapAxisAnnotation.isHidden = true;
+      this.vwapAxisAnnotation.y1 = 0;
+    }
     if (this.markPriceAnnotation) {
       this.surface?.annotations.remove(this.markPriceAnnotation);
       this.markPriceAnnotation = null;
@@ -946,6 +1106,7 @@ export class TerminalChart {
     const newCandle = this.updateCandles(frame, nowSec);
     if (newCandle) {
       this.rebuildHeavyAbsorptions();
+      this.rebuildDailyVwap();
     }
     this.updateHeatmap(frame, nowSec);
     if (frame.absorption_candidates && frame.absorption_candidates.length > 0) {
@@ -953,6 +1114,10 @@ export class TerminalChart {
     }
     this.updateVacuum(frame);
     this.updateHopla(frame);
+    if (frame.vwap_z) {
+      this.updateLiveVwapPoint(frame.vwap_z);
+    }
+    this.updateVwapAxisBadge(frame.vwap_z?.vwap);
     this.updateMarkPrice(frame.mid_price);
     // --- Audit R3: key levels + sweep markers + v7.5 institutional signals ---
     this.updateKeyLevels(frame);
@@ -1112,38 +1277,40 @@ export class TerminalChart {
     if (!this.absorbDirty || !this.absorbLayers) return;
     this.absorbDirty = false;
     type Buf = { x: number[]; y: number[] };
-    const pts: Record<AbsorbShape, Record<"buy" | "sell", Buf>> = {
-      circle: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
-      square: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
-      diamond: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
+    const pts: Record<AbsorbTier, Record<"buy" | "sell", Buf>> = {
+      sm: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
+      md: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
+      lg: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
+      xl: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
     };
-    const txt: Record<AbsorbShape, Buf & { t: string[] }> = {
-      circle: { x: [], y: [], t: [] },
-      square: { x: [], y: [], t: [] },
-      diamond: { x: [], y: [], t: [] },
+    const txt: Record<AbsorbTier, Buf & { t: string[] }> = {
+      sm: { x: [], y: [], t: [] },
+      md: { x: [], y: [], t: [] },
+      lg: { x: [], y: [], t: [] },
+      xl: { x: [], y: [], t: [] },
     };
     for (const g of this.absorbGroups.values()) {
       const y = groupPrice(g);
       if (y == null || !Number.isFinite(y)) continue;
-      const shape = groupShape(g);
-      pts[shape][g.side].x.push(g.bar);
-      pts[shape][g.side].y.push(y);
+      const tier = groupTier(g);
+      pts[tier][g.side].x.push(g.bar);
+      pts[tier][g.side].y.push(y);
       const label = groupLabel(g);
       if (label) {
-        txt[shape].x.push(g.bar);
-        txt[shape].y.push(y);
-        txt[shape].t.push(label);
+        txt[tier].x.push(g.bar);
+        txt[tier].y.push(y);
+        txt[tier].t.push(label);
       }
     }
-    for (const shape of ABSORB_SHAPES) {
-      const layer = this.absorbLayers[shape];
+    for (const tier of ABSORB_TIERS) {
+      const layer = this.absorbLayers[tier];
       for (const side of ABSORB_SIDES) {
         const { data } = layer.scatter[side];
         data.clear();
-        if (pts[shape][side].x.length) data.appendRange(pts[shape][side].x, pts[shape][side].y);
+        if (pts[tier][side].x.length) data.appendRange(pts[tier][side].x, pts[tier][side].y);
       }
       layer.text.data.clear();
-      if (txt[shape].x.length) layer.text.data.appendRange(txt[shape].x, txt[shape].y, txt[shape].t);
+      if (txt[tier].x.length) layer.text.data.appendRange(txt[tier].x, txt[tier].y, txt[tier].t);
     }
   }
 
@@ -1580,6 +1747,118 @@ export class TerminalChart {
       mk(h.line_3, "#00b4d8", `3% ${h.line_3.toFixed(2)}`, [4, 4]);
   }
 
+  /**
+   * Rebuild the continuous GPU Daily VWAP curve and Cornish-Fisher deviation bands.
+   * Matches REG-v7-4-light.pine (lines 2204-2255):
+   * - Daily anchor reset at UTC 00:00:00 with gaps (NaN) at day boundaries
+   * - Supply zone between +1.618σ and +2.618σ (red ribbon)
+   * - Demand zone between -1.618σ and -2.618σ (green ribbon)
+   * - Guide lines: +1.0σ (sky blue dashed), -1.0σ (pink dashed)
+   * - Center VWAP line: amber #ff9800 2px
+   */
+  private rebuildDailyVwap() {
+    if (!this.historicalCandles.length || !this.vwapDataSeries) return;
+
+    const bars = computeDailyVwapBars(this.historicalCandles);
+    if (!bars.length) return;
+
+    const xVals: number[] = [];
+    const vwapV: number[] = [];
+    const u1V: number[] = [];
+    const l1V: number[] = [];
+    const supY0: number[] = [];
+    const supY1: number[] = [];
+    const demY0: number[] = [];
+    const demY1: number[] = [];
+
+    for (let i = 0; i < bars.length; i++) {
+      const b = bars[i];
+      if (b.isNewDay && i > 0) {
+        // Insert gap strictly between previous bar time and new bar time
+        const prevTime = bars[i - 1].time;
+        const gapX = (prevTime + b.time) / 2;
+        xVals.push(gapX);
+        vwapV.push(NaN);
+        u1V.push(NaN);
+        l1V.push(NaN);
+        supY0.push(NaN);
+        supY1.push(NaN);
+        demY0.push(NaN);
+        demY1.push(NaN);
+      }
+      xVals.push(b.time);
+      vwapV.push(b.vwap);
+      u1V.push(b.upper1);
+      l1V.push(b.lower1);
+      supY0.push(b.fibUpper1);
+      supY1.push(b.fibUpper2);
+      demY0.push(b.fibLower1);
+      demY1.push(b.fibLower2);
+    }
+
+    this.vwapDataSeries.clear();
+    this.upper1DataSeries.clear();
+    this.lower1DataSeries.clear();
+    this.supplyBandDataSeries.clear();
+    this.demandBandDataSeries.clear();
+
+    this.vwapDataSeries.appendRange(xVals, vwapV);
+    this.upper1DataSeries.appendRange(xVals, u1V);
+    this.lower1DataSeries.appendRange(xVals, l1V);
+    this.supplyBandDataSeries.appendRange(xVals, supY0, supY1);
+    this.demandBandDataSeries.appendRange(xVals, demY0, demY1);
+
+    const lastBar = bars[bars.length - 1];
+    this.updateVwapAxisBadge(lastBar.vwap);
+  }
+
+  /** Update forming bar's VWAP point in place from live tick frame */
+  private updateLiveVwapPoint(vz: VwapZData) {
+    if (!this.layers.vwap || !this.vwapDataSeries) return;
+    const count = this.vwapDataSeries.count();
+    if (count === 0) return;
+    const lastIdx = count - 1;
+    if (vz.vwap != null && Number.isFinite(vz.vwap)) {
+      this.vwapDataSeries.update(lastIdx, vz.vwap);
+    }
+    if (vz.upper1 != null && Number.isFinite(vz.upper1)) {
+      this.upper1DataSeries.update(lastIdx, vz.upper1);
+    }
+    if (vz.lower1 != null && Number.isFinite(vz.lower1)) {
+      this.lower1DataSeries.update(lastIdx, vz.lower1);
+    }
+    if (
+      vz.fibUpper1 != null &&
+      Number.isFinite(vz.fibUpper1) &&
+      vz.fibUpper2 != null &&
+      Number.isFinite(vz.fibUpper2)
+    ) {
+      this.supplyBandDataSeries.update(lastIdx, vz.fibUpper1, vz.fibUpper2);
+    }
+    if (
+      vz.fibLower1 != null &&
+      Number.isFinite(vz.fibLower1) &&
+      vz.fibLower2 != null &&
+      Number.isFinite(vz.fibLower2)
+    ) {
+      this.demandBandDataSeries.update(lastIdx, vz.fibLower1, vz.fibLower2);
+    }
+  }
+
+  /** Update the amber d-VWAP badge on the price axis */
+  private updateVwapAxisBadge(price?: number | null) {
+    if (!this.vwapAxisAnnotation) return;
+    if (!this.layers.vwap) {
+      this.vwapAxisAnnotation.isHidden = true;
+      return;
+    }
+    if (price != null && Number.isFinite(price) && price > 0) {
+      this.vwapAxisAnnotation.isHidden = false;
+      this.vwapAxisAnnotation.y1 = price;
+      this.vwapAxisAnnotation.labelValue = `d-VWAP ${price.toFixed(2)}`;
+    }
+  }
+
   /** Render prior-day/week high/low key levels — only when signature changes. */
   private updateKeyLevels(frame: ChartFrame) {
     const kl = frame.key_levels;
@@ -1936,6 +2215,10 @@ export class TerminalChart {
   delete() {
     for (const a of this.hoplaAnnotations) this.surface?.annotations.remove(a);
     this.hoplaAnnotations = [];
+    if (this.vwapAxisAnnotation) {
+      this.surface?.annotations.remove(this.vwapAxisAnnotation);
+      this.vwapAxisAnnotation = null;
+    }
     for (const a of this.vacuumAnnotations) this.surface?.annotations.remove(a);
     this.vacuumAnnotations = [];
     for (const a of this.keyLevelAnnotations)
