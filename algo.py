@@ -41,7 +41,7 @@ class InstitutionalQuantEngine:
         df['vwap_upper_2'] = df['vwap'] + 2.0 * df['std']
         df['vwap_lower_2'] = df['vwap'] - 2.0 * df['std']
         df['vwap_upper_3'] = df['vwap'] + 3.0 * df['std']
-        df['vwap_lower_3'] = df['vwap'] - 2.0 * df['std']
+        df['vwap_lower_3'] = df['vwap'] - 3.0 * df['std']
         return df
 
     def detect_absorption(self, df: pd.DataFrame, window: int = 5, delta_mult: float = 2.0) -> pd.DataFrame:
@@ -119,7 +119,9 @@ class InstitutionalQuantEngine:
                     )
 
         # ─── SCENARIO 2: LONG SETUP (Passive Buyer Absorbing Aggressive Sellers at Floor) ───
-        if self.gex_regime == "LONG_GAMMA":
+        # Evaluate in any regime — SHORT_GAMMA may still produce valid long reversal signals;
+        # the regime weight (+20 pts) is already captured in the score above if applicable.
+        if True:
             at_location = False
             if latest['price'] <= latest['vwap_lower_2']:
                 confluences.append("Price <= VWAP -2.0 Sigma Band")
