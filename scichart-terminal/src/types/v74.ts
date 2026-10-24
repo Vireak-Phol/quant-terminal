@@ -219,7 +219,17 @@ export interface TimeframeFrame {
     vac_band: number
     unicorn: UnicornSetup[]
     liquidity: LiquidityLevel[]
-    key_levels: { pdh: number | null; pdl: number | null; pwh: number | null; pwl: number | null }
+    key_levels: {
+      pdh: number | null
+      pdl: number | null
+      pwh: number | null
+      pwl: number | null
+      globex_open?: number | null
+      call_wall?: number | null
+      put_wall?: number | null
+      gamma_flip?: number | null
+      net_gex?: string | null
+    }
     regob: RegObZone[]
     regression: { mid: number | null; upper: number | null; lower: number | null }
     events: StructureEvent[]

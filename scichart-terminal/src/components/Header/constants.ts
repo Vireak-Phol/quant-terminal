@@ -25,5 +25,6 @@ export const LAYER_META: LayerMeta[] = [
   { key: "vacuum", label: "Vacuum", icon: "vacuum", tone: "info", description: "Liquidity vacuum pockets & magnet" },
   { key: "hopla", label: "Hopla", icon: "hopla", tone: "gold", description: "Hopla 3 / 50 / 97 range" },
   { key: "vwap", label: "VWAP", icon: "vwap", tone: "gold", description: "Institutional VWAP & Cornish-Fisher Fib Deviation Bands (REG v7.4)" },
+  { key: "gex", label: "GEX & Open", icon: "gex", tone: "info", description: "Daily Globex Open & Options Gamma Exposure (Call Wall / Put Wall / Flip)" },
   { key: "delta", label: "Delta", icon: "delta", tone: "accent", description: "Volume-delta candle colouring" },
 ];

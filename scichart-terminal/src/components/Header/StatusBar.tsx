@@ -17,8 +17,17 @@ export const StatusBar = memo(function StatusBar({
       sync: s.data?.telemetry?.order_book_sync_state ?? "—",
       // Batch updates to every 50 events so React is not forced to reconcile 15x/sec
       events: Math.floor((s.data?.telemetry?.total_updates_processed ?? 0) / 50) * 50,
+      globex: s.data?.key_levels?.globex_open,
+      netGex: s.data?.key_levels?.net_gex,
+      gexRegime: s.data?.key_levels?.gex_regime,
+      callWall: s.data?.key_levels?.call_wall,
+      putWall: s.data?.key_levels?.put_wall,
     }),
-    (a, b) => a.sync === b.sync && a.events === b.events,
+    (a, b) =>
+      a.sync === b.sync &&
+      a.events === b.events &&
+      a.globex === b.globex &&
+      a.netGex === b.netGex,
   );
   return (
     <footer className="h-6 px-3 border-t border-terminal-border/70 bg-terminal-surface/95 flex items-center justify-between gap-4 text-2xs font-mono text-terminal-text-dim whitespace-nowrap overflow-hidden shrink-0 z-30">
@@ -35,9 +44,21 @@ export const StatusBar = memo(function StatusBar({
       </div>
       <div className="hidden xl:flex items-center gap-3">
         <span>{timeframe} candles</span>
+        {t.globex ? (
+          <span className="text-cyan-400">
+            Globex: <strong className="font-semibold">${t.globex.toFixed(2)}</strong>
+          </span>
+        ) : null}
+        {t.netGex ? (
+          <span
+            className={t.gexRegime === "POSITIVE_GEX" ? "text-emerald-400" : "text-rose-400"}
+            title={`Call Wall: $${t.callWall?.toFixed(2) ?? "—"} | Put Wall: $${t.putWall?.toFixed(2) ?? "—"}`}
+          >
+            GEX: <strong className="font-semibold">{t.netGex}</strong> ({t.gexRegime === "POSITIVE_GEX" ? "+GEX Pin" : "-GEX Vol"})
+          </span>
+        ) : null}
+        <span>· GEX Walls</span>
         <span>· Heatmap</span>
-        <span>· Absorption</span>
-        <span>· Vacuum / Hopla</span>
       </div>
       <div className="flex items-center gap-3">
         <span className="tabular-nums">Events {t.events.toLocaleString()}</span>

@@ -9,6 +9,7 @@ export type IconName =
   | "hopla"
   | "vwap"
   | "delta"
+  | "gex"
   | "fade"
   | "chevron"
   | "signals"
@@ -58,6 +59,14 @@ const PATHS: Record<IconName, JSX.Element> = {
     </>
   ),
   delta: <path d="M8 2.5 14 13.5H2Z" />,
+  gex: (
+    <>
+      <path d="M2 3.5h12" strokeDasharray="3 2" />
+      <path d="M2 8h12" />
+      <path d="M2 12.5h12" strokeDasharray="3 2" />
+      <circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none" />
+    </>
+  ),
   fade: (
     <>
       <path d="M2 4h12" />

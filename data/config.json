@@ -1,0 +1,23 @@
+{
+  "risk": {
+    "account_equity": 10001,
+    "risk_pct": 10,
+    "taker_fee_rate": 0.0002,
+    "slippage_ticks": 1,
+    "tick_size": 0.01,
+    "qty_step": 0.001,
+    "min_qty": 0.001,
+    "leverage_cap": 10.0,
+    "sl_mult": 1.5,
+    "tp1_mult": 2.0,
+    "tp2_mult": 3.5,
+    "min_risk_atr": 0.5,
+    "wall_anchor_atr": 0.5,
+    "wall_buffer_ticks": 5,
+    "horizon_bars": 20,
+    "max_trades_per_day": 5,
+    "daily_loss_limit_r": 3.0,
+    "max_consecutive_losses": 3,
+    "cost_heavy_r": 0.3
+  }
+}

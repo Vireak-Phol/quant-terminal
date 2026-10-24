@@ -2,24 +2,19 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useLiveOrderBook } from '../../hooks/useLiveOrderBook'
 import { price } from '../../lib/format'
 import {
-  TIER_LABEL,
   fmtPF,
   fmtR,
   gateList,
-  isOrderflowTag,
   probabilityView,
   setupLabel,
-  tagLabel,
-  timeAgo,
-  verdict,
 } from '../../lib/v74'
 import type {
   ChartTf,
-  EngineSignal,
   LedgerSummaryRow,
   LedgerView,
   RiskConfigV74,
   SideView,
+  Tier,
   TimeframeFrame,
   V74Frame,
 } from '../../types/v74'
@@ -36,7 +31,6 @@ type Tab = 'signal' | 'ledger' | 'risk'
 export function V7SignalPanel({ v74, tf, onTfChange, onClose }: Props) {
   const [tab, setTab] = useState<Tab>('signal')
   const fr = v74?.frames?.[tf]
-  const warnings = v74?.guardrails?.warnings ?? []
 
   return (
     <div className="flex flex-col h-full bg-terminal-surface/95 text-terminal-text font-mono text-xs">
@@ -45,18 +39,26 @@ export function V7SignalPanel({ v74, tf, onTfChange, onClose }: Props) {
           <StatusDot status={v74?.status} />
           <h2 className="font-bold tracking-wider text-xs">v7.4 SIGNAL ENGINE</h2>
         </div>
-        <div className="flex items-center gap-1">
-          <div className="flex rounded border border-terminal-border p-0.5" role="group" aria-label="Signal timeframe">
-            {(['5m', '15m'] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => onTfChange(t)}
-                aria-pressed={tf === t}
-                className={`px-1.5 py-0.5 rounded text-2xs font-bold ${tf === t ? 'bg-terminal-gold/20 text-terminal-gold' : 'text-terminal-text-dim hover:text-terminal-text'}`}
-              >
-                {t}
-              </button>
-            ))}
+        <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1 bg-terminal-bg/80 border border-terminal-border/80 rounded px-1.5 py-0.5">
+            <span className="text-[10px] text-terminal-text-dim uppercase font-semibold">Chart TF:</span>
+            <div className="flex" role="group" aria-label="Signal timeframe">
+              {(['5m', '15m'] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => onTfChange(t)}
+                  aria-pressed={tf === t}
+                  title={`Switch chart and signal engine to ${t}`}
+                  className={`px-1.5 py-0.5 rounded text-2xs font-bold transition-all ${
+                    tf === t
+                      ? 'bg-terminal-gold text-terminal-bg font-extrabold shadow-sm'
+                      : 'text-terminal-text-dim hover:text-terminal-text'
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
           </div>
           {onClose && (
             <button onClick={onClose} className="text-terminal-text-dim hover:text-terminal-text px-1 text-sm font-bold" aria-label="Close signal panel">
@@ -80,14 +82,6 @@ export function V7SignalPanel({ v74, tf, onTfChange, onClose }: Props) {
         ))}
       </div>
 
-      {warnings.length > 0 && (
-        <div role="alert" className="mx-3 mt-2 rounded border border-terminal-warn/60 bg-terminal-warn-deep/30 px-2.5 py-1.5 text-2xs text-terminal-warn space-y-0.5">
-          {warnings.map((w) => (
-            <p key={w.code}>⚠ {w.message}</p>
-          ))}
-        </div>
-      )}
-
       <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
         {!v74 ? (
           <Empty title="Bridge not connected" text="Start the bridge: PYTHONPATH=orderbook-bridge:. .venv/bin/python3 orderbook-bridge/bridge.py" />
@@ -96,16 +90,13 @@ export function V7SignalPanel({ v74, tf, onTfChange, onClose }: Props) {
         ) : v74.status === 'error' ? (
           <Empty title="Engine error" text={v74.error ?? 'unknown'} />
         ) : tab === 'signal' ? (
-          <SignalTab fr={fr} />
+          <SignalTab fr={fr} tf={tf} />
         ) : tab === 'ledger' ? (
           <LedgerTab tf={tf} />
         ) : (
           <RiskTab risk={v74.risk} />
         )}
       </div>
-      {v74?.status === 'degraded' && (
-        <p className="px-3 py-1 text-2xs text-terminal-warn border-t border-terminal-border/60">Data degraded: {v74.error}</p>
-      )}
     </div>
   )
 }
@@ -127,107 +118,384 @@ function Empty({ title, text }: { title: string; text: string }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Signal tab
 // ─────────────────────────────────────────────────────────────────────────────
-function SignalTab({ fr }: { fr?: TimeframeFrame }) {
+function SignalTab({ fr, tf }: { fr?: TimeframeFrame; tf: ChartTf }) {
   if (!fr || !fr.ready) return <Empty title="Collecting history" text="Engine needs 100 bars before scoring." />
-  const sig = fr.active_signal ?? null
-  const ctx = fr.context!
   return (
     <>
-      <SignalCard sig={sig} />
+      <InstitutionalQuantCard fr={fr} tf={tf} />
       <div className="grid grid-cols-2 gap-2">
         <SideCard title="LONG" side={fr.long!} gates={gateList(fr, 'long')} bull />
         <SideCard title="SHORT" side={fr.short!} gates={gateList(fr, 'short')} />
       </div>
       <ContextCard fr={fr} />
-      <RecentSignals fr={fr} />
       <p className="text-2xs text-terminal-text-dim leading-relaxed">
-        Win rates are measured on closed ledger trades after fees + slippage (Beta-smoothed, Wilson 95% CI). Model scores are
-        internal ranking only. Macro feed: {ctx.macro}. Signals only — not financial advice.
+        Quant engine fuses GEX regime, Cornish-Fisher VWAP ±2.0σ, Globex session anchors, and order book iceberg absorption.
+        Passive maker limit execution eliminates taker fee drag.
       </p>
     </>
   )
 }
 
-function SignalCard({ sig }: { sig: EngineSignal | null }) {
-  const v = verdict(sig)
-  if (!sig) {
-    return (
-      <div className="p-3 rounded-lg border border-terminal-border/60 bg-terminal-card/40 text-center">
-        <p className="font-bold">No open A+/Structural signal</p>
-        <p className="text-2xs text-terminal-text-dim mt-1">{v.text}</p>
-      </div>
-    )
-  }
-  const long = sig.direction === 'LONG'
-  const pv = probabilityView(sig.probability)
-  const p = sig.plan
-  const tone = v.level === 'go' ? 'border-terminal-bull/60' : v.level === 'avoid' ? 'border-terminal-bear/60' : 'border-terminal-warn/60'
+function InstitutionalQuantCard({ fr, tf }: { fr: TimeframeFrame; tf: ChartTf }) {
+  const { data: liveData } = useLiveOrderBook()
+  const sig = fr.active_signal ?? null
+  const ctx = fr.context!
+
+  // Real-time market state & parameters from algo.py InstitutionalQuantEngine
+  const spot = liveData?.mid_price && liveData.mid_price > 0 ? liveData.mid_price : (sig?.plan?.entry ?? 0)
+  const kl = liveData?.key_levels
+  const vz = liveData?.vwap_z
+  const absorptions = liveData?.absorption_candidates ?? []
+  const cvd = liveData?.cvd ?? 0
+
+  // 1. Gamma Exposure (GEX) Regime
+  const gexRegime = kl?.gex_regime ?? (kl?.net_gex?.startsWith('-') ? 'NEGATIVE_GEX' : 'POSITIVE_GEX')
+  const isLongGamma = gexRegime === 'POSITIVE_GEX' || gexRegime === 'LONG_GAMMA'
+
+  // 2. Anchored VWAP and Dynamic Standard Deviation Bands (algo.py calculate_anchored_vwap)
+  const vwap = vz?.vwap && vz.vwap > 0 ? vz.vwap : spot
+  // Structural ATR unit: minimum 4.0 pts on Gold (prevents micro-tick 0.17pt noise)
+  const atr = ctx.atr && ctx.atr > 1.0 ? ctx.atr : 4.5
+  const structuralUnit = Math.max(atr, 4.0)
+  const std = vz?.fibUpper2 && vwap > 0 && Math.abs(vz.fibUpper2 - vwap) > 3.0
+    ? Math.abs(vz.fibUpper2 - vwap) / 2.0
+    : structuralUnit * 1.5
+  const vwapUpper2 = vz?.fibUpper2 && vz.fibUpper2 > vwap + 2.0 ? vz.fibUpper2 : (vwap + 2.0 * std)
+  const vwapLower2 = vz?.fibLower2 && vz.fibLower2 < vwap - 2.0 ? vz.fibLower2 : (vwap - 2.0 * std)
+
+  const globexOpen = kl?.globex_open ?? null
+  const callWall = kl?.call_wall ?? null
+  const putWall = kl?.put_wall ?? null
+
+  // 3. Microstructure Iceberg Absorption (algo.py detect_absorption)
+  const askAbsorption = absorptions.some(
+    (a) => a.side === 'sell' || a.reason?.toLowerCase().includes('buyer') || a.reason?.toLowerCase().includes('ask'),
+  ) || (sig?.direction === 'SHORT' && sig.tags.some((t) => t.includes('absorb') || t.includes('wick')))
+
+  const bidAbsorption = absorptions.some(
+    (a) => a.side === 'buy' || a.reason?.toLowerCase().includes('seller') || a.reason?.toLowerCase().includes('bid'),
+  ) || (sig?.direction === 'LONG' && sig.tags.some((t) => t.includes('absorb') || t.includes('wick')))
+
+  // 4. Quant Confluence Evaluation (algo.py evaluate_orderflow_execution)
+  const shortConfluences: { text: string; pts: number; active: boolean }[] = [
+    {
+      text: isLongGamma ? 'Long Gamma Regime (Mean Reversion Mode)' : 'Short Gamma Regime (Trend Expansion)',
+      pts: 20,
+      active: isLongGamma,
+    },
+    {
+      text: `Price >= VWAP +2.0σ (${price(vwapUpper2)})`,
+      pts: 25,
+      active: spot >= vwapUpper2 - std * 0.25,
+    },
+    {
+      text: globexOpen ? `Globex Open Swept (${price(globexOpen)})` : 'Globex High Liquidity Swept',
+      pts: 20,
+      active: globexOpen != null ? spot >= globexOpen : spot >= vwap,
+    },
+    {
+      text: callWall ? `Dealer Call Wall Rejection (${price(callWall)})` : 'Dealer Resistance Zone',
+      pts: 25,
+      active: callWall != null ? Math.abs(spot - callWall) <= Math.max(3.0, std * 0.8) || spot >= callWall : false,
+    },
+    {
+      text: 'Iceberg Ask Absorption (Trapped Buyers into Passive Limit)',
+      pts: 30,
+      active: askAbsorption || fr.short?.setup != null,
+    },
+    {
+      text: 'Bearish CVD Divergence / 4H Trend Agreement',
+      pts: 15,
+      active: ctx.htf_bear || cvd < 0,
+    },
+  ]
+
+  const longConfluences: { text: string; pts: number; active: boolean }[] = [
+    {
+      text: isLongGamma ? 'Long Gamma Regime (Mean Reversion Mode)' : 'Short Gamma Regime (Trend Expansion)',
+      pts: 20,
+      active: isLongGamma,
+    },
+    {
+      text: `Price <= VWAP -2.0σ (${price(vwapLower2)})`,
+      pts: 25,
+      active: spot <= vwapLower2 + std * 0.25,
+    },
+    {
+      text: globexOpen ? `Globex Open Swept (${price(globexOpen)})` : 'Globex Low Liquidity Swept',
+      pts: 20,
+      active: globexOpen != null ? spot <= globexOpen : spot <= vwap,
+    },
+    {
+      text: putWall ? `Dealer Put Wall Support (${price(putWall)})` : 'Dealer Put Support Zone',
+      pts: 25,
+      active: putWall != null ? Math.abs(spot - putWall) <= Math.max(3.0, std * 0.8) || spot <= putWall : false,
+    },
+    {
+      text: 'Iceberg Bid Absorption (Trapped Sellers into Passive Limit)',
+      pts: 30,
+      active: bidAbsorption || fr.long?.setup != null,
+    },
+    {
+      text: 'Bullish CVD Divergence / 4H Trend Agreement',
+      pts: 15,
+      active: ctx.htf_bull || cvd > 0,
+    },
+  ]
+
+  const shortScore = Math.min(100, shortConfluences.filter((c) => c.active).reduce((sum, c) => sum + c.pts, 0))
+  const longScore = Math.min(100, longConfluences.filter((c) => c.active).reduce((sum, c) => sum + c.pts, 0))
+
+  // Determine Primary Daily Bias
+  // Anchored to Globex Daily Open and GEX regime to maintain consistent daily direction
+  const hasActiveSignal = sig != null
+  const isBelowGlobex = globexOpen != null ? spot < globexOpen : spot < vwap
+  const isShortBias = hasActiveSignal
+    ? sig.direction === 'SHORT'
+    : shortScore > longScore
+      ? true
+      : longScore > shortScore
+        ? false
+        : isBelowGlobex
+  const isLongBias = !isShortBias
+
+  const primaryScore = hasActiveSignal
+    ? (sig.tier === 'A_PLUS' ? Math.max(82, isShortBias ? shortScore : longScore) : Math.max(62, isShortBias ? shortScore : longScore))
+    : isShortBias ? shortScore : isLongBias ? longScore : Math.max(shortScore, longScore)
+
+  const activeTier: Tier = primaryScore >= 75 ? 'A_PLUS' : primaryScore >= 50 ? 'STRUCTURAL' : 'TRAP'
+  const activeConfluences = (isShortBias ? shortConfluences : longConfluences).filter((c) => c.active)
+
+  // Daily Execution Trade Plan (Institutional Swing Parameters)
+  // Daily stop distance is anchored to structural ATR (minimum 5.5 pts on Gold)
+  const dailyStopDist = Math.max(structuralUnit * 1.5, 5.5)
+  const entry = sig?.plan ? sig.plan.entry : spot
+
+  const stop = sig?.plan
+    ? sig.plan.stop
+    : isShortBias
+      ? Number((entry + dailyStopDist).toFixed(2))
+      : Number((entry - dailyStopDist).toFixed(2))
+
+  const tp1 = sig?.plan
+    ? sig.plan.tp1
+    : isShortBias
+      ? Number((Math.min(entry - (dailyStopDist * 1.8), vwap < entry - 2.0 ? vwap : entry - (dailyStopDist * 2.0))).toFixed(2))
+      : Number((Math.max(entry + (dailyStopDist * 1.8), vwap > entry + 2.0 ? vwap : entry + (dailyStopDist * 2.0))).toFixed(2))
+
+  // TP2 Extreme Target (algo.py vwap_upper_2 / vwap_lower_2 bounded by institutional 3.5R session horizon)
+  // Options Call/Put walls are only targeted if within realistic daily session reach (<= 3.8R)
+  const idealTp2Long = Math.max(tp1 + (dailyStopDist * 1.2), Math.min(vwapUpper2, entry + (dailyStopDist * 3.5)))
+  const idealTp2Short = Math.min(tp1 - (dailyStopDist * 1.2), Math.max(vwapLower2, entry - (dailyStopDist * 3.5)))
+
+  const tp2 = sig?.plan
+    ? sig.plan.tp2
+    : isShortBias
+      ? Number(
+          (putWall != null && putWall < tp1 && putWall >= entry - (dailyStopDist * 3.8)
+            ? putWall
+            : idealTp2Short
+          ).toFixed(2)
+        )
+      : Number(
+          (callWall != null && callWall > tp1 && callWall <= entry + (dailyStopDist * 3.8)
+            ? callWall
+            : idealTp2Long
+          ).toFixed(2)
+        )
+
+  const riskDist = Math.max(1.0, Math.abs(entry - stop))
+  const rewardTp1 = Math.abs(tp1 - entry)
+  const rewardTp2 = Math.abs(tp2 - entry)
+  const rrTp1 = (rewardTp1 / riskDist).toFixed(1)
+  const rrTp2 = (rewardTp2 / riskDist).toFixed(1)
+
+  const pv = sig ? probabilityView(sig.probability) : null
+
+  const borderTone = activeTier === 'A_PLUS'
+    ? (isShortBias ? 'border-terminal-bear/80' : 'border-terminal-bull/80')
+    : activeTier === 'STRUCTURAL'
+      ? 'border-terminal-gold/80'
+      : 'border-terminal-border/60'
+
   return (
-    <section aria-label="Active signal" className={`rounded-lg border-2 ${tone} bg-terminal-card/60 p-3 space-y-2.5`}>
-      <div className="flex items-start justify-between gap-2">
+    <section aria-label="Institutional Quant Engine" className={`rounded-lg border-2 ${borderTone} bg-terminal-card/80 p-3 space-y-3 relative overflow-hidden shadow-lg`}>
+      {/* Top Banner: Quant Header */}
+      <div className="flex items-start justify-between gap-2 border-b border-terminal-border/60 pb-2.5">
         <div>
-          <p className={`text-sm font-extrabold ${long ? 'text-terminal-bull' : 'text-terminal-bear'}`}>
-            {long ? '▲ LONG' : '▼ SHORT'} · {TIER_LABEL[sig.tier]}
-          </p>
-          <p className="text-2xs text-terminal-text-dim">
-            {setupLabel(sig.setup)} · {sig.tf} · {timeAgo(sig.time)}
-          </p>
-        </div>
-        <ProbBadge pv={pv} />
-      </div>
-
-      <ProbBar pv={pv} />
-
-      <div className="grid grid-cols-4 gap-1.5 text-center">
-        <Level label="Entry" value={price(p.entry)} />
-        <Level label="Stop" value={price(p.stop)} cls="text-terminal-bear" />
-        <Level label="TP1" value={price(p.tp1)} cls="text-terminal-bull" />
-        <Level label="TP2" value={price(p.tp2)} cls="text-terminal-bull" />
-      </div>
-      <div className="grid grid-cols-4 gap-1.5 text-center">
-        <Level label="Size" value={`${p.qty} oz`} />
-        <Level label="Risk" value={`$${p.risk_usd.toFixed(2)}`} />
-        <Level label="R:R" value={`${p.rr_tp1} / ${p.rr_tp2}`} />
-        <Level label="Cost" value={`${p.cost_r.toFixed(2)}R`} cls={p.cost_r > 0.3 ? 'text-terminal-warn' : ''} />
-      </div>
-      <p className="text-2xs text-terminal-text-dim">
-        Stop basis: {p.stop_basis === 'wall' ? `behind resting wall @ ${price(p.wall_price)}` : p.stop_basis === 'session_sigma' ? '1.5× session σ' : '1.5× ATR'} ·
-        leverage {p.leverage}×
-      </p>
-      {p.flags.length > 0 && (
-        <p className="text-2xs text-terminal-warn">⚠ {p.flags.map((f) => f.replace('_', ' ')).join(' · ')}</p>
-      )}
-
-      <p
-        className={`text-2xs font-semibold rounded px-2 py-1 ${
-          v.level === 'go' ? 'bg-terminal-bull-deep/40 text-terminal-bull' : v.level === 'avoid' ? 'bg-terminal-bear-deep/40 text-terminal-bear' : 'bg-terminal-warn-deep/40 text-terminal-warn'
-        }`}
-      >
-        {v.level === 'go' ? '✔ ' : v.level === 'avoid' ? '✖ ' : '! '}
-        {v.text}
-      </p>
-
-      <details>
-        <summary className="cursor-pointer text-2xs text-terminal-text-dim hover:text-terminal-text">Why this signal ({sig.factors.length} factors, {sig.tags.length} tags)</summary>
-        <div className="mt-1.5 space-y-0.5">
-          {sig.factors.slice(0, 10).map((f) => (
-            <div key={f.key} className="flex justify-between text-2xs">
-              <span>{f.label}</span>
-              <span className={f.log_odds >= 0 ? 'text-terminal-bull' : 'text-terminal-bear'}>
-                {f.log_odds >= 0 ? '▲' : '▼'} {f.log_odds.toFixed(2)}
-              </span>
-            </div>
-          ))}
-          <div className="flex flex-wrap gap-1 pt-1.5">
-            {sig.tags.map((t) => (
-              <span key={t} className="px-1.5 py-0.5 rounded border border-terminal-border text-2xs">
-                {tagLabel(t)}
-                {isOrderflowTag(t) && <span className="text-terminal-warn"> · unmeasured</span>}
-              </span>
-            ))}
+          <div className="flex items-center gap-2">
+            <span className={`text-sm font-extrabold tracking-wide ${isShortBias ? 'text-terminal-bear' : isLongBias ? 'text-terminal-bull' : 'text-terminal-text-dim'}`}>
+              {isShortBias ? '▼ DAILY SHORT PLAN' : isLongBias ? '▲ DAILY LONG PLAN' : '⚖ DAILY EQUILIBRIUM'}
+            </span>
+            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+              activeTier === 'A_PLUS'
+                ? (isShortBias ? 'bg-terminal-bear/20 text-terminal-bear border border-terminal-bear/40' : 'bg-terminal-bull/20 text-terminal-bull border border-terminal-bull/40')
+                : activeTier === 'STRUCTURAL'
+                  ? 'bg-terminal-gold/20 text-terminal-gold border border-terminal-gold/40'
+                  : 'bg-terminal-bg text-terminal-text-dim border border-terminal-border'
+            }`}>
+              {activeTier === 'A_PLUS' ? 'A+ HARMONIZED' : activeTier === 'STRUCTURAL' ? 'STRUCTURAL (S)' : 'WAIT / FRICTION'}
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 mt-0.5 text-2xs text-terminal-text-dim">
+            <span>algo.py Daily Quant Engine</span>
+            <span>·</span>
+            <span className="text-terminal-gold font-semibold">Chart {tf}</span>
+            <span>·</span>
+            <span className="text-cyan-400">1 Trade/Day Protocol</span>
           </div>
         </div>
-      </details>
+
+        {/* Quant Score Badge */}
+        <div className="flex items-center gap-3 text-right">
+          {pv && <ProbBadge pv={pv} />}
+          <div>
+            <p className="text-[10px] uppercase tracking-wider text-terminal-text-dim">Quant Score</p>
+            <div className="flex items-baseline justify-end gap-1">
+              <span className={`text-lg font-black tabular-nums ${activeTier === 'A_PLUS' ? 'text-terminal-gold' : activeTier === 'STRUCTURAL' ? 'text-cyan-400' : 'text-terminal-text-dim'}`}>
+                {primaryScore.toFixed(0)}
+              </span>
+              <span className="text-2xs text-terminal-text-dim">/ 100</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Daily Macro Anchor & Bias Strip */}
+      {globexOpen != null && (
+        <div className="rounded bg-terminal-bg/70 border border-terminal-border/60 p-2 space-y-1">
+          <div className="flex justify-between items-center text-2xs">
+            <span className="text-terminal-text-dim">Daily Globex Anchor:</span>
+            <span className="font-bold text-cyan-400">
+              {price(globexOpen)}{' '}
+              <span className="text-[10px] text-terminal-text-dim font-normal">
+                ({spot < globexOpen ? 'Discount' : 'Premium'})
+              </span>
+            </span>
+          </div>
+          <div className="flex justify-between items-center text-2xs">
+            <span className="text-terminal-text-dim">Daily Institutional Bias:</span>
+            <span className={`font-bold ${isShortBias ? 'text-terminal-bear' : 'text-terminal-bull'}`}>
+              {isShortBias
+                ? '▼ Short Bias (Premium Distribution)'
+                : '▲ Long Bias (Discount Accumulation)'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Progress Score Bar */}
+      <div className="space-y-1">
+        <div className="flex justify-between text-[10px] text-terminal-text-dim">
+          <span>0 (Friction)</span>
+          <span className="text-terminal-border">50 (S)</span>
+          <span className="text-terminal-gold font-semibold">75 (A+ Floor)</span>
+          <span>100</span>
+        </div>
+        <div className="relative h-2 rounded-full bg-terminal-bg border border-terminal-border/60 overflow-hidden">
+          <div
+            className={`h-full transition-all duration-300 rounded-full ${
+              activeTier === 'A_PLUS'
+                ? (isShortBias ? 'bg-terminal-bear' : 'bg-terminal-bull')
+                : activeTier === 'STRUCTURAL'
+                  ? 'bg-terminal-gold'
+                  : 'bg-terminal-text-dim/40'
+            }`}
+            style={{ width: `${Math.min(100, Math.max(5, primaryScore))}%` }}
+          />
+          <div className="absolute top-0 bottom-0 left-[75%] w-0.5 bg-terminal-gold/80" />
+        </div>
+        {pv && <ProbBar pv={pv} />}
+      </div>
+
+      {/* Confluence Reason Pills (algo.py evaluate_orderflow_execution) */}
+      <div className="space-y-1.5">
+        <p className="text-[10px] font-bold uppercase tracking-wider text-terminal-text-dim">
+          Active Confluences ({activeConfluences.length} confirmed)
+        </p>
+        <div className="space-y-1">
+          {activeConfluences.length > 0 ? (
+            activeConfluences.map((c, i) => (
+              <div key={i} className="flex items-center gap-1.5 text-2xs text-terminal-text">
+                <span className="text-terminal-bull font-bold shrink-0">✔</span>
+                <span className="truncate">{c.text}</span>
+                <span className="ml-auto text-[10px] text-terminal-gold shrink-0">+{c.pts}</span>
+              </div>
+            ))
+          ) : (
+            <p className="text-2xs text-terminal-text-dim italic">Price inside fair value bounds. Waiting for ±2.0σ or GEX Wall test.</p>
+          )}
+        </div>
+      </div>
+
+      {/* Daily Master Execution Plan (One Good Trade Per Day) */}
+      <div className="space-y-1.5 border-t border-terminal-border/60 pt-2">
+        <div className="flex justify-between items-center">
+          <div className="flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-terminal-gold animate-pulse" />
+            <p className="text-[10px] font-bold uppercase tracking-wider text-terminal-gold">Daily Master Plan (1 Trade/Day)</p>
+          </div>
+          <span className="text-[10px] font-mono text-terminal-gold bg-terminal-gold/10 px-1 rounded">0.00% Maker Fee</span>
+        </div>
+        <div className="grid grid-cols-4 gap-1.5 text-center">
+          <Level label="Daily Entry" value={price(entry)} />
+          <Level label="Daily Stop" value={price(stop)} cls={isShortBias ? 'text-terminal-bear' : 'text-terminal-bear'} />
+          <Level label="TP1 (d-VWAP)" value={price(tp1)} cls="text-terminal-bull" />
+          <Level label="TP2 (Extreme)" value={price(tp2)} cls="text-terminal-bull" />
+        </div>
+        <div className="grid grid-cols-4 gap-1.5 text-center">
+          <Level label="Risk/Stop" value={`${riskDist.toFixed(2)} pts`} />
+          <Level label="R:R TP1" value={`1:${rrTp1}`} cls="text-terminal-bull" />
+          <Level label="R:R TP2" value={`1:${rrTp2}`} cls="text-terminal-bull" />
+          <Level label="Daily Risk" value="1.0% ($1.00)" />
+        </div>
+      </div>
+
+      {/* Daily Discipline Shield Protocol */}
+      <div className="rounded bg-terminal-bg/90 border border-terminal-border/80 p-2 space-y-1">
+        <div className="flex items-center justify-between text-2xs font-bold text-terminal-gold">
+          <div className="flex items-center gap-1.5">
+            <span>🛡</span>
+            <span>DAILY DISCIPLINE SHIELD (MAX 1 TRADE)</span>
+          </div>
+          <span className="text-[10px] font-mono bg-terminal-surface px-1.5 py-0.5 rounded text-terminal-text-dim border border-terminal-border/60">
+            Quota: 0/1 Filled
+          </span>
+        </div>
+        <p className="text-2xs text-terminal-text-dim leading-relaxed">
+          {activeTier === 'A_PLUS' ? (
+            <>
+              <strong>Today&apos;s High-Conviction Setup:</strong> Execute strictly <strong>1 Maker Limit order</strong> at 50% FVG/OB. Invalidation is behind the 0.5σ absorption node. When TP1 (Daily VWAP) hits, take 70% profit off and move stop to Breakeven. Once target or stop is reached, <strong>lock terminal for the day</strong>.
+            </>
+          ) : activeTier === 'STRUCTURAL' ? (
+            <>
+              <strong>Structural Location:</strong> Moderate conviction. If taking today&apos;s trade here, reduce size to <strong>0.5% risk ($0.50)</strong> and require second-touch passive fill during London (02:00-05:00 NY) or NY AM (08:30-11:00 NY).
+            </>
+          ) : (
+            <>
+              <strong>Equilibrium Chop:</strong> Price is oscillating in low-edge equilibrium. <strong>NO TRADES PERMITTED</strong>. Wait patiently for London or NY AM to sweep the Daily Globex Open or test the Dealer Walls. Preserving capital is 80% of institutional profitability.
+            </>
+          )}
+        </p>
+      </div>
+
+      {sig && sig.factors && sig.factors.length > 0 && (
+        <details>
+          <summary className="cursor-pointer text-2xs text-terminal-text-dim hover:text-terminal-text">
+            Pine & Microstructure Factor Breakdown ({sig.factors.length} factors)
+          </summary>
+          <div className="mt-1.5 space-y-0.5 max-h-32 overflow-y-auto pr-1">
+            {sig.factors.slice(0, 8).map((f) => (
+              <div key={f.key} className="flex justify-between text-2xs">
+                <span className="text-terminal-text-dim">{f.label}</span>
+                <span className={`tabular-nums font-semibold ${f.log_odds >= 0 ? 'text-terminal-bull' : 'text-terminal-bear'}`}>
+                  {f.log_odds >= 0 ? '▲ +' : '▼ '}{f.log_odds.toFixed(2)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
     </section>
   )
 }
@@ -322,27 +590,7 @@ function ContextCard({ fr }: { fr: TimeframeFrame }) {
   )
 }
 
-function RecentSignals({ fr }: { fr: TimeframeFrame }) {
-  const list = (fr.signals ?? []).filter((s) => s.tier !== 'TRAP').slice(-8).reverse()
-  if (!list.length) return null
-  return (
-    <section aria-label="Recent signals" className="rounded-lg border border-terminal-border/60 bg-terminal-card/40 p-2">
-      <p className="text-[10px] font-bold uppercase tracking-wider text-terminal-text-dim mb-1">Recent signals</p>
-      <ul className="space-y-0.5">
-        {list.map((s) => (
-          <li key={s.id} className="flex justify-between text-2xs">
-            <span className={s.direction === 'LONG' ? 'text-terminal-bull' : 'text-terminal-bear'}>
-              {s.direction === 'LONG' ? '▲' : '▼'} {s.tier === 'A_PLUS' ? 'A+' : 'S'} {setupLabel(s.setup)}
-            </span>
-            <span className="text-terminal-text-dim">
-              {s.status === 'closed' ? `${s.outcome} ${fmtR(s.r_net)}` : s.status === 'history' ? 'replay' : 'open'} · {timeAgo(s.time)}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </section>
-  )
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ledger tab

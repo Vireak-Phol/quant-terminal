@@ -136,7 +136,16 @@ export interface LiveOrderBookData {
     london: boolean; ny_am: boolean; asia: boolean; london_fix: boolean; name: string
   }
   key_levels?: {
-    pdh: number | null; pdl: number | null; pwh: number | null; pwl: number | null
+    pdh: number | null;
+    pdl: number | null;
+    pwh: number | null;
+    pwl: number | null;
+    globex_open?: number | null;
+    call_wall?: number | null;
+    put_wall?: number | null;
+    gamma_flip?: number | null;
+    net_gex?: string | null;
+    gex_regime?: string | null;
   }
   sweep_events?: Array<{ kind: 'liq_sweep'; time: number; price: number; dir: number }>
   // --- Bubble Regime engine: OI + liquidation classified sweeps ---

@@ -16,7 +16,11 @@ import {
 } from "./chart/TerminalChart";
 import { configureSciChart } from "./chart/scichart-init";
 import { fetchChartKlines } from "./lib/klines";
-import { loadChartStyle, saveChartStyle, type ChartStyle } from "./lib/chartStyle";
+import {
+  loadChartStyle,
+  saveChartStyle,
+  type ChartStyle,
+} from "./lib/chartStyle";
 import { price } from "./lib/format";
 import { newAplusSignals, playChime } from "./lib/alerts";
 import { probabilityView, setupLabel } from "./lib/v74";
@@ -37,7 +41,11 @@ import { ErrorBoundary } from "./components/Shared/ErrorBoundary";
 import { HeaderToolbar } from "./components/Header/HeaderToolbar";
 import { StatusBar } from "./components/Header/StatusBar";
 import { SignalDock } from "./components/Header/SignalDock";
-import { CHART_DIV_ID, HISTORY_LIMIT, LAYER_META } from "./components/Header/constants";
+import {
+  CHART_DIV_ID,
+  HISTORY_LIMIT,
+  LAYER_META,
+} from "./components/Header/constants";
 
 configureSciChart();
 
@@ -62,8 +70,8 @@ export default function App() {
   const chartRef = useRef<TerminalChart | null>(null);
   const readyRef = useRef(false);
 
-  const [timeframe, setTimeframe] = useState<Timeframe>("1m");
-  const timeframeRef = useRef<Timeframe>("1m");
+  const [timeframe, setTimeframe] = useState<Timeframe>("5m");
+  const timeframeRef = useRef<Timeframe>("5m");
   const [isLoadingKlines, setIsLoadingKlines] = useState(false);
 
   // Active market-data venue (Binance / OANDA) — drives labels + layer gating.
@@ -97,6 +105,7 @@ export default function App() {
     vacuum: true,
     hopla: true,
     vwap: true,
+    gex: true,
     delta: false,
   });
 
@@ -105,17 +114,24 @@ export default function App() {
   const layerUnavailable = useMemo<Record<ChartLayer, string | null>>(() => {
     const caps = venue.capabilities;
     return {
-      heatmap: caps.l2_depth ? null : `${venue.label} has no market depth (quotes only)`,
+      heatmap: caps.l2_depth
+        ? null
+        : `${venue.label} has no market depth (quotes only)`,
       bubbles: null,
       vacuum: null,
       hopla: null,
       vwap: null,
-      delta: caps.delta === "exchange" ? null : `${venue.label} has no aggressor (taker) volume`,
+      gex: null,
+      delta:
+        caps.delta === "exchange"
+          ? null
+          : `${venue.label} has no aggressor (taker) volume`,
     };
   }, [venue]);
   const effectiveLayers = useMemo(() => {
     const out = { ...layers };
-    for (const k of Object.keys(out) as ChartLayer[]) if (layerUnavailable[k]) out[k] = false;
+    for (const k of Object.keys(out) as ChartLayer[])
+      if (layerUnavailable[k]) out[k] = false;
     return out;
   }, [layers, layerUnavailable]);
 
@@ -156,7 +172,10 @@ export default function App() {
 
   const toggleSignals = useCallback(() => setShowSignals((v) => !v), []);
   const toggleDomLadder = useCallback(() => setShowDomLadder((v) => !v), []);
-  const toggleDiagnostics = useCallback(() => setShowDiagnostics((v) => !v), []);
+  const toggleDiagnostics = useCallback(
+    () => setShowDiagnostics((v) => !v),
+    [],
+  );
   const toggleOrderFlow = useCallback(() => setShowOrderFlow((v) => !v), []);
 
   const [soundOn, setSoundOn] = useState<boolean>(
@@ -205,28 +224,27 @@ export default function App() {
   // A monotonically increasing token drops stale responses when the timeframe or
   // venue changes while a request is in flight.
   const loadSeqRef = useRef(0);
-  const loadKlines = useCallback(
-    async (tf: Timeframe) => {
-      const seq = ++loadSeqRef.current;
-      const v = venueRef.current ?? DEFAULT_VENUE;
-      setIsLoadingKlines(true);
-      try {
-        const res = await fetchChartKlines(
-          getSharedSocket(DEFAULT_BRIDGE_URL),
-          v.name,
-          v.symbol,
-          tf,
-          HISTORY_LIMIT,
-        );
-        if (seq !== loadSeqRef.current || timeframeRef.current !== tf) return;
-        if (res.candles.length > 0) chartRef.current?.loadHistoricalCandles(res.candles);
-        else if (res.error) addToastRef.current(`History unavailable: ${res.error}`, "bear");
-      } finally {
-        if (seq === loadSeqRef.current) setIsLoadingKlines(false);
-      }
-    },
-    [],
-  );
+  const loadKlines = useCallback(async (tf: Timeframe) => {
+    const seq = ++loadSeqRef.current;
+    const v = venueRef.current ?? DEFAULT_VENUE;
+    setIsLoadingKlines(true);
+    try {
+      const res = await fetchChartKlines(
+        getSharedSocket(DEFAULT_BRIDGE_URL),
+        v.name,
+        v.symbol,
+        tf,
+        HISTORY_LIMIT,
+      );
+      if (seq !== loadSeqRef.current || timeframeRef.current !== tf) return;
+      if (res.candles.length > 0)
+        chartRef.current?.loadHistoricalCandles(res.candles);
+      else if (res.error)
+        addToastRef.current(`History unavailable: ${res.error}`, "bear");
+    } finally {
+      if (seq === loadSeqRef.current) setIsLoadingKlines(false);
+    }
+  }, []);
   const loadKlinesRef = useRef(loadKlines);
   useEffect(() => {
     loadKlinesRef.current = loadKlines;
@@ -244,7 +262,7 @@ export default function App() {
     legendRafRef.current = requestAnimationFrame(() => {
       legendRafRef.current = 0;
       legendRef.current?.update(
-        crosshairRef.current ? chartRef.current?.getReadout() ?? null : null,
+        crosshairRef.current ? (chartRef.current?.getReadout() ?? null) : null,
       );
     });
   }, []);
@@ -431,13 +449,27 @@ export default function App() {
   }, [addToast, scheduleLegend]);
 
   // ── Timeframe switching ──────────────────────────────────────────────────
-  const changeTimeframe = useCallback(async (tf: Timeframe) => {
-    if (tf === timeframeRef.current) return;
-    timeframeRef.current = tf;
-    setTimeframe(tf);
-    chartRef.current?.setTimeframe(tf);
-    await loadKlines(tf);
-  }, [loadKlines]);
+  const changeTimeframe = useCallback(
+    async (tf: Timeframe) => {
+      if (tf === timeframeRef.current) return;
+      timeframeRef.current = tf;
+      setTimeframe(tf);
+      if (tf === "5m" || tf === "15m") {
+        setSignalTf(tf);
+      }
+      chartRef.current?.setTimeframe(tf);
+      await loadKlines(tf);
+    },
+    [loadKlines],
+  );
+
+  const handleSignalTfChange = useCallback(
+    (tf: ChartTf) => {
+      setSignalTf(tf);
+      void changeTimeframe(tf as Timeframe);
+    },
+    [changeTimeframe],
+  );
 
   const resetView = useCallback(() => chartRef.current?.resetView(), []);
 
@@ -450,7 +482,8 @@ export default function App() {
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
-    for (const { key } of LAYER_META) chart.setLayerVisibility(key, effectiveLayers[key]);
+    for (const { key } of LAYER_META)
+      chart.setLayerVisibility(key, effectiveLayers[key]);
   }, [effectiveLayers]);
 
   // ── Click-to-inspect absorption bubbles ──────────────────────────────────
@@ -546,7 +579,7 @@ export default function App() {
               <ErrorBoundary title="Signal Panel">
                 <SignalDock
                   tf={signalTf}
-                  onTfChange={setSignalTf}
+                  onTfChange={handleSignalTfChange}
                   onClose={toggleSignals}
                 />
               </ErrorBoundary>

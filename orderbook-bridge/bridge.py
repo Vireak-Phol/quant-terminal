@@ -223,6 +223,28 @@ hub = LiveHub(
     risk_defaults=VENUE.risk_defaults,
 )
 _v74_cache: Dict[str, Any] = {"version": -1, "at": 0.0, "frame": None}
+_gex_cache: Dict[str, Any] = {"at": 0.0, "levels": None}
+
+
+def get_live_gex(mid_price: float) -> Dict:
+    now = time.time()
+    if _gex_cache["levels"] is None or (now - _gex_cache["at"]) > 180.0:
+        try:
+            from engine.gamma import get_gamma_engine
+            g_eng = get_gamma_engine()
+            _gex_cache["levels"] = g_eng.compute_gamma_levels(mid_price or 4000.0)
+            _gex_cache["at"] = now
+        except Exception as e:
+            logger.warning(f"GEX computation error: {e}")
+            if not _gex_cache["levels"]:
+                _gex_cache["levels"] = {
+                    "call_wall": None,
+                    "put_wall": None,
+                    "gamma_flip": None,
+                    "net_gex_label": None,
+                    "regime": "NEUTRAL",
+                }
+    return _gex_cache["levels"]
 
 
 def refresh_v74_frame() -> bool:
@@ -313,6 +335,12 @@ terminal_state: Dict[str, Any] = {
         "pdl": None,
         "pwh": None,
         "pwl": None,
+        "globex_open": None,
+        "call_wall": None,
+        "put_wall": None,
+        "gamma_flip": None,
+        "net_gex": None,
+        "gex_regime": None,
     },
     "sweep_events": [],  # recent liq_sweep StructureEvent from v74
     "telemetry": {
@@ -452,25 +480,35 @@ async def on_depth_update(book: LocalOrderBook):
         "name": sess.name,
     }
 
-    # Extract key levels and recent sweep events from the v74 frame (if available)
+    # Extract key levels, Globex open, GEX, and recent sweep events from the v74 frame
+    mid = terminal_state["mid_price"] or 4000.0
+    gex_data = get_live_gex(mid)
     v74_frame = _v74_cache.get("frame")
+    kl: Dict[str, Any] = {}
     if v74_frame:
         # Key levels come from the first ready timeframe in frames
         for tf_name, tf_frame in (v74_frame.get("frames") or {}).items():
             struct = tf_frame.get("structure") if tf_frame else None
             if struct:
                 kl = struct.get("key_levels") or {}
-                terminal_state["key_levels"] = {
-                    "pdh": kl.get("pdh"),
-                    "pdl": kl.get("pdl"),
-                    "pwh": kl.get("pwh"),
-                    "pwl": kl.get("pwl"),
-                }
                 # Sweep events: keep the last 20 for the chart overlay
                 events = struct.get("events") or []
                 sweeps = [e for e in events if e.get("kind") == "liq_sweep"]
                 terminal_state["sweep_events"] = sweeps[-20:]
                 break  # use the first ready timeframe
+
+    terminal_state["key_levels"] = {
+        "pdh": kl.get("pdh"),
+        "pdl": kl.get("pdl"),
+        "pwh": kl.get("pwh"),
+        "pwl": kl.get("pwl"),
+        "globex_open": kl.get("globex_open"),
+        "call_wall": gex_data.get("call_wall"),
+        "put_wall": gex_data.get("put_wall"),
+        "gamma_flip": gex_data.get("gamma_flip"),
+        "net_gex": gex_data.get("net_gex_label"),
+        "gex_regime": gex_data.get("regime"),
+    }
 
     # Telemetry
     last_ex = book.last_exchange_time or now_ms

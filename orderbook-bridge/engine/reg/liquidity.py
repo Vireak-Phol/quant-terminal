@@ -100,6 +100,7 @@ class LiquidityBar:
     pdl: Optional[float] = None
     pwh: Optional[float] = None
     pwl: Optional[float] = None
+    globex_open: Optional[float] = None
 
     # Derived HTF sweeps (not a direct Pine plot column; wick pierces + close rejects)
     sweep_pdh: bool = False
@@ -199,6 +200,8 @@ class LiquidityEngine:
         self.pdl: Optional[float] = None
         self.pwh: Optional[float] = None
         self.pwl: Optional[float] = None
+        self.globex_open: Optional[float] = None
+        self._last_session_day: Optional[int] = None
 
     # ── helpers mirroring Pine functions ──────────────────────────────────
     def _is_visible(self, c: float, level: float, n: float) -> bool:
@@ -238,7 +241,15 @@ class LiquidityEngine:
         pwh_raw, pwl_raw = self._weekly.update(t, h, l)
         self.pdh, self.pdl = pdh_raw, pdl_raw
         self.pwh, self.pwl = pwh_raw, pwl_raw
+
+        # Track Daily Globex Open (session rolls 17:00/18:00 NY)
+        sday = _session_day(t)
+        if self._last_session_day is None or sday != self._last_session_day:
+            self._last_session_day = sday
+            self.globex_open = o
+
         out.pdh, out.pdl, out.pwh, out.pwl = self.pdh, self.pdl, self.pwh, self.pwl
+        out.globex_open = self.globex_open
 
         if not cfg.enable_liquidity:
             # newLiqSweep requires enableLiquidity; nothing else runs.

@@ -102,7 +102,7 @@ export const TIMEFRAME_SECONDS: Record<Timeframe, number> = {
 };
 
 /** Overlay groups the UI can switch on/off. */
-export type ChartLayer = "heatmap" | "bubbles" | "vacuum" | "hopla" | "vwap" | "delta";
+export type ChartLayer = "heatmap" | "bubbles" | "vacuum" | "hopla" | "vwap" | "delta" | "gex";
 
 /** Minimal shape the chart needs from a live frame. Structurally compatible with
  *  both the bridge `bookmap_update` frame and the `LiveOrderBookData` snapshot. */
@@ -159,6 +159,12 @@ export interface ChartFrame {
     pdl: number | null;
     pwh: number | null;
     pwl: number | null;
+    globex_open?: number | null;
+    call_wall?: number | null;
+    put_wall?: number | null;
+    gamma_flip?: number | null;
+    net_gex?: string | null;
+    gex_regime?: string | null;
   };
   sweep_events?: Array<{
     kind: "liq_sweep";
@@ -556,6 +562,7 @@ export class TerminalChart {
     hopla: true,
     vwap: true,
     delta: false,
+    gex: true,
   };
 
   // Last frame kept so toggles can re-render overlays without a new tick.
@@ -694,7 +701,7 @@ export class TerminalChart {
     });
     this.surface.renderableSeries.add(this.candlestickSeries);
 
-    // --- Daily VWAP Curves and ±1σ Guides (REG v7.4) ---
+    // --- Daily VWAP Curves (±1σ lines disabled for clean uncluttered chart) ---
     this.upper1DataSeries = new XyDataSeries(wasmContext, {
       containsNaN: true,
       isSorted: true,
@@ -704,9 +711,8 @@ export class TerminalChart {
       stroke: "rgba(0, 191, 255, 0.75)",
       strokeThickness: 1,
       strokeDashArray: [3, 3],
-      isVisible: this.layers.vwap,
+      isVisible: false,
     });
-    this.surface.renderableSeries.add(this.upper1LineSeries);
 
     this.lower1DataSeries = new XyDataSeries(wasmContext, {
       containsNaN: true,
@@ -717,9 +723,8 @@ export class TerminalChart {
       stroke: "rgba(255, 105, 180, 0.75)",
       strokeThickness: 1,
       strokeDashArray: [3, 3],
-      isVisible: this.layers.vwap,
+      isVisible: false,
     });
-    this.surface.renderableSeries.add(this.lower1LineSeries);
 
     this.vwapDataSeries = new XyDataSeries(wasmContext, {
       containsNaN: true,
@@ -842,6 +847,11 @@ export class TerminalChart {
       this.bubblesSig = "";
       this.updateBubbleRegimes(this.lastFrame);
     }
+    // GEX & Globex levels share the `gex` toggle; rebuild from last frame.
+    if (layer === "gex" && this.lastFrame) {
+      this.keyLevelsSig = "";
+      this.updateKeyLevels(this.lastFrame);
+    }
   }
 
   getLayerVisibility(): Record<ChartLayer, boolean> {
@@ -872,8 +882,8 @@ export class TerminalChart {
     if (this.supplyBandSeries) {
       this.supplyBandSeries.isVisible = this.layers.vwap;
       this.demandBandSeries.isVisible = this.layers.vwap;
-      this.upper1LineSeries.isVisible = this.layers.vwap;
-      this.lower1LineSeries.isVisible = this.layers.vwap;
+      this.upper1LineSeries.isVisible = false;
+      this.lower1LineSeries.isVisible = false;
       this.vwapLineSeries.isVisible = this.layers.vwap;
     }
     if (this.vwapAxisAnnotation) {
@@ -1859,10 +1869,20 @@ export class TerminalChart {
     }
   }
 
-  /** Render prior-day/week high/low key levels — only when signature changes. */
+  /** Render prior-day/week high/low, Daily Globex Open, and Gamma Exposure (GEX) levels. */
   private updateKeyLevels(frame: ChartFrame) {
+    if (!this.layers.gex) {
+      for (const a of this.keyLevelAnnotations)
+        this.surface.annotations.remove(a);
+      this.keyLevelAnnotations = [];
+      this.keyLevelsSig = "";
+      return;
+    }
+
     const kl = frame.key_levels;
-    const sig = kl ? `${kl.pdh}:${kl.pdl}:${kl.pwh}:${kl.pwl}` : "";
+    const sig = kl
+      ? `${kl.pdh}:${kl.pdl}:${kl.pwh}:${kl.pwl}:${kl.globex_open}:${kl.call_wall}:${kl.put_wall}:${kl.gamma_flip}`
+      : "";
     if (sig === this.keyLevelsSig) return;
     this.keyLevelsSig = sig;
 
@@ -1871,27 +1891,43 @@ export class TerminalChart {
     this.keyLevelAnnotations = [];
     if (!kl) return;
 
-    const mk = (price: number | null, color: string, prefix: string) => {
-      if (price == null || !Number.isFinite(price)) return;
+    const mk = (
+      price: number | null | undefined,
+      color: string,
+      labelTitle: string,
+      dashArray = [8, 4],
+      thickness = 1.5,
+      placement = ELabelPlacement.TopLeft,
+    ) => {
+      if (price == null || !Number.isFinite(price) || price <= 0) return;
       const line = new HorizontalLineAnnotation({
         y1: price,
         stroke: color,
-        strokeThickness: 1.5,
-        strokeDashArray: [8, 4],
+        strokeThickness: thickness,
+        strokeDashArray: dashArray,
         showLabel: true,
-        labelPlacement: ELabelPlacement.TopLeft,
+        labelPlacement: placement,
         axisLabelFill: color,
         axisLabelStroke: "#000000",
-        labelValue: `${prefix} ${price.toFixed(2)}`,
+        labelValue: labelTitle,
       });
       this.surface.annotations.add(line);
       this.keyLevelAnnotations.push(line);
     };
 
-    mk(kl.pdh, "#a855f7", "PDH");
-    mk(kl.pdl, "#a855f7", "PDL");
-    mk(kl.pwh, "#ec4899", "PWH");
-    mk(kl.pwl, "#ec4899", "PWL");
+    // Prior period levels (purple / pink)
+    mk(kl.pdh, "#a855f7", "PDH", [6, 4], 1.2);
+    mk(kl.pdl, "#a855f7", "PDL", [6, 4], 1.2);
+    mk(kl.pwh, "#ec4899", "PWH", [8, 4], 1.2);
+    mk(kl.pwl, "#ec4899", "PWL", [8, 4], 1.2);
+
+    // ── Daily Globex Open (Clean label: no price, no CME 18..) ──
+    mk(kl.globex_open, "#06b6d4", "GLOBEX OPEN", [6, 3], 2.0, ELabelPlacement.TopRight);
+
+    // ── Gamma Exposure (GEX) Walls & Inflection (Clean label: no price) ──
+    mk(kl.call_wall, "#f43f5e", "CALL WALL", [10, 4], 2.0, ELabelPlacement.TopLeft);
+    mk(kl.put_wall, "#10b981", "PUT WALL", [10, 4], 2.0, ELabelPlacement.BottomLeft);
+    mk(kl.gamma_flip, "#f59e0b", "GAMMA FLIP", [3, 3], 1.5, ELabelPlacement.TopRight);
   }
 
   /** Render liquidity sweep markers (liq_sweep events) — only when signature changes. */
