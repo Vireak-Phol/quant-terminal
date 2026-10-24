@@ -24,6 +24,7 @@ from .data import TF_SECONDS, Kline, load_history
 from .ledger import DEFAULT_DB, Ledger, SignalRecord
 from .risk import RiskConfig
 from .runtime import TimeframeEngine, group_intrabars
+from .venue import VENUES, active_venue
 
 log = logging.getLogger("engine.backtest")
 
@@ -36,8 +37,9 @@ def run_backtest(
     ledger: Optional[Ledger] = None,
     risk: Optional[RiskConfig] = None,
     flow_mode: str = "taker",
+    symbol: str = "XAUUSDT",
 ) -> Dict:
-    eng = TimeframeEngine(tf, ledger=ledger, calibrator=Calibrator(None), risk=risk or RiskConfig(),
+    eng = TimeframeEngine(tf, symbol=symbol, ledger=ledger, calibrator=Calibrator(None), risk=risk or RiskConfig(),
                           source="backtest", flow_mode=flow_mode)
     eng.cal.ledger = ledger
     secs = TF_SECONDS[tf]
@@ -109,29 +111,34 @@ def _fmt_report(rep: Dict) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="v7.4 engine backtest on Binance XAUUSDT history")
+    ap = argparse.ArgumentParser(description="v7.4 engine backtest on venue XAU history (Binance XAUUSDT or OANDA XAU_USD)")
     ap.add_argument("--tf", action="append", choices=["5m", "15m"], help="chart timeframe(s); default 5m and 15m")
-    ap.add_argument("--symbol", default="XAUUSDT")
-    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--provider", choices=sorted(VENUES), default=None,
+                    help="venue: sets symbol, ledger DB and risk cost model (default: active provider)")
+    ap.add_argument("--symbol", default=None, help="override the venue symbol")
+    ap.add_argument("--db", default=None, help="override the venue ledger DB")
     ap.add_argument("--no-refresh", action="store_true", help="use cached klines only")
     ap.add_argument("--flow", choices=["taker", "pine"], default="taker", help="intrabar flow model")
     ap.add_argument("--json", help="write the report JSON to this path")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    venue = VENUES[args.provider] if args.provider else active_venue()
+    args.symbol = args.symbol or venue.symbol
+    args.db = args.db or venue.ledger_path
     tfs = args.tf or ["5m", "15m"]
     refresh = not args.no_refresh
     t0 = time.time()
-    log.info("loading 1m / 4h history (cached under data/cache)…")
+    log.info("venue %s (%s) · loading 1m / 4h history (cached under data/cache)…", venue.name, args.symbol)
     one = load_history(args.symbol, "1m", refresh=refresh)
     h4 = load_history(args.symbol, "4h", refresh=refresh)
     ledger = Ledger(args.db)
-    risk = RiskConfig.load()
+    risk = RiskConfig.load(section=venue.risk_section, defaults=venue.risk_defaults)
     reports = []
     for tf in tfs:
         chart = load_history(args.symbol, tf, refresh=refresh)
         log.info("%s: %d bars, %d 1m intrabars, %d 4h bars", tf, len(chart), len(one), len(h4))
         ledger.clear_source("backtest", tf)
-        res = run_backtest(tf, chart, one, h4, ledger, risk, args.flow)
+        res = run_backtest(tf, chart, one, h4, ledger, risk, args.flow, symbol=args.symbol)
         rep = report(tf, res["closed"])
         rep["bars"] = res["bars"]
         reports.append(rep)

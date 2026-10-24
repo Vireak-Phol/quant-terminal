@@ -34,13 +34,24 @@ import {
   UniformHeatmapRenderableSeries,
   HeatmapColorMap,
   BoxAnnotation,
-  CustomAnnotation,
   HorizontalLineAnnotation,
   TextAnnotation,
   ELabelPlacement,
   ZoomPanModifier,
   MouseWheelZoomModifier,
   ZoomExtentsModifier,
+  CursorModifier,
+  ChartModifierBase2D,
+  EChart2DModifierType,
+  translateFromCanvasToSeriesViewRect,
+  XyDataSeries,
+  XyScatterRenderableSeries,
+  EllipsePointMarker,
+  XyTextDataSeries,
+  FastTextRenderableSeries,
+  EHorizontalTextPosition,
+  EVerticalTextPosition,
+  EDataChangeType,
   EDataPointWidthMode,
   ECoordinateMode,
   EHorizontalAnchorPoint,
@@ -49,11 +60,14 @@ import {
   EStrokePaletteMode,
   EValueName,
   parseColorToUIntArgb,
+  DefaultPaletteProvider,
 } from "scichart";
 import type {
   IFillPaletteProvider,
   IStrokePaletteProvider,
   IRenderableSeries,
+  ModifierMouseArgs,
+  Point,
 } from "scichart";
 import type { CandleData } from "../lib/klines";
 import {
@@ -61,6 +75,7 @@ import {
   type HeavyAbsorptionPoint,
 } from "../lib/absorption";
 import type { V74Frame, TimeframeFrame } from "../types/v74";
+import { DEFAULT_CHART_STYLE, bubblePaint, type ChartStyle } from "../lib/chartStyle";
 
 export type Timeframe = "1m" | "5m" | "15m";
 
@@ -156,7 +171,44 @@ export interface ChartFrame {
 export interface BubbleHit {
   x: number; // epoch seconds
   y: number; // price
+  side: "buy" | "sell";
   point: HeavyAbsorptionPoint | null; // null for live-tape footprints
+}
+
+/** OHLC(+V/Δ) of the candle under the crosshair (or the live candle). */
+export interface CandleReadout {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+  delta: number | null;
+  /** Cursor price on the Y axis (null when not hovering). */
+  cursorPrice: number | null;
+  live: boolean;
+}
+
+/** Records the pointer in SciChart's own (DPI-scaled, series-view) coordinates so
+ *  hover readouts and click hit-tests agree with what is drawn, on Retina too. */
+class PointerTrackerModifier extends ChartModifierBase2D {
+  readonly type = EChart2DModifierType.Custom;
+  /** Series-view-rect coordinates (device px), or null when outside the plot. */
+  point: Point | null = null;
+  onMove: (() => void) | null = null;
+
+  modifierMouseMove(args: ModifierMouseArgs): void {
+    super.modifierMouseMove(args);
+    const svr = this.parentSurface?.seriesViewRect;
+    this.point = svr ? translateFromCanvasToSeriesViewRect(args.mousePoint, svr) ?? null : null;
+    this.onMove?.();
+  }
+
+  modifierMouseLeave(args: ModifierMouseArgs): void {
+    super.modifierMouseLeave(args);
+    this.point = null;
+    this.onMove?.();
+  }
 }
 
 const PRICE_ROWS = 240; // heatmap price buckets (240×160 depth tensor)
@@ -185,19 +237,12 @@ const RIGHT_OFFSET_PX = 200;
 //            otherwise the live absorbed size in oz.
 // One marker per candle per side; the tier only upgrades.
 export type AbsorbShape = "circle" | "square" | "diamond";
-const SHAPE_RANK: Record<AbsorbShape, number> = { circle: 0, square: 1, diamond: 2 };
 const MARKER_PX: Record<AbsorbShape, number> = { circle: 12, square: 15, diamond: 18 };
 const MARKER_FONT: Record<AbsorbShape, number> = { circle: 9, square: 10, diamond: 11 };
 
-// DeepCharts palette: BLUE = aggressive buyers, PINK = aggressive sellers. Kept
-// deliberately distinct from the green/red candles so markers never blend into bars.
-const ABSORB_COLORS = {
-  buy: { fill: "rgba(59, 130, 246, 0.55)", stroke: "rgba(96, 165, 250, 1)" },
-  sell: { fill: "rgba(236, 72, 153, 0.55)", stroke: "rgba(244, 114, 182, 1)" },
-  // Battle tier: brighter fill and a light ring so it pops at a glance.
-  buyBattle: { fill: "rgba(37, 99, 235, 0.9)", stroke: "rgba(239, 246, 255, 0.95)" },
-  sellBattle: { fill: "rgba(219, 39, 119, 0.9)", stroke: "rgba(253, 242, 248, 0.95)" },
-};
+// Bubble + candle colours are user settings (lib/chartStyle.ts). Defaults keep the
+// DeepCharts palette: BLUE = aggressive buyers, PINK = aggressive sellers — distinct
+// from the green/red candles so markers never blend into bars.
 
 /** Compact number for inside the circle: 87, 130, 1.2k. */
 function absorbLabel(v: number): string {
@@ -206,53 +251,44 @@ function absorbLabel(v: number): string {
   return v >= 10 ? `${Math.round(v)}` : v.toFixed(1);
 }
 
-/** A fixed-pixel-size numbered absorption circle centred on (time, price). */
-class VolumeBubbleAnnotation extends CustomAnnotation {
-  priceRadius: number;
+/** One absorption marker = one (side, candle). Evidence accumulates; it is rendered
+ *  through GPU scatter + text series (see flushAbsorb), not per-marker DOM/SVG. */
+interface AbsorbGroup {
   side: "buy" | "sell";
-  shape: AbsorbShape;
-  label: string;
+  bar: number;
+  /** Bar-close candle detector hit (wick anchor + volume ratio). Recomputed on rebuild. */
+  detector: HeavyAbsorptionPoint | null;
+  /** Live tape episodes merged into this candle (oz, and Σ price×qty for the VWAP). */
+  liveQty: number;
+  livePxQty: number;
+  /** Aggression traded into a resting wall (square tier). */
+  wall: boolean;
+  /** Bubble-regime "battle": absorbed AND open interest rose (diamond tier). */
+  battle: boolean;
+  battlePx: number | null;
+}
 
-  constructor(opts: {
-    time: number;
-    price: number;
-    side: "buy" | "sell";
-    shape: AbsorbShape;
-    label: string;
-  }) {
-    super({
-      x1: opts.time,
-      y1: opts.price,
-      xCoordinateMode: ECoordinateMode.DataValue,
-      yCoordinateMode: ECoordinateMode.DataValue,
-      horizontalAnchorPoint: EHorizontalAnchorPoint.Center,
-      verticalAnchorPoint: EVerticalAnchorPoint.Center,
-    });
-    this.priceRadius = 0;
-    this.side = opts.side;
-    this.shape = opts.shape;
-    this.label = opts.label;
-  }
+function groupShape(g: AbsorbGroup): AbsorbShape {
+  return g.battle ? "diamond" : g.wall ? "square" : "circle";
+}
 
-  getSvgString(annotation: CustomAnnotation): string {
-    const self = annotation as VolumeBubbleAnnotation;
-    const r = MARKER_PX[self.shape];
-    const battle = self.shape === "diamond";
-    const sw = battle ? 2 : 1.5;
-    const d = r * 2 + 4;
-    const c = d / 2;
-    const col = ABSORB_COLORS[battle ? (self.side === "buy" ? "buyBattle" : "sellBattle") : self.side];
-    const text = self.label
-      ? `<text x="${c}" y="${c}" fill="#ffffff" font-family="monospace" font-weight="bold" ` +
-        `font-size="${MARKER_FONT[self.shape]}" text-anchor="middle" dominant-baseline="central">${self.label}</text>`
-      : "";
-    return (
-      `<svg width="${d}" height="${d}" viewBox="0 0 ${d} ${d}" xmlns="http://www.w3.org/2000/svg">` +
-      `<circle cx="${c}" cy="${c}" r="${r}" fill="${col.fill}" stroke="${col.stroke}" stroke-width="${sw}"/>` +
-      text +
-      `</svg>`
-    );
-  }
+/** Detector markers stay on their wick; live-only markers sit at the episode VWAP. */
+function groupPrice(g: AbsorbGroup): number | null {
+  if (g.detector) return g.detector.price;
+  if (g.liveQty > 0) return g.livePxQty / g.liveQty;
+  return g.battlePx;
+}
+
+function groupLabel(g: AbsorbGroup): string {
+  return absorbLabel(g.detector?.volRatio ?? g.liveQty);
+}
+
+const ABSORB_SHAPES: AbsorbShape[] = ["circle", "square", "diamond"];
+const ABSORB_SIDES: Array<"buy" | "sell"> = ["buy", "sell"];
+
+interface AbsorbLayer {
+  scatter: Record<"buy" | "sell", { data: XyDataSeries; rs: XyScatterRenderableSeries }>;
+  text: { data: XyTextDataSeries; rs: FastTextRenderableSeries };
 }
 
 export interface ChartConfig {
@@ -274,8 +310,6 @@ export interface ChartConfig {
 // NOT fall back to brushUp/brushDown — the native draw path passes fill=undefined as
 // the fallback, which renders NEUTRAL (white). So when enabled we return an explicit
 // color for every candle.
-const DELTA_UP_COLOR = "#26a69a"; // buyers in control
-const DELTA_DOWN_COLOR = "#ef5350"; // sellers in control
 
 class DeltaPaletteProvider
   implements IFillPaletteProvider, IStrokePaletteProvider
@@ -285,24 +319,30 @@ class DeltaPaletteProvider
   readonly isRangeIndependant = true;
 
   /** Delta per candle, index-aligned with the OhlcDataSeries. */
-  private deltas: number[];
+  private deltas: Array<number | null>;
   /** When false, overrides are disabled and the series uses its default coloring. */
   enabled = false;
   /** |delta| <= deadband is treated as neutral (use close-vs-open fallback). */
   private readonly deadband: number;
 
-  private readonly upArgb = parseColorToUIntArgb(DELTA_UP_COLOR);
-  private readonly downArgb = parseColorToUIntArgb(DELTA_DOWN_COLOR);
+  // Delta-candle colours follow the user's up/down candle body colours.
+  private upArgb = parseColorToUIntArgb(DEFAULT_CHART_STYLE.candleUpBody);
+  private downArgb = parseColorToUIntArgb(DEFAULT_CHART_STYLE.candleDownBody);
+
+  setColors(up: string, down: string) {
+    this.upArgb = parseColorToUIntArgb(up);
+    this.downArgb = parseColorToUIntArgb(down);
+  }
   /** Low-delta body color (bars with weak imbalance fade toward this). */
   private readonly dimArgb = parseColorToUIntArgb("#2a2e39");
 
-  constructor(deltas: number[], deadband = 0) {
+  constructor(deltas: Array<number | null>, deadband = 0) {
     this.deltas = deltas;
     this.deadband = deadband;
   }
 
   /** Swap the backing array (e.g. after a timeframe reset reallocates it). */
-  setDeltas(deltas: number[]) {
+  setDeltas(deltas: Array<number | null>) {
     this.deltas = deltas;
   }
 
@@ -318,7 +358,7 @@ class DeltaPaletteProvider
       let s = 0;
       let n = 0;
       for (const d of this.deltas) {
-        if (Number.isFinite(d) && d !== 0) {
+        if (d != null && Number.isFinite(d) && d !== 0) {
           s += Math.abs(d);
           n++;
         }
@@ -347,7 +387,7 @@ class DeltaPaletteProvider
   private fillFor(index: number, close: number, otherValues?: Map<string, Float64Array>): number | undefined {
     if (!this.enabled) return undefined;
     const d = this.deltas[index];
-    if (d === undefined || !Number.isFinite(d) || Math.abs(d) <= this.deadband || this.meanAbs <= 0) {
+    if (d == null || !Number.isFinite(d) || Math.abs(d) <= this.deadband || this.meanAbs <= 0) {
       // No delta for this bar: plain close-vs-open color so it never renders white.
       const up = this.priceUp(index, close, otherValues);
       return up === undefined ? undefined : up ? this.upArgb : this.downArgb;
@@ -399,16 +439,25 @@ export class TerminalChart {
   private candlestickSeries!: FastCandlestickRenderableSeries;
   // Per-candle order-flow delta (oz), index-aligned with candleData, for the
   // Volume Delta Candle coloring. Mutated in lockstep with candle append/remove.
-  private candleDelta: number[] = [];
+  private candleDelta: Array<number | null> = [];
   private deltaPalette!: DeltaPaletteProvider;
+  private plainPalette = DefaultPaletteProvider.createEmpty();
 
   private heatmapData!: UniformHeatmapDataSeries;
   private heatmapSeries!: UniformHeatmapRenderableSeries;
 
-  // Absorption bubbles are DeepChart-style: drawn in price (data) units so they
-  // scale with the chart zoom, with radius proportional to volume. Each bubble
-  // is a VolumeBubbleAnnotation; we keep them in one list for lifecycle mgmt.
-  private bubbleAnnotations: VolumeBubbleAnnotation[] = [];
+  // Absorption markers: model (one group per side×candle) + GPU series per size tier.
+  private absorbGroups = new Map<string, AbsorbGroup>();
+  private absorbLayers!: Record<AbsorbShape, AbsorbLayer>;
+  private absorbDirty = false;
+
+  // Crosshair + pointer tracking (hover readout / click hit-test).
+  private cursorModifier!: CursorModifier;
+  private pointer!: PointerTrackerModifier;
+  private crosshairEnabled = true;
+
+  // User colour settings (candles + bubbles); applied live by setStyle().
+  private style: ChartStyle = { ...DEFAULT_CHART_STYLE };
 
   private vacuumAnnotations: (
     | BoxAnnotation
@@ -430,10 +479,9 @@ export class TerminalChart {
   // Candle history storage for the rolling absorption detector.
   private historicalCandles: CandleData[] = [];
 
-  // Recorded bubble positions for click-to-inspect hit-testing.
-  private bubbleHits: BubbleHit[] = [];
-
   // Heatmap rolling grids [PRICE_ROWS][HEATMAP_COLS] (ring-buffered on the X axis).
+  // displayZGrid is handed to SciChart BY REFERENCE and mutated in place; changes are
+  // published with one notifyDataChanged() instead of re-validating a 38k-cell copy.
   private rawZGrid: number[][] = [];
   private displayZGrid: number[][] = [];
   private heatmapFadeEnabled = false;
@@ -441,6 +489,8 @@ export class TerminalChart {
   private priceFloor = 0;
   private lastHeatmapBucket = 0;
   private heatmapInitialized = false;
+  /** Raw grid changed while the layer was hidden: full refresh when shown again. */
+  private heatmapStale = false;
 
   // Candle aggregation state (bucketStartSec -> ohlc).
   private curBucket = 0;
@@ -477,19 +527,6 @@ export class TerminalChart {
   private vacuumSig = "";
   private hoplaSig = "";
   private seenFootprintIds = new Set<string>();
-  // Live ABS episodes merged per (side, candle) — see appendLiveFootprints.
-  private liveAbsGroups = new Map<
-    string,
-    {
-      bubble: VolumeBubbleAnnotation;
-      hit: BubbleHit;
-      pxQty: number;
-      qty: number;
-      fixed: boolean;
-      /** Candle-detector volume ratio (% of avg); preferred number when present. */
-      ratio: number | null;
-    }
-  >();
   // Last applied live-view range, to skip redundant visibleRange writes.
   private lastViewFirstX = NaN;
   private lastViewLastX = NaN;
@@ -542,7 +579,7 @@ export class TerminalChart {
       xStep: this.tfSeconds,
       yStart: 0,
       yStep: this.cfg.tickSize,
-      zValues: this.displayZGrid.map((row) => [...row]),
+      zValues: this.displayZGrid,
     });
     this.heatmapSeries = new UniformHeatmapRenderableSeries(wasmContext, {
       dataSeries: this.heatmapData,
@@ -563,21 +600,80 @@ export class TerminalChart {
     this.surface.renderableSeries.add(this.heatmapSeries);
 
     // --- Candlesticks ---
-    this.candleData = new OhlcDataSeries(wasmContext);
+    // Candles are strictly time-ordered and never NaN: these flags let SciChart use
+    // its fast resampling / binary-search paths instead of scanning.
+    this.candleData = new OhlcDataSeries(wasmContext, { isSorted: true, containsNaN: false });
     this.deltaPalette = new DeltaPaletteProvider(this.candleDelta);
+    this.deltaPalette.setColors(this.style.candleUpBody, this.style.candleDownBody);
     this.deltaPalette.enabled = this.layers.delta;
     this.candlestickSeries = new FastCandlestickRenderableSeries(wasmContext, {
       dataSeries: this.candleData,
       strokeThickness: 1,
-      brushUp: "#26a69a",
-      brushDown: "#ef5350",
-      strokeUp: "#26a69a",
-      strokeDown: "#ef5350",
+      brushUp: this.style.candleUpBody,
+      brushDown: this.style.candleDownBody,
+      strokeUp: this.style.candleUpWick,
+      strokeDown: this.style.candleDownWick,
       dataPointWidth: 0.7,
       dataPointWidthMode: EDataPointWidthMode.Relative,
-      paletteProvider: this.deltaPalette,
+      // Attached only while the Delta layer is on (applyLayerVisibility), so plain
+      // candles never pay the per-candle palette pass.
+      paletteProvider: this.layers.delta ? this.deltaPalette : this.plainPalette,
     });
     this.surface.renderableSeries.add(this.candlestickSeries);
+
+    // --- Absorption markers (GPU): per size tier one scatter series per side plus
+    //     one text series for the numbers. Hundreds of markers cost one draw call per
+    //     series instead of one SVG DOM node each, and pan/zoom no longer relayouts.
+    this.absorbLayers = {} as Record<AbsorbShape, AbsorbLayer>;
+    for (const shape of ABSORB_SHAPES) {
+      const battle = shape === "diamond";
+      const size = MARKER_PX[shape] * 2;
+      const scatter = {} as AbsorbLayer["scatter"];
+      for (const side of ABSORB_SIDES) {
+        const col = bubblePaint(this.style, side, battle);
+        const data = new XyDataSeries(wasmContext, { containsNaN: false, isSorted: false });
+        const rs = new XyScatterRenderableSeries(wasmContext, {
+          dataSeries: data,
+          pointMarker: new EllipsePointMarker(wasmContext, {
+            width: size,
+            height: size,
+            fill: col.fill,
+            stroke: col.stroke,
+            strokeThickness: col.strokeThickness,
+          }),
+        });
+        this.surface.renderableSeries.add(rs);
+        scatter[side] = { data, rs };
+      }
+      const tdata = new XyTextDataSeries(wasmContext, { isSorted: false, containsNaN: false });
+      const trs = new FastTextRenderableSeries(wasmContext, {
+        dataSeries: tdata,
+        dataLabels: {
+          style: { fontFamily: "Arial", fontSize: MARKER_FONT[shape] },
+          color: this.style.bubbleText,
+          horizontalTextPosition: EHorizontalTextPosition.Center,
+          verticalTextPosition: EVerticalTextPosition.Center,
+          calculateTextBounds: false,
+        },
+      });
+      this.surface.renderableSeries.add(trs);
+      this.absorbLayers[shape] = { scatter, text: { data: tdata, rs: trs } };
+    }
+
+    // --- Crosshair: native cursor (lines + axis badges), no SciChart tooltip — the
+    //     OHLC readout is a DOM legend driven by getReadout(). The pointer tracker
+    //     shares SciChart's coordinate space for hover + click hit-tests.
+    this.cursorModifier = new CursorModifier({
+      crosshairStroke: "#94a3b8",
+      crosshairStrokeThickness: 1,
+      crosshairStrokeDashArray: [3, 3],
+      showTooltip: false,
+      showAxisLabels: true,
+      axisLabelFill: "#334155",
+      axisLabelStroke: "#f8fafc",
+    });
+    this.cursorModifier.isEnabled = this.crosshairEnabled;
+    this.pointer = new PointerTrackerModifier();
 
     // --- Interaction: wheel zoom, drag pan, double-click reset to live extents ---
     this.surface.chartModifiers.add(
@@ -589,6 +685,8 @@ export class TerminalChart {
           return false;
         },
       }),
+      this.cursorModifier,
+      this.pointer,
     );
 
     // Apply initial layer visibility now that series exist.
@@ -621,15 +719,129 @@ export class TerminalChart {
   }
 
   private applyLayerVisibility() {
-    if (this.heatmapSeries) this.heatmapSeries.isVisible = this.layers.heatmap;
-    for (const b of this.bubbleAnnotations) b.isHidden = !this.layers.bubbles;
+    if (this.heatmapSeries) {
+      const wasHidden = !this.heatmapSeries.isVisible;
+      this.heatmapSeries.isVisible = this.layers.heatmap;
+      // Grid kept advancing while hidden but was not pushed to the GPU; catch up now.
+      if (wasHidden && this.layers.heatmap && this.heatmapStale && this.heatmapInitialized) {
+        this.heatmapStale = false;
+        this.recalculateDisplayGrid();
+        this.heatmapData.notifyDataChanged(EDataChangeType.Update);
+      }
+    }
+    if (this.absorbLayers) {
+      for (const shape of ABSORB_SHAPES) {
+        const l = this.absorbLayers[shape];
+        l.scatter.buy.rs.isVisible = this.layers.bubbles;
+        l.scatter.sell.rs.isVisible = this.layers.bubbles;
+        l.text.rs.isVisible = this.layers.bubbles;
+      }
+    }
     for (const m of this.bubbleRegimeAnnotations)
       m.isHidden = !this.layers.bubbles;
-    if (this.deltaPalette) {
+    if (this.deltaPalette && this.candlestickSeries) {
       this.deltaPalette.enabled = this.layers.delta;
-      // Force the candlestick series to repaint with/without the delta override.
+      const want = this.layers.delta ? this.deltaPalette : this.plainPalette;
+      if (this.candlestickSeries.paletteProvider !== want) this.candlestickSeries.paletteProvider = want;
       this.surface?.invalidateElement({ force: true });
     }
+  }
+
+  /** Apply candle + bubble colours. Safe before init() (used as construction values).
+   *  Mutates series/markers in place — no data rebuild. */
+  setStyle(style: ChartStyle) {
+    this.style = { ...style };
+    if (!this.candlestickSeries) return;
+    const cs = this.candlestickSeries;
+    cs.brushUp = style.candleUpBody;
+    cs.brushDown = style.candleDownBody;
+    cs.strokeUp = style.candleUpWick;
+    cs.strokeDown = style.candleDownWick;
+    this.deltaPalette.setColors(style.candleUpBody, style.candleDownBody);
+    for (const shape of ABSORB_SHAPES) {
+      const layer = this.absorbLayers[shape];
+      for (const side of ABSORB_SIDES) {
+        const paint = bubblePaint(style, side, shape === "diamond");
+        const pm = layer.scatter[side].rs.pointMarker;
+        if (pm) {
+          pm.fill = paint.fill;
+          pm.stroke = paint.stroke;
+          pm.strokeThickness = paint.strokeThickness;
+        }
+      }
+      layer.text.rs.dataLabelProvider.color = style.bubbleText;
+    }
+    this.surface?.invalidateElement({ force: true });
+  }
+
+  /** Crosshair (cursor lines + axis badges) on/off. */
+  setCrosshair(enabled: boolean) {
+    this.crosshairEnabled = enabled;
+    if (this.cursorModifier) this.cursorModifier.isEnabled = enabled;
+    this.surface?.invalidateElement({ force: true });
+  }
+
+  /** Called on every pointer move/leave over the plot (hover readout). */
+  setPointerListener(fn: (() => void) | null) {
+    if (this.pointer) this.pointer.onMove = fn;
+  }
+
+  /** OHLC readout for the candle under the pointer, or the live (last) candle when
+   *  the pointer is outside the plot. O(log n) binary search on the x values. */
+  getReadout(): CandleReadout | null {
+    const n = this.candleData?.count() ?? 0;
+    if (n === 0) return null;
+    const xs = this.candleData.getNativeXValues();
+    let idx = n - 1;
+    let cursorPrice: number | null = null;
+    const p = this.pointer?.point;
+    if (p) {
+      const xCalc = this.xAxis.getCurrentCoordinateCalculator();
+      const yCalc = this.yAxis.getCurrentCoordinateCalculator();
+      const xv = xCalc.getDataValue(p.x);
+      cursorPrice = yCalc.getDataValue(p.y);
+      // Candle i covers [x_i, x_i + tf): last index with x_i <= xv.
+      let lo = 0;
+      let hi = n - 1;
+      if (xv < xs.get(0)) idx = 0;
+      else {
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (xs.get(mid) <= xv) lo = mid;
+          else hi = mid - 1;
+        }
+        idx = lo;
+      }
+    }
+    const t = xs.get(idx);
+    const j = this.findCandleIndex(t);
+    const vol = j >= 0 ? this.historicalCandles[j].volume : null;
+    const d = this.candleDelta[idx];
+    return {
+      time: t,
+      open: this.candleData.getNativeOpenValues().get(idx),
+      high: this.candleData.getNativeHighValues().get(idx),
+      low: this.candleData.getNativeLowValues().get(idx),
+      close: this.candleData.getNativeCloseValues().get(idx),
+      volume: vol,
+      delta: d != null && Number.isFinite(d) ? d : null,
+      cursorPrice,
+      live: idx === n - 1,
+    };
+  }
+
+  /** Historical candles sorted by time (for O(log n) readout lookups). */
+  private findCandleIndex(t: number): number {
+    const hc = this.historicalCandles;
+    let lo = 0;
+    let hi = hc.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (hc[mid].time === t) return mid;
+      if (hc[mid].time < t) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return -1;
   }
 
   /** Load historical candles from Binance to seed price action + absorption history. */
@@ -640,8 +852,8 @@ export class TerminalChart {
     this.candleDelta.length = 0;
     for (const c of candles) {
       this.candleData.append(c.time, c.open, c.high, c.low, c.close);
-      // Real aggressor delta from REST taker-buy volume (0 if the field is absent).
-      this.candleDelta.push(c.delta ?? 0);
+      // Real aggressor delta from REST taker-buy volume (null if the field is absent).
+      this.candleDelta.push(c.delta ?? null);
     }
     const last = candles[candles.length - 1];
     this.curBucket = last.time;
@@ -682,7 +894,6 @@ export class TerminalChart {
     this.heatmapInitialized = false;
     this.lastHeatmapBucket = 0;
     this.historicalCandles = [];
-    this.bubbleHits = [];
     this.seenFootprintIds.clear();
     this.vacuumSig = "";
     this.hoplaSig = "";
@@ -700,13 +911,31 @@ export class TerminalChart {
     for (const a of this.bubbleRegimeAnnotations)
       this.surface?.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
-    this.clearBubbles();
+    this.clearAbsorb();
     for (let r = 0; r < PRICE_ROWS; r++) {
       this.rawZGrid[r].fill(0);
       this.displayZGrid[r].fill(0);
     }
+    this.heatmapData?.notifyDataChanged(EDataChangeType.Update);
+    this.candleData?.clear();
+    this.lastFrame = null;
     this.liveFollow = true;
     this.invalidateView();
+  }
+
+  /** Market-data venue changed (e.g. Binance → OANDA): drop everything derived from
+   *  the old feed, including the heatmap price anchor and the mark line. */
+  resetForVenue() {
+    this.setTimeframe(this.cfg.timeframe);
+    this.priceFloor = 0;
+    this.vacuumAnnotations.forEach((a) => this.surface?.annotations.remove(a));
+    this.vacuumAnnotations = [];
+    this.hoplaAnnotations.forEach((a) => this.surface?.annotations.remove(a));
+    this.hoplaAnnotations = [];
+    if (this.markPriceAnnotation) {
+      this.surface?.annotations.remove(this.markPriceAnnotation);
+      this.markPriceAnnotation = null;
+    }
   }
 
   /** Feed a (coalesced) websocket frame. Called at most once per animation frame. */
@@ -730,6 +959,7 @@ export class TerminalChart {
     this.updateSweeps(frame);
     this.updateSignals(frame);
     this.updateBubbleRegimes(frame);
+    this.flushAbsorb();
     if (this.liveFollow) {
       this.applyLiveView();
     }
@@ -831,106 +1061,99 @@ export class TerminalChart {
   }
 
   /**
-   * Full rebuild of the Heavy Absorption bubbles from the candle history.
+   * Re-run the bar-close Heavy Absorption detector over the candle history and merge
+   * its hits into the marker model. Live-tape evidence and regime "battle" upgrades
+   * already attached to a candle are preserved (they used to be wiped at every candle
+   * close, so live markers vanished as soon as the bridge's 4 s window rolled on).
    */
   private rebuildHeavyAbsorptions() {
     if (!this.surface) return;
-    this.clearBubbles();
-    this.seenFootprintIds.clear();
+    for (const g of this.absorbGroups.values()) g.detector = null;
 
     const points = detectHeavyAbsorptions(this.historicalCandles);
     for (const pt of points) {
       // buyers_absorbed = aggressive BUYERS were absorbed → aggressor side "buy".
       const side: "buy" | "sell" = pt.type === "buyers_absorbed" ? "buy" : "sell";
-      this.upsertAbsorb(side, pt.time, pt.price, "circle", pt, 0, true, pt.volRatio);
+      this.absorbGroup(side, pt.time).detector = pt;
     }
-    // Groups were rebuilt, so let regime "battle" upgrades re-apply on this frame.
-    this.bubblesSig = "";
+
+    // Drop markers with no remaining evidence and anything older than the chart.
+    const oldest = this.historicalCandles.length ? this.historicalCandles[0].time : -Infinity;
+    for (const [k, g] of this.absorbGroups) {
+      if (g.bar < oldest || (!g.detector && g.liveQty <= 0 && !g.battle)) this.absorbGroups.delete(k);
+    }
+    this.absorbDirty = true;
   }
 
-  /**
-   * One absorption marker per (candle, side). New evidence for the same candle/side
-   * upgrades the size tier (absorb → wall → battle) and updates the number instead
-   * of stacking a second marker. Live evidence moves the marker to the episode's
-   * volume-weighted price; markers from the bar-close detector stay at their wick.
-   */
-  private upsertAbsorb(
-    side: "buy" | "sell",
-    timeSec: number,
-    price: number,
-    shape: AbsorbShape,
-    point: HeavyAbsorptionPoint | null,
-    qty: number,
-    fixed: boolean,
-    volRatio?: number,
-  ) {
+  /** Get-or-create the single marker group for (side, candle). */
+  private absorbGroup(side: "buy" | "sell", timeSec: number): AbsorbGroup {
     const bar = Math.floor(timeSec / this.tfSeconds) * this.tfSeconds;
     const key = `${side}-${bar}`;
-    const g = this.liveAbsGroups.get(key);
-    if (g) {
-      if (qty > 0) {
-        g.qty += qty;
-        if (!g.fixed) {
-          g.pxQty += price * qty;
-          g.hit.y = g.pxQty / g.qty;
-          g.bubble.y1 = g.hit.y;
-        }
-      }
-      if (volRatio != null && g.ratio == null) g.ratio = volRatio;
-      if (point && !g.hit.point) g.hit.point = point;
-      const nextShape =
-        SHAPE_RANK[shape] > SHAPE_RANK[g.bubble.shape] ? shape : g.bubble.shape;
-      const nextLabel = absorbLabel(g.ratio ?? g.qty);
-      if (nextShape !== g.bubble.shape || nextLabel !== g.bubble.label) {
-        // Size and number are baked into the SVG, so swap the annotation to repaint.
-        const next = this.addBubble(side, bar, g.bubble.y1, nextShape, nextLabel);
-        this.surface.annotations.remove(g.bubble);
-        this.bubbleAnnotations = this.bubbleAnnotations.filter((b) => b !== g.bubble);
-        g.bubble = next;
-      }
-      return;
+    let g = this.absorbGroups.get(key);
+    if (!g) {
+      g = { side, bar, detector: null, liveQty: 0, livePxQty: 0, wall: false, battle: false, battlePx: null };
+      this.absorbGroups.set(key, g);
     }
-    const hit: BubbleHit = { x: bar, y: price, point };
-    this.bubbleHits.push(hit);
-    const q = Math.max(qty, 0);
-    const ratio = volRatio ?? null;
-    const bubble = this.addBubble(side, bar, price, shape, absorbLabel(ratio ?? q));
-    this.liveAbsGroups.set(key, {
-      bubble, hit, pxQty: q > 0 ? price * q : 0, qty: q, fixed, ratio,
-    });
+    return g;
   }
 
-  /** Create one fixed-size numbered absorption circle. */
-  private addBubble(
-    side: "buy" | "sell",
-    time: number,
-    price: number,
-    shape: AbsorbShape,
-    label: string,
-  ) {
-    const bubble = new VolumeBubbleAnnotation({ time, price, side, shape, label });
-    bubble.isHidden = !this.layers.bubbles;
-    this.surface.annotations.add(bubble);
-    this.bubbleAnnotations.push(bubble);
-    return bubble;
-  }
-
-  /** Remove all bubble annotations from the surface and reset hit records. */
-  private clearBubbles() {
-    for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
-    this.bubbleAnnotations = [];
-    this.bubbleHits = [];
-    this.liveAbsGroups.clear();
+  private clearAbsorb() {
+    this.absorbGroups.clear();
+    this.seenFootprintIds.clear();
+    this.absorbDirty = true;
   }
 
   /**
-   * Incrementally append live order-flow absorption footprints.
+   * Push the marker model to the GPU series — only when something changed, and at
+   * most once per animation frame (called at the end of update()). A few hundred
+   * points per series: a clear + appendRange is far cheaper than diffing.
+   */
+  private flushAbsorb() {
+    if (!this.absorbDirty || !this.absorbLayers) return;
+    this.absorbDirty = false;
+    type Buf = { x: number[]; y: number[] };
+    const pts: Record<AbsorbShape, Record<"buy" | "sell", Buf>> = {
+      circle: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
+      square: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
+      diamond: { buy: { x: [], y: [] }, sell: { x: [], y: [] } },
+    };
+    const txt: Record<AbsorbShape, Buf & { t: string[] }> = {
+      circle: { x: [], y: [], t: [] },
+      square: { x: [], y: [], t: [] },
+      diamond: { x: [], y: [], t: [] },
+    };
+    for (const g of this.absorbGroups.values()) {
+      const y = groupPrice(g);
+      if (y == null || !Number.isFinite(y)) continue;
+      const shape = groupShape(g);
+      pts[shape][g.side].x.push(g.bar);
+      pts[shape][g.side].y.push(y);
+      const label = groupLabel(g);
+      if (label) {
+        txt[shape].x.push(g.bar);
+        txt[shape].y.push(y);
+        txt[shape].t.push(label);
+      }
+    }
+    for (const shape of ABSORB_SHAPES) {
+      const layer = this.absorbLayers[shape];
+      for (const side of ABSORB_SIDES) {
+        const { data } = layer.scatter[side];
+        data.clear();
+        if (pts[shape][side].x.length) data.appendRange(pts[shape][side].x, pts[shape][side].y);
+      }
+      layer.text.data.clear();
+      if (txt[shape].x.length) layer.text.data.appendRange(txt[shape].x, txt[shape].y, txt[shape].t);
+    }
+  }
+
+  /**
+   * Incrementally merge live order-flow absorption footprints.
    *
    * The bridge re-evaluates its rolling absorption window on every trade, so one
    * sustained episode emits many near-identical candidates a few cents apart. They
-   * are the same event and merge into the single marker for that candle/side.
-   * `wall` (aggression traded into a resting liquidity wall) upgrades it to the
-   * larger "wall" circle.
+   * are the same event and merge into the single marker for that candle/side
+   * (volume-weighted price, summed size). `wall` upgrades it to the larger tier.
    */
   private appendLiveFootprints(
     candidates: ChartFrame["absorption_candidates"],
@@ -946,7 +1169,11 @@ export class TerminalChart {
 
       const side: "buy" | "sell" = a.side === "buy" ? "buy" : "sell";
       const qty = Math.max(Number(a.executedQuantity ?? 0) || 0, 1e-9);
-      this.upsertAbsorb(side, t, px, a.wall ? "square" : "circle", null, qty, false);
+      const g = this.absorbGroup(side, t);
+      g.liveQty += qty;
+      g.livePxQty += px * qty;
+      if (a.wall) g.wall = true;
+      this.absorbDirty = true;
     }
     if (this.seenFootprintIds.size > 2000) {
       const recent = Array.from(this.seenFootprintIds).slice(-500);
@@ -957,7 +1184,10 @@ export class TerminalChart {
   private updateHeatmap(frame: ChartFrame, nowSec: number) {
     const mid = frame.mid_price;
     const span = PRICE_ROWS * this.cfg.tickSize;
-    let dirty = false;
+    // full: every column must be re-derived (shift / re-anchor / init).
+    // colDirty: only the live (right-most) column changed — the common intra-bar case.
+    let full = false;
+    let colDirty = false;
 
     if (
       this.priceFloor === 0 ||
@@ -985,7 +1215,7 @@ export class TerminalChart {
         }
       }
       this.priceFloor = newPriceFloor;
-      dirty = true;
+      full = true;
     }
 
     const bucket = Math.floor(nowSec / this.tfSeconds) * this.tfSeconds;
@@ -1027,8 +1257,7 @@ export class TerminalChart {
           }
         }
       }
-      this.recalculateDisplayGrid();
-      dirty = true;
+      full = true;
     } else {
       if (bucket !== this.lastHeatmapBucket) {
         const elapsed = Math.round(
@@ -1037,16 +1266,17 @@ export class TerminalChart {
         if (elapsed > 0) {
           const shiftCount = Math.min(HEATMAP_COLS, elapsed);
           this.lastHeatmapBucket = bucket;
+          // In-place left shift (no per-row slice/concat allocations).
           for (let r = 0; r < PRICE_ROWS; r++) {
+            const row = this.rawZGrid[r];
             if (shiftCount >= HEATMAP_COLS) {
-              this.rawZGrid[r].fill(0);
+              row.fill(0);
             } else {
-              this.rawZGrid[r] = this.rawZGrid[r]
-                .slice(shiftCount)
-                .concat(new Array(shiftCount).fill(0));
+              row.copyWithin(0, shiftCount);
+              row.fill(0, HEATMAP_COLS - shiftCount);
             }
           }
-          dirty = true;
+          full = true;
         } else {
           this.lastHeatmapBucket = bucket;
         }
@@ -1055,34 +1285,48 @@ export class TerminalChart {
       for (let r = 0; r < PRICE_ROWS; r++) {
         if (this.rawZGrid[r][col] !== 0) {
           this.rawZGrid[r][col] = 0;
-          dirty = true;
+          colDirty = true;
         }
       }
       // Dense Bookmap gradient: paint every binned depth level into the live
       // column so the map reads continuously at any timeframe, not just the
       // handful of thresholded zones. Zones then highlight on top via max().
       if (this.paintDenseColumn(frame.heatmap_column, col)) {
-        dirty = true;
+        colDirty = true;
       }
       this.paintZones(zones, (r, qty) => {
         const v = Math.max(this.rawZGrid[r][col], qty);
         if (v !== this.rawZGrid[r][col]) {
           this.rawZGrid[r][col] = v;
-          dirty = true;
+          colDirty = true;
         }
       });
-      if (dirty) {
-        this.recalculateDisplayGrid();
-      }
     }
 
-    if (dirty) {
-      this.heatmapData.setZValues(this.displayZGrid);
+    // Geometry: every setter fires notifyDataChanged(), which makes SciChart
+    // re-normalise all 38,400 cells on the next render. Only write on change.
+    const hd = this.heatmapData;
+    const xStart = bucket - (HEATMAP_COLS - 1) * this.tfSeconds;
+    if (hd.yStart !== this.priceFloor) hd.yStart = this.priceFloor;
+    if (hd.yStep !== this.cfg.tickSize) hd.yStep = this.cfg.tickSize;
+    if (hd.xStart !== xStart) hd.xStart = xStart;
+    if (hd.xStep !== this.tfSeconds) hd.xStep = this.tfSeconds;
+
+    if (!full && !colDirty) return;
+    // Hidden layer: keep the raw grid advancing (cheap) but skip the display pass and
+    // the GPU upload; applyLayerVisibility() catches up when it is shown again.
+    if (!this.layers.heatmap) {
+      this.heatmapStale = true;
+      return;
     }
-    this.heatmapData.yStart = this.priceFloor;
-    this.heatmapData.yStep = this.cfg.tickSize;
-    this.heatmapData.xStart = bucket - (HEATMAP_COLS - 1) * this.tfSeconds;
-    this.heatmapData.xStep = this.tfSeconds;
+    if (full || this.heatmapStale) {
+      this.heatmapStale = false;
+      this.recalculateDisplayGrid();
+    } else {
+      // Live column only. Its fade factor is exactly 1 (t = 1), so display == raw.
+      for (let r = 0; r < PRICE_ROWS; r++) this.displayZGrid[r][col] = this.rawZGrid[r][col];
+    }
+    hd.notifyDataChanged(EDataChangeType.Update);
   }
 
   /** Recompute display grid applying BookMap historical time-decay fade. */
@@ -1111,7 +1355,7 @@ export class TerminalChart {
     }
     if (this.heatmapInitialized) {
       this.recalculateDisplayGrid();
-      this.heatmapData?.setZValues(this.displayZGrid);
+      this.heatmapData?.notifyDataChanged(EDataChangeType.Update);
     }
   }
 
@@ -1512,10 +1756,24 @@ export class TerminalChart {
     for (const a of this.bubbleRegimeAnnotations)
       this.surface.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
+
+    // Regime absorption is NOT drawn as a glyph: it upgrades the per-candle absorption
+    // marker to the "battle" tier. Applied to the model even while the layer is hidden.
+    for (const b of notable) {
+      if (b.regime !== "institutional_absorption_open") continue;
+      const p0 = typeof b.priceCenter === "string" ? parseFloat(b.priceCenter) : b.priceCenter;
+      if (!Number.isFinite(p0)) continue;
+      const tSec0 = b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : Math.floor(b.timestamp);
+      const g = this.absorbGroup(b.aggressorSide === "buy" ? "buy" : "sell", tSec0);
+      if (!g.battle) {
+        g.battle = true;
+        g.battlePx = p0;
+        this.absorbDirty = true;
+      }
+    }
     if (!this.layers.bubbles || notable.length === 0) return;
 
-    // Single-glyph markers, no text. Regime absorption is NOT drawn here: it is the
-    // largest "battle" circle tier of the per-candle absorption marker (upsertAbsorb).
+    // Single-glyph markers, no text.
     const META: Record<string, { glyph: string; color: string }> = {
       liquidation_exhaustion_flush: { glyph: "💥", color: "#f43f5e" },
       vacuum_sweep_breakout: { glyph: "⚡", color: "#f59e0b" },
@@ -1524,13 +1782,6 @@ export class TerminalChart {
     for (const b of notable.slice(-8)) {
       const tSec0 =
         b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : Math.floor(b.timestamp);
-      if (b.regime === "institutional_absorption_open") {
-        const p0 = typeof b.priceCenter === "string" ? parseFloat(b.priceCenter) : b.priceCenter;
-        if (Number.isFinite(p0)) {
-          this.upsertAbsorb(b.aggressorSide === "buy" ? "buy" : "sell", tSec0, p0, "diamond", null, 0, true);
-        }
-        continue;
-      }
       const meta = META[b.regime];
       if (!meta) continue;
       const tSec = tSec0;
@@ -1580,30 +1831,26 @@ export class TerminalChart {
   }
 
   /**
-   * Click-to-inspect hit test.
+   * Click-to-inspect hit test against the marker under the pointer. Uses the pointer
+   * position recorded by PointerTrackerModifier (SciChart's DPI-scaled series-view
+   * space), so it matches what is drawn on Retina displays too. `tolerancePx` is in
+   * CSS pixels.
    */
-  hitTestBubble(
-    clientX: number,
-    clientY: number,
-    tolerancePx = 16,
-  ): BubbleHit | null {
-    if (!this.surface || this.bubbleHits.length === 0 || !this.layers.bubbles)
-      return null;
-    const rect = this.surface.domCanvasWebGL?.getBoundingClientRect?.();
-    if (!rect) return null;
-    const px = clientX - rect.left;
-    const py = clientY - rect.top;
+  hitTestBubble(tolerancePx = 16): BubbleHit | null {
+    const p = this.pointer?.point;
+    if (!this.surface || !p || this.absorbGroups.size === 0 || !this.layers.bubbles) return null;
+    const dpr = window.devicePixelRatio || 1;
     const xCalc = this.xAxis.getCurrentCoordinateCalculator();
     const yCalc = this.yAxis.getCurrentCoordinateCalculator();
     let best: BubbleHit | null = null;
-    let bestDist = tolerancePx;
-    for (const hit of this.bubbleHits) {
-      const hx = xCalc.getCoordinate(hit.x);
-      const hy = yCalc.getCoordinate(hit.y);
-      const d = Math.hypot(hx - px, hy - py);
+    let bestDist = tolerancePx * dpr;
+    for (const g of this.absorbGroups.values()) {
+      const y = groupPrice(g);
+      if (y == null) continue;
+      const d = Math.hypot(xCalc.getCoordinate(g.bar) - p.x, yCalc.getCoordinate(y) - p.y);
       if (d < bestDist) {
         bestDist = d;
-        best = hit;
+        best = { x: g.bar, y, side: g.side, point: g.detector };
       }
     }
     return best;
@@ -1701,14 +1948,13 @@ export class TerminalChart {
     for (const a of this.bubbleRegimeAnnotations)
       this.surface?.annotations.remove(a);
     this.bubbleRegimeAnnotations = [];
-    for (const b of this.bubbleAnnotations) this.surface?.annotations.remove(b);
-    this.bubbleAnnotations = [];
+    this.absorbGroups.clear();
+    if (this.pointer) this.pointer.onMove = null;
     if (this.markPriceAnnotation) {
       this.surface?.annotations.remove(this.markPriceAnnotation);
       this.markPriceAnnotation = null;
     }
     this.surface?.delete();
-    this.bubbleHits = [];
     this.lastFrame = null;
   }
 }

@@ -6,6 +6,8 @@ export interface AbsorptionModalData {
   time: number
   /** anchor price (candle high/low or mid) */
   anchorPrice: number
+  /** aggressor side absorbed ("buy" = buyers absorbed, "sell" = sellers absorbed) */
+  side?: "buy" | "sell"
   /** detected absorption point (null for a live-tape footprint) */
   point: HeavyAbsorptionPoint | null
 }
@@ -20,7 +22,7 @@ interface Props {
  *  institutional thesis. */
 export function AbsorptionModal({ data, onClose }: Props) {
   const p = data.point
-  const isBuyAbs = p ? p.type === 'buyers_absorbed' : true
+  const isBuyAbs = p ? p.type === 'buyers_absorbed' : data.side !== 'sell'
   const when = new Date(data.time * 1000).toLocaleString()
 
   const tone = isBuyAbs

@@ -1,7 +1,13 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrefs } from "./store/usePrefs";
-import { getSharedSocket, DEFAULT_BRIDGE_URL } from "./hooks/useLiveOrderBook";
+import {
+  getSharedSocket,
+  DEFAULT_BRIDGE_URL,
+  DEFAULT_VENUE,
+  type VenueInfo,
+} from "./hooks/useLiveOrderBook";
 import { useLiveField } from "./hooks/useLiveField";
+import { useVenue } from "./hooks/useVenue";
 import {
   TerminalChart,
   type Timeframe,
@@ -9,7 +15,8 @@ import {
   type ChartFrame,
 } from "./chart/TerminalChart";
 import { configureSciChart } from "./chart/scichart-init";
-import { fetchBinanceFuturesKlines } from "./lib/klines";
+import { fetchChartKlines } from "./lib/klines";
+import { loadChartStyle, saveChartStyle, type ChartStyle } from "./lib/chartStyle";
 import { price } from "./lib/format";
 import { newAplusSignals, playChime } from "./lib/alerts";
 import { probabilityView, setupLabel } from "./lib/v74";
@@ -22,6 +29,10 @@ import {
   type AbsorptionModalData,
 } from "./components/Dashboard/AbsorptionModal";
 import { ToastContainer, type ToastMessage } from "./components/Shared/Toast";
+import {
+  CrosshairLegend,
+  type CrosshairLegendHandle,
+} from "./components/Dashboard/CrosshairLegend";
 import { ErrorBoundary } from "./components/Shared/ErrorBoundary";
 import { HeaderToolbar } from "./components/Header/HeaderToolbar";
 import { StatusBar } from "./components/Header/StatusBar";
@@ -55,6 +66,31 @@ export default function App() {
   const timeframeRef = useRef<Timeframe>("1m");
   const [isLoadingKlines, setIsLoadingKlines] = useState(false);
 
+  // Active market-data venue (Binance / OANDA) — drives labels + layer gating.
+  const venue = useVenue();
+  const venueRef = useRef<VenueInfo>(DEFAULT_VENUE);
+
+  const [crosshair, setCrosshair] = useState<boolean>(
+    () => localStorage.getItem("terminal.crosshair") !== "off",
+  );
+  const legendRef = useRef<CrosshairLegendHandle | null>(null);
+
+  // Candle + bubble colours (persisted). Pushed to the chart and to CSS variables
+  // used by the OHLC legend so the readout matches the candles.
+  const [chartStyle, setChartStyle] = useState<ChartStyle>(loadChartStyle);
+  const chartStyleRef = useRef(chartStyle);
+  const [showStyleMenu, setShowStyleMenu] = useState(false);
+  useEffect(() => {
+    chartStyleRef.current = chartStyle;
+    saveChartStyle(chartStyle);
+    chartRef.current?.setStyle(chartStyle);
+    const root = document.documentElement.style;
+    root.setProperty("--legend-up", chartStyle.candleUpWick);
+    root.setProperty("--legend-down", chartStyle.candleDownWick);
+  }, [chartStyle]);
+  const toggleStyleMenu = useCallback(() => setShowStyleMenu((v) => !v), []);
+  const closeStyleMenu = useCallback(() => setShowStyleMenu(false), []);
+
   const [layers, setLayers] = useState<Record<ChartLayer, boolean>>({
     heatmap: true,
     bubbles: true,
@@ -62,6 +98,24 @@ export default function App() {
     hopla: true,
     delta: false,
   });
+
+  // Layers the active venue cannot feed. OANDA streams quotes only: no market depth
+  // (heatmap) and no exchange aggressor delta. Gated layers render nothing.
+  const layerUnavailable = useMemo<Record<ChartLayer, string | null>>(() => {
+    const caps = venue.capabilities;
+    return {
+      heatmap: caps.l2_depth ? null : `${venue.label} has no market depth (quotes only)`,
+      bubbles: null,
+      vacuum: null,
+      hopla: null,
+      delta: caps.delta === "exchange" ? null : `${venue.label} has no aggressor (taker) volume`,
+    };
+  }, [venue]);
+  const effectiveLayers = useMemo(() => {
+    const out = { ...layers };
+    for (const k of Object.keys(out) as ChartLayer[]) if (layerUnavailable[k]) out[k] = false;
+    return out;
+  }, [layers, layerUnavailable]);
 
   const [heatmapFade, setHeatmapFade] = useState<boolean>(() => {
     const saved = localStorage.getItem("terminal.heatmapFade");
@@ -132,16 +186,75 @@ export default function App() {
   }, []);
 
   // Keep a ref of layer state for the init effect (it must not re-run on toggle).
-  const layersRef = useRef(layers);
+  const layersRef = useRef(effectiveLayers);
   useEffect(() => {
-    layersRef.current = layers;
-  }, [layers]);
+    layersRef.current = effectiveLayers;
+  }, [effectiveLayers]);
+
+  const crosshairRef = useRef(crosshair);
 
   // Latest fade settings for the async init effect, without re-running it.
   const fadeRef = useRef({ heatmapFade, fadeStrength });
   useEffect(() => {
     fadeRef.current = { heatmapFade, fadeStrength };
   }, [heatmapFade, fadeStrength]);
+
+  // ── Kline seeding (bridge → active venue; Binance-direct fallback) ─────────
+  // A monotonically increasing token drops stale responses when the timeframe or
+  // venue changes while a request is in flight.
+  const loadSeqRef = useRef(0);
+  const loadKlines = useCallback(
+    async (tf: Timeframe) => {
+      const seq = ++loadSeqRef.current;
+      const v = venueRef.current ?? DEFAULT_VENUE;
+      setIsLoadingKlines(true);
+      try {
+        const res = await fetchChartKlines(
+          getSharedSocket(DEFAULT_BRIDGE_URL),
+          v.name,
+          v.symbol,
+          tf,
+          HISTORY_LIMIT,
+        );
+        if (seq !== loadSeqRef.current || timeframeRef.current !== tf) return;
+        if (res.candles.length > 0) chartRef.current?.loadHistoricalCandles(res.candles);
+        else if (res.error) addToastRef.current(`History unavailable: ${res.error}`, "bear");
+      } finally {
+        if (seq === loadSeqRef.current) setIsLoadingKlines(false);
+      }
+    },
+    [],
+  );
+  const loadKlinesRef = useRef(loadKlines);
+  useEffect(() => {
+    loadKlinesRef.current = loadKlines;
+  }, [loadKlines]);
+  const addToastRef = useRef(addToast);
+  useEffect(() => {
+    addToastRef.current = addToast;
+  }, [addToast]);
+
+  // ── Crosshair legend: updated imperatively (pointer moves / frames), coalesced
+  //    to one DOM write per animation frame. React never re-renders on hover.
+  const legendRafRef = useRef(0);
+  const scheduleLegend = useCallback(() => {
+    if (legendRafRef.current) return;
+    legendRafRef.current = requestAnimationFrame(() => {
+      legendRafRef.current = 0;
+      legendRef.current?.update(
+        crosshairRef.current ? chartRef.current?.getReadout() ?? null : null,
+      );
+    });
+  }, []);
+  useEffect(() => () => cancelAnimationFrame(legendRafRef.current), []);
+
+  useEffect(() => {
+    crosshairRef.current = crosshair;
+    localStorage.setItem("terminal.crosshair", crosshair ? "on" : "off");
+    chartRef.current?.setCrosshair(crosshair);
+    scheduleLegend();
+  }, [crosshair, scheduleLegend]);
+  const toggleCrosshair = useCallback(() => setCrosshair((v) => !v), []);
 
   // ── Chart lifecycle (StrictMode-safe) ────────────────────────────────────
   // The cleanup awaits the in-flight async init so the surface created by a
@@ -152,6 +265,7 @@ export default function App() {
       tickSize: 0.5,
       timeframe: timeframeRef.current,
     });
+    chart.setStyle(chartStyleRef.current); // construction colours, before init()
     const initPromise = chart
       .init(CHART_DIV_ID)
       .then(async () => {
@@ -164,20 +278,9 @@ export default function App() {
         );
         for (const { key } of LAYER_META)
           chart.setLayerVisibility(key, layersRef.current[key]);
-
-        setIsLoadingKlines(true);
-        try {
-          const klines = await fetchBinanceFuturesKlines(
-            "XAUUSDT",
-            timeframeRef.current,
-            HISTORY_LIMIT,
-          );
-          if (!disposed && chartRef.current === chart && klines.length > 0) {
-            chart.loadHistoricalCandles(klines);
-          }
-        } finally {
-          if (!disposed) setIsLoadingKlines(false);
-        }
+        chart.setCrosshair(crosshairRef.current);
+        chart.setPointerListener(scheduleLegend);
+        await loadKlinesRef.current(timeframeRef.current);
       })
       .catch((e) => console.error("SciChart init failed:", e));
 
@@ -220,8 +323,23 @@ export default function App() {
       const frame = snap.data as ChartFrame | null;
       if (!frame) return;
 
+      // Venue switch (bridge restarted on another provider): everything on the chart
+      // came from the old feed — wipe it, forget seen signals, reseed history.
+      const v = snap.data?.venue ?? DEFAULT_VENUE;
+      const prevVenue = venueRef.current;
+      venueRef.current = v;
+      if (prevVenue && prevVenue.name !== v.name) {
+        seenSignalIds.current.clear();
+        firstV74Ref.current = true;
+        if (readyRef.current && chartRef.current) {
+          chartRef.current.resetForVenue();
+          void loadKlinesRef.current(timeframeRef.current);
+        }
+      }
+
       if (readyRef.current && chartRef.current) {
         chartRef.current.update(frame);
+        scheduleLegend();
       }
 
       // A+ signal alerts (v74 changes only on closed bars, so this is cheap).
@@ -308,7 +426,7 @@ export default function App() {
       if (rafId) cancelAnimationFrame(rafId);
       stopHiddenPump();
     };
-  }, [addToast]);
+  }, [addToast, scheduleLegend]);
 
   // ── Timeframe switching ──────────────────────────────────────────────────
   const changeTimeframe = useCallback(async (tf: Timeframe) => {
@@ -316,24 +434,8 @@ export default function App() {
     timeframeRef.current = tf;
     setTimeframe(tf);
     chartRef.current?.setTimeframe(tf);
-    setIsLoadingKlines(true);
-    try {
-      const klines = await fetchBinanceFuturesKlines(
-        "XAUUSDT",
-        tf,
-        HISTORY_LIMIT,
-      );
-      if (
-        chartRef.current &&
-        timeframeRef.current === tf &&
-        klines.length > 0
-      ) {
-        chartRef.current.loadHistoricalCandles(klines);
-      }
-    } finally {
-      setIsLoadingKlines(false);
-    }
-  }, []);
+    await loadKlines(tf);
+  }, [loadKlines]);
 
   const resetView = useCallback(() => chartRef.current?.resetView(), []);
 
@@ -346,16 +448,17 @@ export default function App() {
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
-    for (const { key } of LAYER_META) chart.setLayerVisibility(key, layers[key]);
-  }, [layers]);
+    for (const { key } of LAYER_META) chart.setLayerVisibility(key, effectiveLayers[key]);
+  }, [effectiveLayers]);
 
   // ── Click-to-inspect absorption bubbles ──────────────────────────────────
-  const onChartClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const hit = chartRef.current?.hitTestBubble(e.clientX, e.clientY, 18);
+  const onChartClick = useCallback(() => {
+    const hit = chartRef.current?.hitTestBubble(18);
     if (hit) {
       setAbsorptionModal({
         time: hit.point?.time ?? hit.x,
         anchorPrice: hit.point?.price ?? hit.y,
+        side: hit.side,
         point: hit.point,
       });
     }
@@ -364,9 +467,14 @@ export default function App() {
   // ── Keyboard: Alt+D toggles DOM ladder ───────────────────────────────────
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.altKey && (e.key === "d" || e.key === "D")) {
+      if (!e.altKey) return;
+      // e.code: Alt+letter yields a dead/special char on macOS ("∂", "ç").
+      if (e.code === "KeyD") {
         e.preventDefault();
         setShowDomLadder((v) => !v);
+      } else if (e.code === "KeyC") {
+        e.preventDefault();
+        setCrosshair((v) => !v);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -380,8 +488,17 @@ export default function App() {
         isLoadingKlines={isLoadingKlines}
         onChangeTimeframe={changeTimeframe}
         onResetView={resetView}
-        layers={layers}
+        layers={effectiveLayers}
         onToggleLayer={toggleLayer}
+        layerUnavailable={layerUnavailable}
+        crosshair={crosshair}
+        onToggleCrosshair={toggleCrosshair}
+        chartStyle={chartStyle}
+        showStyleMenu={showStyleMenu}
+        onToggleStyleMenu={toggleStyleMenu}
+        onCloseStyleMenu={closeStyleMenu}
+        onChangeChartStyle={setChartStyle}
+        onNotify={addToast}
         heatmapFade={heatmapFade}
         fadeStrength={fadeStrength}
         showFadeMenu={showFadeMenu}
@@ -412,6 +529,13 @@ export default function App() {
               id={CHART_DIV_ID}
               onClick={onChartClick}
               className="absolute inset-0"
+              aria-label={`${venue.display_symbol} price chart`}
+              role="img"
+            />
+            <CrosshairLegend
+              ref={legendRef}
+              volumeKind={venue.capabilities.volume}
+              deltaKind={venue.capabilities.delta}
             />
           </div>
 

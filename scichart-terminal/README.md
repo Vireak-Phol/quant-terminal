@@ -9,8 +9,19 @@ Edition) that visualises three institutional order-flow lenses on one chart:
 | **Absorption bubbles** | ATAS | `absorption_candidates[]` (aggressive volume absorbed w/o price move) | `XyScatterRenderableSeries` + `EllipsePointMarker` |
 | **Liquidity vacuum** | OSC-VIP v7.4 Pine | `vacuum_zones[]` + `vacuum_magnet` | `BoxAnnotation` per pocket + magnet `HorizontalLineAnnotation` |
 
-It **reuses the existing Python `orderbook-bridge`** as the data backend (Binance
-USDⓈ-M Futures XAUUSDT) over WebSocket. No new market-data plumbing.
+It **reuses the existing Python `orderbook-bridge`** as the data backend over
+WebSocket. The bridge serves one of two venues, switchable from the instrument chip
+in the header:
+
+| Provider | Instrument | L2 heatmap | Absorption / regime | Delta candles | Volume |
+| --- | --- | --- | --- | --- | --- |
+| Binance USDⓈ-M (default) | XAUUSDT perp | ✔ | ✔ (real tape, OI, liquidations) | ✔ exchange taker delta | traded |
+| OANDA v20 | XAU/USD CFD | — (quotes only) | bar-close detector only | — | tick count |
+
+Layers whose data the active venue lacks are disabled in the toolbar (hover for the
+reason) rather than drawn from fabricated inputs. Chart history is fetched **through
+the bridge** (`get_klines`), so OANDA credentials stay server-side; if the bridge is
+down and the venue is Binance, the chart falls back to Binance public REST.
 
 ---
 
@@ -63,10 +74,18 @@ From the repo root:
 .venv/bin/python orderbook-bridge/bridge.py
 ```
 
-The bridge serves `ws://0.0.0.0:8765`. Optional env vars:
+The bridge serves `ws://localhost:8765` (loopback only; browser origins other than
+localhost get HTTP 403). Optional env vars:
 
 - `BRIDGE_PORT` — WebSocket port (default `8765`)
+- `BRIDGE_HOST` — bind address (default `localhost`; the socket has no auth)
+- `MARKET_PROVIDER` — `binance` | `oanda` (overrides the UI choice)
 - `VACUUM_BAR_MS` — candle size fed to the vacuum engine (default `60000` = 1m)
+
+To enable OANDA, put `OANDA_API_TOKEN`, `OANDA_ACCOUNT_ID` and `OANDA_ENV`
+(`practice`/`live`) in the repo-root `.env` (see `.env.example`), then pick OANDA in
+the instrument menu. The bridge saves the choice to `data/config.json` and restarts
+itself (~5 s); the chart resets and reloads history automatically.
 
 ### 2. Start the SciChart terminal (frontend)
 
@@ -76,9 +95,26 @@ pnpm install      # first time only
 pnpm dev          # http://localhost:5273
 ```
 
-Open http://localhost:5273. The header shows connection status and the current
-vacuum-magnet direction. The chart draws candles, the liquidity heatmap, absorption
-bubbles, and vacuum boxes/magnet line live.
+Open http://localhost:5273. The chart draws candles, the liquidity heatmap,
+absorption bubbles, and vacuum boxes/magnet line live.
+
+Chart controls:
+
+- **Crosshair** — toolbar button or **Alt+C**. Dashed cursor lines with time/price
+  axis badges, plus an OHLC · change · volume · Δ legend (top-left) for the candle
+  under the cursor; it shows the live candle when the pointer leaves the plot.
+- **Wheel** zoom, **drag** pan, **double-click** (or *Live*) snaps back to the live edge.
+- **Click an absorption bubble** for the detector breakdown. **Alt+D** toggles the DOM.
+
+### Rendering performance
+
+Absorption markers are GPU scatter + text series (one draw call per size tier and
+side) instead of one SVG annotation each, the heatmap grid is shared with SciChart by
+reference and only the live column is copied per frame, geometry setters are skipped
+when unchanged, hidden layers do no GPU work, and the OHLC legend is updated
+imperatively (no React re-render on hover). Measured in headless Chrome against the
+previous build with the same live feed: SVG nodes in the chart 1,205 → 37–121,
+animation frame rate 2.5–21 fps → 23–32 fps.
 
 ### Production build
 
@@ -114,10 +150,14 @@ runs **fully offline**. If local WASM ever fails to resolve, switch that call to
 scichart-terminal/
 ├─ src/
 │  ├─ types/frame.ts        # typed BookmapFrame (bridge contract)
-│  ├─ hooks/useBridge.ts    # WS client, auto-reconnect, partial-frame merge
+│  ├─ hooks/useLiveOrderBook.ts # shared WS (ref-counted), request/response, venue types
+│  ├─ hooks/useVenue.ts     # active venue + capability flags
+│  ├─ lib/klines.ts         # chart history via bridge, Binance-direct fallback
 │  ├─ chart/
 │  │  ├─ scichart-init.ts   # Community license + WASM config
-│  │  └─ TerminalChart.ts   # surface + heatmap + bubbles + vacuum overlays
+│  │  └─ TerminalChart.ts   # surface + heatmap + bubbles + vacuum + crosshair
+│  ├─ components/Header/ProviderSwitcher.tsx  # Binance ⇄ OANDA menu
+│  ├─ components/Dashboard/CrosshairLegend.tsx # OHLC hover readout
 │  ├─ App.tsx               # header + chart mount
 │  └─ main.tsx
 ├─ vite.config.ts           # WASM static copy, dev port 5273

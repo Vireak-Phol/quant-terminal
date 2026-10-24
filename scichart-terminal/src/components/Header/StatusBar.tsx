@@ -1,5 +1,6 @@
 import { memo } from "react";
 import { useLiveField } from "../../hooks/useLiveField";
+import { useVenue } from "../../hooks/useVenue";
 import type { Timeframe } from "../../chart/TerminalChart";
 
 /** Isolated, memoised footer. Subscribes only to telemetry counters.
@@ -10,6 +11,7 @@ export const StatusBar = memo(function StatusBar({
 }: {
   timeframe: Timeframe;
 }) {
+  const venue = useVenue();
   const t = useLiveField(
     (s) => ({
       sync: s.data?.telemetry?.order_book_sync_state ?? "—",
@@ -24,9 +26,10 @@ export const StatusBar = memo(function StatusBar({
           <span className="w-1.5 h-1.5 rounded-full bg-terminal-bull" />
           SciChart GPU
         </span>
-        <span className="hidden md:inline">Binance USDⓈ-M · XAUUSDT</span>
-        <span>
-          Sync <span className="text-terminal-gold font-semibold uppercase">{t.sync}</span>
+        <span className="hidden md:inline">{venue.label} · {venue.display_symbol}</span>
+        <span title={venue.capabilities.l2_depth ? "L2 order-book sync state" : "Quote stream (no market depth on this venue)"}>
+          {venue.capabilities.l2_depth ? "Sync" : "Quotes"}{" "}
+          <span className="text-terminal-gold font-semibold uppercase">{t.sync}</span>
         </span>
       </div>
       <div className="hidden xl:flex items-center gap-3">

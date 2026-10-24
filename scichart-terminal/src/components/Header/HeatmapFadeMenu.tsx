@@ -87,7 +87,7 @@ export const HeatmapFadeMenu = memo(function HeatmapFadeMenu({
       </div>
 
       {showMenu && heatmapEnabled && (
-        <div className="absolute top-full mt-2 right-0 z-50 w-72 p-3 rounded-lg bg-terminal-surface/98 border border-terminal-border shadow-2xl backdrop-blur-md text-2xs font-mono space-y-2.5">
+        <div className="absolute top-full mt-2 right-0 z-50 w-72 p-3 rounded-lg bg-terminal-surface border border-terminal-border shadow-2xl text-2xs font-mono space-y-2.5">
           <div className="flex items-center justify-between border-b border-terminal-border/60 pb-1.5">
             <span className="font-bold text-terminal-gold flex items-center gap-1.5">
               <Icon name="heatmap" /> HEATMAP FADE

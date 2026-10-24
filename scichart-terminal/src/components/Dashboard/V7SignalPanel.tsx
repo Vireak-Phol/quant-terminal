@@ -92,7 +92,7 @@ export function V7SignalPanel({ v74, tf, onTfChange, onClose }: Props) {
         {!v74 ? (
           <Empty title="Bridge not connected" text="Start the bridge: PYTHONPATH=orderbook-bridge:. .venv/bin/python3 orderbook-bridge/bridge.py" />
         ) : v74.status === 'warming_up' ? (
-          <Empty title="Warming up engine…" text="Replaying 30 days of XAUUSDT bars so every indicator matches its Pine state." />
+          <Empty title="Warming up engine…" text="Replaying 30 days of bars from the active venue so every indicator matches its Pine state." />
         ) : v74.status === 'error' ? (
           <Empty title="Engine error" text={v74.error ?? 'unknown'} />
         ) : tab === 'signal' ? (

@@ -1,4 +1,5 @@
-"""Binance USDⓈ-M kline access with an on-disk cache and offline fixture fallback (T2 BarStore backfill)."""
+"""Venue kline access (Binance USDⓈ-M or OANDA v20, routed by symbol) with an on-disk
+cache and offline fixture fallback (T2 BarStore backfill)."""
 
 from __future__ import annotations
 
@@ -62,8 +63,59 @@ def _get(url: str, retries: int = 2) -> List:
     return []
 
 
+def _is_oanda(symbol: str) -> bool:
+    """OANDA instrument ids contain "_" (XAU_USD); Binance symbols never do."""
+    return "_" in symbol
+
+
+# OANDA has gold history back to 2005; a full 1m pull would be millions of bars.
+# Cap the backfill window (override with OANDA_HISTORY_DAYS).
+OANDA_HISTORY_DAYS = int(os.environ.get("OANDA_HISTORY_DAYS", "180"))
+
+
+def _oanda_cfg():
+    from .venue import oanda_config
+
+    cfg = oanda_config()
+    if cfg is None:
+        raise RuntimeError("OANDA credentials missing (OANDA_API_TOKEN / OANDA_ACCOUNT_ID)")
+    return cfg
+
+
+def _oanda_kline(r: Dict) -> Kline:
+    # No aggressor split on OANDA: taker_buy=0.0 makes the runtime fall back to the
+    # Pine lower-TF flow proxy (same path as the TradingView fixtures). Volume is tick volume.
+    return Kline(int(r["t"]), float(r["o"]), float(r["h"]), float(r["l"]), float(r["c"]), float(r["v"]), 0.0)
+
+
+def _oanda_fetch_range(symbol: str, interval: str, start: int, end: int) -> List[Kline]:
+    from market_data.oanda import MAX_CANDLES_PER_REQUEST, fetch_candles
+
+    cfg = _oanda_cfg()
+    step = TF_SECONDS[interval]
+    now = int(time.time())
+    start = max(start, now - OANDA_HISTORY_DAYS * 86400)
+    out: List[Kline] = []
+    cur = start
+    while cur < end:
+        rows = fetch_candles(cfg, symbol, interval, count=MAX_CANDLES_PER_REQUEST, from_sec=cur)
+        if not rows:
+            break
+        for r in rows:
+            if r["t"] < end and r["t"] + step <= now:
+                out.append(_oanda_kline(r))
+        nxt = int(rows[-1]["t"]) + step
+        if nxt <= cur or len(rows) < MAX_CANDLES_PER_REQUEST - 1:
+            break
+        cur = nxt
+        time.sleep(0.1)  # OANDA allows ~100 req/s; stay polite
+    return out
+
+
 def fetch_range(symbol: str, interval: str, start: int, end: Optional[int] = None, limit: int = 1500) -> List[Kline]:
     """Fetch closed klines with open time in [start, end) (epoch seconds)."""
+    if _is_oanda(symbol):
+        return _oanda_fetch_range(symbol, interval, start, end or int(time.time()))
     out: List[Kline] = []
     step = TF_SECONDS[interval]
     now = int(time.time())
@@ -174,7 +226,32 @@ def load_history(symbol: str, interval: str, start: Optional[int] = None, refres
 
 
 def fetch_recent(symbol: str, interval: str, limit: int = 1500) -> List[Kline]:
-    raw = _get(f"{REST}?symbol={symbol}&interval={interval}&limit={limit}")
     step = TF_SECONDS[interval]
     now = int(time.time())
+    if _is_oanda(symbol):
+        from market_data.oanda import fetch_candles
+
+        rows = fetch_candles(_oanda_cfg(), symbol, interval, count=limit)
+        return [k for k in (_oanda_kline(r) for r in rows) if k.t + step <= now]
+    raw = _get(f"{REST}?symbol={symbol}&interval={interval}&limit={limit}")
     return [k for k in (Kline.from_binance(x) for x in raw) if k.t + step <= now]
+
+
+def fetch_chart_candles(symbol: str, interval: str, limit: int = 1000) -> List[Dict]:
+    """Chart seed for the UI, INCLUDING the forming last bar (the chart treats the last
+    candle as live). ``delta`` is the exchange taker delta on Binance and ``None`` on
+    OANDA, which has no aggressor data (the UI then colours by close-vs-open)."""
+    limit = max(1, min(int(limit), 1500))
+    if _is_oanda(symbol):
+        from market_data.oanda import fetch_candles
+
+        rows = fetch_candles(_oanda_cfg(), symbol, interval, count=limit, include_incomplete=True)
+        return [{"time": int(r["t"]), "open": r["o"], "high": r["h"], "low": r["l"], "close": r["c"],
+                 "volume": r["v"], "delta": None} for r in rows]
+    raw = _get(f"{REST}?symbol={symbol}&interval={interval}&limit={limit}")
+    out = []
+    for k in raw:
+        b = Kline.from_binance(k)
+        out.append({"time": b.t, "open": b.o, "high": b.h, "low": b.l, "close": b.c, "volume": b.v,
+                    "delta": b.delta})
+    return out

@@ -17,6 +17,8 @@ export type IconName =
   | "bell"
   | "bellOff"
   | "live"
+  | "crosshair"
+  | "palette"
   | "theme";
 
 const PATHS: Record<IconName, JSX.Element> = {
@@ -90,6 +92,20 @@ const PATHS: Record<IconName, JSX.Element> = {
     <>
       <path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1" />
       <path d="M12 1.8v2.6H9.4" />
+    </>
+  ),
+  palette: (
+    <>
+      <path d="M8 1.8a6.2 6.2 0 1 0 0 12.4c1 0 1.4-.6 1.4-1.3 0-.9-.8-1.2-.8-2 0-.7.6-1.2 1.4-1.2h1.6a2.6 2.6 0 0 0 2.6-2.7C14.2 4.3 11.4 1.8 8 1.8Z" />
+      <circle cx="5" cy="7" r=".9" fill="currentColor" stroke="none" />
+      <circle cx="8" cy="4.8" r=".9" fill="currentColor" stroke="none" />
+      <circle cx="11" cy="6.3" r=".9" fill="currentColor" stroke="none" />
+    </>
+  ),
+  crosshair: (
+    <>
+      <path d="M8 1.5v4.5M8 10v4.5M1.5 8H6M10 8h4.5" />
+      <circle cx="8" cy="8" r="1" fill="currentColor" stroke="none" />
     </>
   ),
   theme: (

@@ -52,8 +52,9 @@ def format_signal(sig) -> str:
     else:
         n = st.get("n", 0) if st else 0
         pr = f"Win rate: warm-up (n={n}/{prob.get('min_samples', 15)}) — not yet measured"
+    symbol = d.get("symbol") or str(d.get("id", "XAUUSDT")).split("-")[0]
     lines = [
-        f"{arrow} · {tier} · XAUUSDT {d['tf']}",
+        f"{arrow} · {tier} · {symbol} {d['tf']}",
         f"Setup: {d['setup']}",
         f"Entry {p.get('entry')} · SL {p.get('stop')} · TP1 {p.get('tp1')} · TP2 {p.get('tp2')}",
         f"Size {p.get('qty')} oz · risk ${p.get('risk_usd')} · R:R {p.get('rr_tp1')}",

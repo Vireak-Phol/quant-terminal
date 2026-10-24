@@ -147,10 +147,54 @@ export interface LiveOrderBookData {
    *  selector keys its re-render off this so a new bubble is never dropped at
    *  ring-buffer capacity when a same-signature fill repeats (Audit #1). */
   bubblesRev?: number
+  /** Active market-data venue + capability flags (absent on pre-venue bridges). */
+  venue?: VenueInfo
   status: string
 }
 
 export type ConnectionState = 'connected' | 'connecting' | 'disconnected'
+
+/** What the active venue's feed really contains (bridge `frame.venue.capabilities`). */
+export interface VenueCapabilities {
+  l2_depth: boolean
+  trades: boolean
+  liquidations: boolean
+  open_interest: boolean
+  funding: boolean
+  /** "exchange" = traded volume; "tick" = quote-change count (OANDA). */
+  volume: 'exchange' | 'tick'
+  /** "exchange" = taker aggressor delta; "tick_rule" = estimate from quote ticks. */
+  delta: 'exchange' | 'tick_rule'
+}
+
+export interface VenueInfo {
+  name: 'binance' | 'oanda' | string
+  label: string
+  symbol: string
+  display_symbol: string
+  contract: string
+  capabilities: VenueCapabilities
+}
+
+export interface ProviderOption extends VenueInfo {
+  available: boolean
+  reason: string | null
+}
+
+/** Assumed until the first frame arrives (and for bridges that predate venues). */
+export const DEFAULT_VENUE: VenueInfo = {
+  name: 'binance',
+  label: 'Binance USDⓈ-M Futures',
+  symbol: 'XAUUSDT',
+  display_symbol: 'XAUUSDT',
+  contract: 'PERP',
+  capabilities: {
+    l2_depth: true, trades: true, liquidations: true, open_interest: true,
+    funding: true, volume: 'exchange', delta: 'exchange',
+  },
+}
+
+type Reply = { type: string } & Record<string, unknown>
 
 interface Snapshot {
   data: LiveOrderBookData | null
@@ -169,7 +213,7 @@ export class SharedSocket {
   private listeners = new Set<() => void>()
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private closedByUs = false
-  private replyListeners = new Set<(msg: { type: string } & Record<string, unknown>) => void>()
+  private replyListeners = new Set<(msg: Reply) => void>()
   snapshot: Snapshot = { data: null, connectionState: 'connecting', latencyMs: 0 }
 
   constructor(private url: string, private reconnectMs = 2000) {}
@@ -186,7 +230,7 @@ export class SharedSocket {
   getSnapshot = (): Snapshot => this.snapshot
 
   /** Command replies (`ledger`, `risk_config`, `recorder_status`, …) — not book frames. */
-  onReply(fn: (msg: { type: string } & Record<string, unknown>) => void): () => void {
+  onReply(fn: (msg: Reply) => void): () => void {
     this.replyListeners.add(fn)
     return () => {
       this.replyListeners.delete(fn)
@@ -199,6 +243,60 @@ export class SharedSocket {
       return true
     }
     return false
+  }
+
+  private reqSeq = 0
+
+  /**
+   * Request/response over the shared socket. Sends `{action, req_id, ...payload}` and
+   * resolves with the reply carrying the same `req_id`. If the socket is not open yet
+   * (first mount, bridge restarting) it waits for the connection within `timeoutMs`.
+   * Rejects on timeout or if the socket drops before the reply arrives.
+   */
+  request<T = Reply>(
+    action: string,
+    payload: Record<string, unknown> = {},
+    timeoutMs = 15_000,
+  ): Promise<T> {
+    const reqId = `${action}-${Date.now().toString(36)}-${++this.reqSeq}`
+    return new Promise<T>((resolve, reject) => {
+      let sent = false
+      let settled = false
+      const cleanup: Array<() => void> = []
+      const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        cleanup.forEach((c) => c())
+        fn()
+      }
+      const timer = setTimeout(
+        () => finish(() => reject(new Error(`${action}: bridge did not reply within ${timeoutMs} ms`))),
+        timeoutMs,
+      )
+      cleanup.push(() => clearTimeout(timer))
+      cleanup.push(
+        this.onReply((m) => {
+          if (m.req_id === reqId) finish(() => resolve(m as unknown as T))
+        }),
+      )
+      const trySend = () => {
+        if (!sent && this.send(action, { ...payload, req_id: reqId })) sent = true
+      }
+      // Keep the socket alive for the duration of the request and follow reconnects.
+      cleanup.push(
+        this.subscribe(() => {
+          if (this.closedByUs) {
+            finish(() => reject(new Error(`${action}: socket closed`)))
+            return
+          }
+          const st = this.snapshot.connectionState
+          if (!sent && st === 'connected') trySend()
+          else if (sent && st === 'disconnected')
+            finish(() => reject(new Error(`${action}: bridge disconnected`)))
+        }),
+      )
+      trySend()
+    })
   }
 
   private emit(patch: Partial<Snapshot>) {
@@ -228,8 +326,11 @@ export class SharedSocket {
           return
         }
         const latencyMs = parsed.timestamp ? Math.max(0, Date.now() - parsed.timestamp) : this.snapshot.latencyMs
-        // The bridge sends the heavy `v74` frame only when it changes; carry the last one forward.
-        if (!('v74' in parsed) && this.snapshot.data?.v74 !== undefined) parsed.v74 = this.snapshot.data.v74
+        // The bridge sends the heavy `v74` frame only when it changes; carry the last one
+        // forward — but never across a venue switch (that would show the other venue's signals).
+        const prev = this.snapshot.data
+        const sameVenue = (prev?.venue?.name ?? 'binance') === (parsed.venue?.name ?? 'binance')
+        if (!('v74' in parsed) && prev?.v74 !== undefined && sameVenue) parsed.v74 = prev.v74
         this.emit({ data: parsed as LiveOrderBookData, latencyMs })
       } catch (e) {
         console.error('Error parsing OrderBook WS payload:', e)

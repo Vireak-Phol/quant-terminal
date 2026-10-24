@@ -37,7 +37,7 @@ High-performance Python market data, order-book synchronization, and quantitativ
         +-----------------------+-----------------------+
                                 |
                       [ TerminalBridge ]
-                    (ws://0.0.0.0:8765)
+                    (ws://localhost:8765)
                                 |
                      [ React Trading Terminal ]
            (Lightweight-Charts v5, Canvas Overlays, DOM Ladder)
@@ -149,6 +149,36 @@ Python port of `pine-strategy/7.4` (OSC-VIP v7.4 + REG/UIS-VIP v7.4), driven by 
 ../.venv/bin/python -m engine.backtest --tf 5m --tf 15m --json ../data/backtest_report.json
 # bridge on another port (frontend: VITE_BRIDGE_URL=ws://localhost:8766 pnpm dev)
 BRIDGE_PORT=8766 PYTHONPATH=orderbook-bridge:. .venv/bin/python3 orderbook-bridge/bridge.py
+# backtest on OANDA XAU_USD (separate ledger data/ledger_oanda.db, spread cost model)
+../.venv/bin/python -m engine.backtest --provider oanda --tf 5m
 ```
 
+### Providers (`market_data/`, `engine/venue.py`)
+
+| | Binance USDⓈ-M (`binance_futures.py`) | OANDA v20 (`oanda.py`) |
+|---|---|---|
+| Symbol | `XAUUSDT` perp | `XAU_USD` CFD |
+| Book | sequenced L2 diffs, 1000 levels | full quote snapshots (`LocalOrderBook.replace_levels`) |
+| Trades | real aggTrade tape | none — tick-rule synthetic ticks (qty 1, side = sign of mid change) |
+| OI / liquidations / funding | yes | no |
+| Kline volume / delta | traded volume, taker delta | tick volume, no delta (engine uses the Pine flow proxy) |
+| Ledger · risk section | `data/ledger.db` · `risk` | `data/ledger_oanda.db` · `risk_oanda` (0 fee, 35-tick spread) |
+
+Capability gating: on OANDA the liquidity-zone detector, dense heatmap column,
+absorption engine and bubble-regime engine are **not fed** (their inputs would be
+dealer quotes or 1-unit synthetic ticks, i.e. fabricated evidence). Tick-volume
+candles, VWAP-Z, SMPI and the full v7.4 engine still run. Each frame carries
+`venue.capabilities` so the UI can grey out what is missing. Ledgers are separate
+because the calibrator does not filter by symbol; mixing perp and CFD outcomes would
+corrupt the measured win rates.
+
+Select with `MARKET_PROVIDER`, `data/config.json` `"provider"`, or the UI. OANDA
+without credentials falls back to Binance with an error log. The API token is only
+sent as a header and is masked in `repr`.
+
 WebSocket commands: `{"action":"get_ledger","tf":"5m"}` → `{"type":"ledger",…}`; `{"action":"set_risk_config","config":{…}}` → `{"type":"risk_config","ok":…}` (validated, saved to `data/config.json`).
+`{"action":"get_klines","tf":"1m","limit":1000,"req_id":…}` → `{"type":"klines","ok":…,"candles":[{time,open,high,low,close,volume,delta}]}` (active venue, includes the forming bar);
+`{"action":"get_providers"}` → `{"type":"providers","active":…,"providers":[…available,reason]}`;
+`{"action":"set_provider","provider":"oanda"}` → `{"type":"provider_switch","ok":…,"restarting":true}` then the bridge persists the choice and re-execs.
+Replies echo `req_id`. The server binds `localhost` and rejects non-localhost browser
+`Origin`s (403) — it has no authentication, so do not expose it.

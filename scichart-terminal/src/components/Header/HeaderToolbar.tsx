@@ -6,6 +6,9 @@ import { LiveQuote } from "./LiveQuote";
 import { OrderFlowBadge } from "./OrderFlowBadge";
 import { HeatmapFadeMenu } from "./HeatmapFadeMenu";
 import { ToolbarButton, ToolbarDivider, ToolbarGroup } from "./ToolbarButton";
+import { ProviderSwitcher } from "./ProviderSwitcher";
+import { ChartStyleMenu } from "./ChartStyleMenu";
+import type { ChartStyle } from "../../lib/chartStyle";
 
 export interface HeaderToolbarProps {
   timeframe: Timeframe;
@@ -15,6 +18,17 @@ export interface HeaderToolbarProps {
 
   layers: Record<ChartLayer, boolean>;
   onToggleLayer: (key: ChartLayer) => void;
+  /** Per-layer reason the active venue cannot feed it (null = available). */
+  layerUnavailable: Record<ChartLayer, string | null>;
+
+  crosshair: boolean;
+  onToggleCrosshair: () => void;
+  chartStyle: ChartStyle;
+  showStyleMenu: boolean;
+  onToggleStyleMenu: () => void;
+  onCloseStyleMenu: () => void;
+  onChangeChartStyle: (s: ChartStyle) => void;
+  onNotify: (msg: string, type?: "info" | "bull" | "bear") => void;
 
   heatmapFade: boolean;
   fadeStrength: number;
@@ -64,6 +78,15 @@ export const HeaderToolbar = memo(function HeaderToolbar({
   onResetView,
   layers,
   onToggleLayer,
+  layerUnavailable,
+  crosshair,
+  onToggleCrosshair,
+  chartStyle,
+  showStyleMenu,
+  onToggleStyleMenu,
+  onCloseStyleMenu,
+  onChangeChartStyle,
+  onNotify,
   heatmapFade,
   fadeStrength,
   showFadeMenu,
@@ -91,13 +114,7 @@ export const HeaderToolbar = memo(function HeaderToolbar({
     <header className="h-12 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-3 border-b border-terminal-border bg-terminal-surface/95 backdrop-blur-md shrink-0 font-mono text-xs z-30">
       {/* ── Left: instrument + timeframe ─────────────────────────────── */}
       <div className="flex items-center gap-2 shrink-0">
-        <div className="flex items-center gap-2 h-8 pl-2.5 pr-2 rounded-lg bg-terminal-panel border border-terminal-border">
-          <span className="w-1.5 h-1.5 rounded-full bg-terminal-gold" aria-hidden="true" />
-          <span className="font-bold tracking-wider text-[13px] text-terminal-text">XAUUSDT</span>
-          <span className="hidden sm:inline text-2xs px-1.5 rounded bg-terminal-surface border border-terminal-border text-terminal-text-dim font-semibold">
-            PERP
-          </span>
-        </div>
+        <ProviderSwitcher onNotify={onNotify} />
 
         <ToolbarGroup label="Timeframe">
           {TIMEFRAMES.map((tf) => (
@@ -116,8 +133,15 @@ export const HeaderToolbar = memo(function HeaderToolbar({
             icon="live"
             label="Live"
             collapseLabel
-            title="Snap back to the live edge"
+            title="Snap back to the live edge (double-click chart)"
             onClick={onResetView}
+          />
+          <ToolbarButton
+            icon="crosshair"
+            active={crosshair}
+            tone="info"
+            title={`Crosshair + OHLC readout — ${crosshair ? "on" : "off"} (Alt+C)`}
+            onClick={onToggleCrosshair}
           />
         </ToolbarGroup>
 
@@ -138,21 +162,25 @@ export const HeaderToolbar = memo(function HeaderToolbar({
       {/* ── Right: chart layers · panels · system ─────────────────────── */}
       <div className="flex items-center gap-2 shrink-0">
         <ToolbarGroup label="Chart layers">
-          {LAYER_META.map((l) => (
-            <ToolbarButton
-              key={l.key}
-              icon={l.icon}
-              label={l.label}
-              collapseLabel
-              active={layers[l.key]}
-              tone={l.tone}
-              title={`${l.description} — ${layers[l.key] ? "on" : "off"}`}
-              onClick={() => onToggleLayer(l.key)}
-            />
-          ))}
+          {LAYER_META.map((l) => {
+            const na = layerUnavailable[l.key];
+            return (
+              <ToolbarButton
+                key={l.key}
+                icon={l.icon}
+                label={l.label}
+                collapseLabel
+                active={!na && layers[l.key]}
+                disabled={!!na}
+                tone={l.tone}
+                title={na ? `${l.description} — unavailable: ${na}` : `${l.description} — ${layers[l.key] ? "on" : "off"}`}
+                onClick={() => onToggleLayer(l.key)}
+              />
+            );
+          })}
           <ToolbarDivider className="mx-0.5 !h-4" />
           <HeatmapFadeMenu
-            heatmapEnabled={layers.heatmap}
+            heatmapEnabled={layers.heatmap && !layerUnavailable.heatmap}
             heatmapFade={heatmapFade}
             fadeStrength={fadeStrength}
             showMenu={showFadeMenu}
@@ -203,6 +231,13 @@ export const HeaderToolbar = memo(function HeaderToolbar({
         </ToolbarGroup>
 
         <ToolbarGroup label="System">
+          <ChartStyleMenu
+            style={chartStyle}
+            open={showStyleMenu}
+            onToggle={onToggleStyleMenu}
+            onClose={onCloseStyleMenu}
+            onChange={onChangeChartStyle}
+          />
           <ToolbarButton
             icon={soundOn ? "bell" : "bellOff"}
             active={soundOn}

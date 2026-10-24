@@ -184,6 +184,31 @@ class LocalOrderBook:
         self.last_receive_time = event.received_timestamp
         self.total_updates_processed += 1
 
+    def replace_levels(
+        self,
+        bids: List[Tuple[Decimal, Decimal]],
+        asks: List[Tuple[Decimal, Decimal]],
+        exchange_timestamp: Optional[int] = None,
+    ):
+        """Replace the whole book with a full quote snapshot (quote-only venues such
+        as OANDA, which stream complete bid/ask ladders rather than sequenced diffs).
+        There is no sequence to verify, so the book is SYNCHRONIZED by construction.
+        Zero/negative-price levels are dropped; a zero liquidity figure is kept (the
+        venue quoted the price but did not disclose size). Crossed snapshots (best
+        bid >= best ask) are rejected and the previous book is kept."""
+        new_bids = {p: q for p, q in bids if p > 0 and q >= 0}
+        new_asks = {p: q for p, q in asks if p > 0 and q >= 0}
+        if new_bids and new_asks and max(new_bids) >= min(new_asks):
+            logger.debug(f"[{self.symbol}] crossed quote ignored: {max(new_bids)} >= {min(new_asks)}")
+            return
+        self.bids = new_bids
+        self.asks = new_asks
+        self.state = OrderBookSyncState.SYNCHRONIZED
+        self.event_buffer.clear()
+        self.last_exchange_time = exchange_timestamp or int(time.time() * 1000)
+        self.last_receive_time = int(time.time() * 1000)
+        self.total_updates_processed += 1
+
     def _apply_event_levels(self, event: DepthUpdateEvent):
         """Applies level quantity updates or removes zero-quantity levels."""
         zero = Decimal("0")

@@ -110,7 +110,7 @@ export function DiagnosticsPanel({ onClose }: DiagnosticsPanelProps) {
           <div className="space-y-1.5 text-2xs pt-1">
             <div className="flex justify-between items-center py-1 border-b border-terminal-border/40">
               <span className="text-terminal-text-dim">Contract:</span>
-              <span className="font-bold text-terminal-text">Binance Futures XAUUSDT Perpetual</span>
+              <span className="font-bold text-terminal-text">{liveBook?.venue ? `${liveBook.venue.label} ${liveBook.venue.display_symbol} ${liveBook.venue.contract}` : 'Binance Futures XAUUSDT Perpetual'}</span>
             </div>
             <div className="flex justify-between items-center py-1 border-b border-terminal-border/40">
               <span className="text-terminal-text-dim">Mark Price:</span>
@@ -121,7 +121,9 @@ export function DiagnosticsPanel({ onClose }: DiagnosticsPanelProps) {
             <div className="flex justify-between items-center py-1 border-b border-terminal-border/40">
               <span className="text-terminal-text-dim">Funding Rate:</span>
               <span className="font-bold tabular-nums text-cyan-400">
-                {liveBook?.funding_rate ? `${(liveBook.funding_rate * 100).toFixed(4)}%` : '0.0000%'}
+                {liveBook?.venue && !liveBook.venue.capabilities.funding
+                  ? 'n/a (CFD)'
+                  : liveBook?.funding_rate ? `${(liveBook.funding_rate * 100).toFixed(4)}%` : '0.0000%'}
               </span>
             </div>
             <div className="flex justify-between items-center py-1 border-b border-terminal-border/40">

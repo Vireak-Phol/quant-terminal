@@ -39,13 +39,15 @@ class RiskConfig:
     cost_heavy_r: float = 0.30  # flag plans whose round-trip cost exceeds this share of 1R
 
     @classmethod
-    def load(cls, path: str = CONFIG_PATH) -> "RiskConfig":
+    def load(cls, path: str = CONFIG_PATH, section: str = "risk", defaults: Optional[Dict] = None) -> "RiskConfig":
+        """Load ``section`` from config.json on top of venue ``defaults`` (e.g. OANDA's
+        zero-commission / spread-cost model). Saved values always win."""
         try:
             with open(path) as fh:
-                raw = json.load(fh).get("risk", {})
+                raw = json.load(fh).get(section, {})
         except (OSError, ValueError):
             raw = {}
-        return cls.from_dict(raw)
+        return cls.from_dict({**(defaults or {}), **raw})
 
     @classmethod
     def from_dict(cls, raw: Dict) -> "RiskConfig":
@@ -68,7 +70,7 @@ class RiskConfig:
         if self.horizon_bars < 1:
             raise ValueError("horizon_bars must be >= 1")
 
-    def save(self, path: str = CONFIG_PATH) -> None:
+    def save(self, path: str = CONFIG_PATH, section: str = "risk") -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         data: Dict = {}
         try:
@@ -76,7 +78,7 @@ class RiskConfig:
                 data = json.load(fh)
         except (OSError, ValueError):
             pass
-        data["risk"] = asdict(self)
+        data[section] = asdict(self)
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(data, fh, indent=2)

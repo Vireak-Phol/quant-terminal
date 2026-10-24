@@ -1,5 +1,6 @@
 import { memo, useEffect, useState } from 'react'
 import { useLiveField } from '../../hooks/useLiveField'
+import { useVenue } from '../../hooks/useVenue'
 import type { BubbleSignalData, BubbleRegime } from '../../hooks/useLiveOrderBook'
 
 export interface OrderFlowPanelProps {
@@ -145,6 +146,8 @@ const PositioningCard = memo(function PositioningCard() {
 })
 
 export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
+  const venue = useVenue()
+  const realTape = venue.capabilities.trades
   // Low-frequency slice: only re-render when the bubble feed changes. CVD/OI are
   // intentionally NOT selected here — they live in <PositioningCard/> with their
   // own granular selector so high-frequency CVD ticks don't thrash the feed (#5).
@@ -205,6 +208,13 @@ export function OrderFlowPanel({ onClose }: OrderFlowPanelProps) {
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
+        {!realTape && (
+          <div role="note" className="rounded-lg border border-terminal-warn/50 bg-terminal-warn/10 p-2.5 text-2xs leading-snug text-terminal-warn">
+            {venue.label} publishes quotes only — no trade tape, open interest or liquidations.
+            Sweep classification is disabled; CVD below is a tick-rule estimate from quote
+            changes, not traded volume.
+          </div>
+        )}
         {/* OI / CVD metrics — isolated in a memoized card so CVD ticks don't
             re-render the sweep feed (Audit #5). */}
         <PositioningCard />

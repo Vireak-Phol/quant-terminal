@@ -1,8 +1,9 @@
 """Live engine hub (T11): warm-up from history, then evaluate every newly closed bar.
 
-Closed bars are taken from Binance REST shortly after each boundary (poll every 2 s,
-only fetching when a boundary has passed). REST is used instead of an extra WebSocket so
-the existing depth/trade stream in ``BinanceFuturesProvider`` stays untouched.
+Closed bars are taken from the venue REST API shortly after each boundary (poll every
+2 s, only fetching when a boundary has passed). ``engine.data`` routes by symbol:
+Binance (XAUUSDT) or OANDA (XAU_USD). REST is used instead of an extra stream so the
+provider's depth/trade stream stays untouched.
 """
 
 from __future__ import annotations
@@ -28,12 +29,15 @@ WARMUP_DAYS = 30
 class LiveHub:
     def __init__(self, symbol: str = "XAUUSDT", tfs=("5m", "15m"), ledger: Optional[Ledger] = None,
                  snapshot_fn: Optional[Callable[[], Optional[OrderflowSnapshot]]] = None,
-                 on_signal: Optional[Callable[[EngineSignal], None]] = None):
+                 on_signal: Optional[Callable[[EngineSignal], None]] = None,
+                 risk_section: str = "risk", risk_defaults: Optional[Dict] = None):
         self.symbol = symbol
         self.tfs = list(tfs)
         self.ledger = ledger or Ledger()
         self.cal = Calibrator(self.ledger)
-        self.risk = RiskConfig.load()
+        self.risk_section = risk_section
+        self.risk_defaults = dict(risk_defaults or {})
+        self.risk = RiskConfig.load(section=risk_section, defaults=self.risk_defaults)
         self.snapshot_fn = snapshot_fn
         self.on_signal = on_signal
         self.engines: Dict[str, TimeframeEngine] = {
@@ -144,7 +148,7 @@ class LiveHub:
     def set_risk(self, raw: Dict) -> RiskConfig:
         cfg = RiskConfig.from_dict({**self.risk.__dict__, **raw})
         with self.lock:
-            cfg.save()
+            cfg.save(section=self.risk_section)
             self.risk = cfg
             for eng in self.engines.values():
                 eng.risk = cfg

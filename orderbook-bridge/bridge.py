@@ -3,13 +3,18 @@
 Institutional Market Microstructure Terminal Bridge
 ----------------------------------------------------
 Primary Instrument: Binance USDⓈ-M Futures XAUUSDT (TRADIFI_PERPETUAL)
+Alternate venue:    OANDA v20 XAU_USD (quote-only; see market_data/oanda.py)
+Select with MARKET_PROVIDER=binance|oanda, data/config.json "provider", or the UI
+switcher (WS action "set_provider", which persists the choice and re-execs).
 Capabilities:
 1. Sequence-synchronized L2 Order Book with REST snapshot recovery & gap detection.
 2. Resting Liquidity Zone overlay engine with multi-threshold clustering & lifecycle tracking.
 3. Absorption bubble candidate engine with volatility-normalized volume vs. price response.
 4. v7.4 engine (engine/): OSC-VIP + REG v7.4 port, empirical ledger calibration, risk plans.
 5. Event recording & replay engine.
-6. Broadcasts structured JSON frames to trading-terminal on ws://0.0.0.0:8765.
+6. Broadcasts structured JSON frames on ws://127.0.0.1:8765 (BRIDGE_HOST / BRIDGE_PORT).
+   Features whose source data a venue lacks (L2 depth, real tape, OI, liquidations)
+   are disabled and advertised in frame["venue"]["capabilities"].
 """
 
 import asyncio
@@ -21,6 +26,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from typing import Set, Dict, List, Optional, Any
@@ -35,6 +41,7 @@ if _BRIDGE_DIR not in sys.path:
 from market_data.base import ConnectionState, OrderBookSyncState, TradeEvent
 from market_data.order_book import LocalOrderBook
 from market_data.binance_futures import BinanceFuturesProvider
+from market_data.oanda import OandaProvider
 from analytics.liquidity_zones import LiquidityZoneDetector, LiquidityZone
 from analytics.absorption_engine import AbsorptionEngine, AbsorptionCandidate
 from analytics.vacuum_engine import VacuumEngine, Candle
@@ -45,8 +52,17 @@ from analytics.bubble_regime_engine import BubbleRegimeEngine, Liquidation
 from engine.sessions import session_flags as _v74_session_flags
 from replay.replay_engine import MarketRecorder, ReplayPlayer
 from engine.live import LiveHub
+from engine.ledger import Ledger
 from engine.orderflow import OrderflowSnapshot
 from engine.alerts import AlertDispatcher
+from engine.data import fetch_chart_candles
+from engine.venue import (
+    VENUES,
+    active_venue,
+    oanda_config,
+    providers_view,
+    save_provider_name,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,7 +102,28 @@ def safe_json_dumps(obj: Any, default=None) -> str:
     return json.dumps(_clean(obj), default=default)
 
 PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
-SYMBOL = "XAUUSDT"
+# Loopback by default: the socket accepts control commands (risk config, provider
+# switch, recording) and has no authentication. Set BRIDGE_HOST=0.0.0.0 only on a
+# trusted network. "localhost" binds both 127.0.0.1 and ::1.
+HOST = os.environ.get("BRIDGE_HOST", "localhost")
+# Browser Origin allowlist (defends against cross-site WebSocket hijacking: any web
+# page can open ws://localhost). Non-browser clients send no Origin and are allowed.
+ALLOWED_ORIGINS: List[Any] = [
+    None,
+    re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"),
+    *[o.strip() for o in os.environ.get("BRIDGE_ALLOWED_ORIGINS", "").split(",") if o.strip()],
+]
+
+# ── Venue / provider selection ───────────────────────────────────────────────
+# MARKET_PROVIDER env > data/config.json "provider" > binance. OANDA without
+# credentials falls back to Binance so a stale config can never brick the bridge.
+VENUE = active_venue()
+_OANDA_CFG = oanda_config() if VENUE.name == "oanda" else None
+if VENUE.name == "oanda" and _OANDA_CFG is None:
+    logger.error("MARKET_PROVIDER=oanda but OANDA_API_TOKEN / OANDA_ACCOUNT_ID are not set; falling back to Binance")
+    VENUE = VENUES["binance"]
+SYMBOL = VENUE.symbol
+CAPS: Dict[str, Any] = dict(VENUE.capabilities)
 
 # Dense heatmap depth-column geometry. Must stay in lockstep with the frontend
 # TerminalChart grid (PRICE_ROWS rows at tickSize each) so each emitted bin maps
@@ -98,7 +135,10 @@ HEATMAP_BIN_SIZE = 0.5         # == ChartConfig.tickSize in App.tsx
 CLIENTS: Set = set()
 
 # Core engines
-provider = BinanceFuturesProvider(symbol=SYMBOL)
+if VENUE.name == "oanda":
+    provider = OandaProvider(_OANDA_CFG, symbol=SYMBOL)
+else:
+    provider = BinanceFuturesProvider(symbol=SYMBOL)
 zone_detector = LiquidityZoneDetector(
     symbol=SYMBOL,
     min_absolute_qty=15.0,
@@ -174,7 +214,14 @@ def _orderflow_snapshot() -> Optional[OrderflowSnapshot]:
     )
 
 
-hub = LiveHub(symbol=SYMBOL, snapshot_fn=_orderflow_snapshot, on_signal=alerts.on_signal)
+hub = LiveHub(
+    symbol=SYMBOL,
+    ledger=Ledger(VENUE.ledger_path),
+    snapshot_fn=_orderflow_snapshot,
+    on_signal=alerts.on_signal,
+    risk_section=VENUE.risk_section,
+    risk_defaults=VENUE.risk_defaults,
+)
 _v74_cache: Dict[str, Any] = {"version": -1, "at": 0.0, "frame": None}
 
 
@@ -210,9 +257,11 @@ CURRENT_ZONES: List[LiquidityZone] = []
 terminal_state: Dict[str, Any] = {
     "type": "bookmap_update",
     "symbol": SYMBOL,
-    "market_type": "usd_m_futures",
-    "provider": "Binance USDⓈ-M Futures",
-    "contract_type": "TRADIFI_PERPETUAL",
+    "market_type": "usd_m_futures" if VENUE.name == "binance" else "spot_cfd",
+    "provider": VENUE.label,
+    "contract_type": "TRADIFI_PERPETUAL" if VENUE.name == "binance" else "CFD",
+    # Active venue + data capabilities; the UI gates layers on these flags.
+    "venue": VENUE.to_dict(),
     "timestamp": int(time.time() * 1000),
     "mid_price": 0.0,
     "spread": 0.0,
@@ -318,8 +367,13 @@ async def on_depth_update(book: LocalOrderBook):
     top_bids, top_asks = book.get_top_levels(limit=25)
     imbalance, imbalance_score = book.get_imbalance(depth=5)
 
-    # 3. Detect resting liquidity zones
-    CURRENT_ZONES = zone_detector.update(book.bids, book.asks, now_ms=now_ms)
+    # 3. Detect resting liquidity zones. Quote-only venues (OANDA) have no market
+    #    depth — their bid/ask tiers are the dealer's own ladder — so painting them as
+    #    resting liquidity would be fabricated evidence. Zones stay empty there.
+    if CAPS.get("l2_depth"):
+        CURRENT_ZONES = zone_detector.update(book.bids, book.asks, now_ms=now_ms)
+    else:
+        CURRENT_ZONES = []
 
     # 4. Extract resting walls (for backward-compatible DOM & lines)
     resting_walls = []
@@ -368,7 +422,11 @@ async def on_depth_update(book: LocalOrderBook):
         * HEATMAP_BIN_SIZE
     )
     price_max = price_min + HEATMAP_PRICE_ROWS * HEATMAP_BIN_SIZE
-    depth_bins = book.get_binned_depth_column(price_min, price_max, HEATMAP_BIN_SIZE)
+    depth_bins = (
+        book.get_binned_depth_column(price_min, price_max, HEATMAP_BIN_SIZE)
+        if CAPS.get("l2_depth")
+        else []
+    )
     if depth_bins:
         terminal_state["heatmap_column"] = {
             "priceMin": round(price_min, 2),
@@ -448,6 +506,8 @@ async def on_trade_received(trade: TradeEvent):
         "side": trade.aggressor_side,
         "id": trade.trade_id,
     }
+    if not CAPS.get("trades"):
+        trade_dict["synthetic"] = True  # tick-rule estimate from quote changes
     RECENT_TRADES.append(trade_dict)
 
     # --- Audit R1: aggregate into trade-price candles + CVD ---
@@ -462,36 +522,42 @@ async def on_trade_received(trade: TradeEvent):
     terminal_state["trade_candle"] = forming.to_dict() if forming else None
     terminal_state["cvd"] = trade_candle_agg.cvd()
 
+    # Real tape only. On quote-only venues the "trades" are tick-rule synthetic
+    # (qty = 1 tick) — fine for tick-volume candles / VWAP / SMPI, meaningless for
+    # size-based absorption and OI/liquidation sweep classification.
+    real_tape = bool(CAPS.get("trades"))
+
     # --- Bubble Regime engine: classify aggressive sweeps with OI + liquidation ---
     # Refresh the latest OI reading (polled by the provider) before processing the
     # trade so sweep classification sees the freshest OI delta.
-    bubble_engine.update_open_interest(provider.open_interest)
-    bubble_signal = bubble_engine.process_trade(
-        price=float(trade.price),
-        qty=float(trade.quantity),
-        aggressor_side=trade.aggressor_side,
-        timestamp_ms=trade.exchange_timestamp,
-    )
-    if bubble_signal is not None:
-        logger.info(
-            f"🫧 Bubble[{bubble_signal.regime}] {bubble_signal.aggressor_side} "
-            f"{bubble_signal.total_qty:.1f} @ {bubble_signal.price_center:.2f} "
-            f"(oiΔ={bubble_signal.oi_delta:+.1f}, liq={bubble_signal.liquidation_qty:.1f})"
+    if real_tape:
+        bubble_engine.update_open_interest(provider.open_interest)
+        bubble_signal = bubble_engine.process_trade(
+            price=float(trade.price),
+            qty=float(trade.quantity),
+            aggressor_side=trade.aggressor_side,
+            timestamp_ms=trade.exchange_timestamp,
         )
-    bubble_state = bubble_engine.to_dict()
-    terminal_state["open_interest"] = bubble_state["open_interest"]
-    terminal_state["oi_delta"] = bubble_state["oi_delta"]
-    # Only ship the most recent sweeps so the frame stays light (engine retains 500).
-    terminal_state["bubbles"] = bubble_state["bubbles"][-40:]
-    # Monotonic revision drives the UI's sweep-feed change detection (Audit #1).
-    terminal_state["bubblesRev"] = bubble_state["bubblesRev"]
+        if bubble_signal is not None:
+            logger.info(
+                f"🫧 Bubble[{bubble_signal.regime}] {bubble_signal.aggressor_side} "
+                f"{bubble_signal.total_qty:.1f} @ {bubble_signal.price_center:.2f} "
+                f"(oiΔ={bubble_signal.oi_delta:+.1f}, liq={bubble_signal.liquidation_qty:.1f})"
+            )
+        bubble_state = bubble_engine.to_dict()
+        terminal_state["open_interest"] = bubble_state["open_interest"]
+        terminal_state["oi_delta"] = bubble_state["oi_delta"]
+        # Only ship the most recent sweeps so the frame stays light (engine retains 500).
+        terminal_state["bubbles"] = bubble_state["bubbles"][-40:]
+        # Monotonic revision drives the UI's sweep-feed change detection (Audit #1).
+        terminal_state["bubblesRev"] = bubble_state["bubblesRev"]
 
     # --- Audit #5: feed the session regime baseline at each 1-minute bar close ---
     # The closed trade candle's transacted volume is a clean per-minute sample of
     # how thick/thin the tape currently is. Pushing it to update_session_baseline
     # scales the absorption volume gates with the regime (thin Asia vs. hot NY),
     # instead of leaving _vol_scale pinned at 1.0. Only runs once per closed bar.
-    if closed_tc is not None and closed_tc.volume > 0:
+    if real_tape and closed_tc is not None and closed_tc.volume > 0:
         absorption_engine.update_session_baseline(closed_tc.volume)
 
     # --- OSC v7.4 overlays: advance once per CLOSED 1m trade candle (no repaint) ---
@@ -499,7 +565,7 @@ async def on_trade_received(trade: TradeEvent):
     # the live absorption state for the just-closed bar. The forming bar never feeds
     # these, so live == backtest.
     if closed_tc is not None:
-        absorbed = len(absorption_engine.get_recent_candidates(trade.exchange_timestamp)) > 0
+        absorbed = real_tape and len(absorption_engine.get_recent_candidates(trade.exchange_timestamp)) > 0
         vwap_z_engine.update(
             t_ms=closed_tc.t,
             high=closed_tc.h,
@@ -516,19 +582,20 @@ async def on_trade_received(trade: TradeEvent):
         terminal_state["vwap_z"] = vwap_z_engine.to_dict()["vwap_z"]
         terminal_state["pressure_index"] = pressure_engine.to_dict()["pressure_index"]
 
-    # Ingest into quantitative absorption engine
-    candidate = absorption_engine.ingest_trade(
-        price=float(trade.price),
-        qty=float(trade.quantity),
-        aggressor_side=trade.aggressor_side,
-        timestamp_ms=trade.exchange_timestamp,
-        resting_zones=CURRENT_ZONES,
-    )
-
-    if candidate:
-        logger.info(f"⚡ Candidate Absorption: {candidate.reason} (Confidence: {candidate.confidence * 100:.0f}%)")
-
-    recent_candidates = absorption_engine.get_recent_candidates(trade.exchange_timestamp)
+    # Ingest into quantitative absorption engine (real tape only, see above)
+    if real_tape:
+        candidate = absorption_engine.ingest_trade(
+            price=float(trade.price),
+            qty=float(trade.quantity),
+            aggressor_side=trade.aggressor_side,
+            timestamp_ms=trade.exchange_timestamp,
+            resting_zones=CURRENT_ZONES,
+        )
+        if candidate:
+            logger.info(f"⚡ Candidate Absorption: {candidate.reason} (Confidence: {candidate.confidence * 100:.0f}%)")
+        recent_candidates = absorption_engine.get_recent_candidates(trade.exchange_timestamp)
+    else:
+        recent_candidates = []
     terminal_state["recent_trades"] = list(RECENT_TRADES)
     terminal_state["absorption_candidates"] = [c.to_dict() for c in recent_candidates]
 
@@ -573,7 +640,8 @@ async def broadcast():
     else:
         msg = safe_json_dumps({k: v for k, v in terminal_state.items() if k != "v74"})
     dead = set()
-    for ws in CLIENTS:
+    # Snapshot: clients may (dis)connect while we await a send.
+    for ws in list(CLIENTS):
         try:
             await ws.send(msg)
         except Exception:
@@ -593,6 +661,68 @@ async def broadcast_loop():
         except Exception as e:
             logger.error(f"Broadcast error: {e}")
             await asyncio.sleep(0.1)
+
+
+KLINE_TFS = ("1m", "5m", "15m", "30m", "1h", "4h")
+
+# Provider switch: the whole process (engines, ledger, caches, provider stream) is
+# venue-bound, so a switch persists the choice and re-execs the bridge. Clients just
+# see a reconnect and receive the new venue in the first frame.
+_restart_to: Optional[str] = None
+_restart_event: Optional[asyncio.Event] = None
+
+
+async def _klines_reply(cmd: Dict[str, Any]) -> Dict[str, Any]:
+    """Chart seed candles from the ACTIVE venue (keeps OANDA credentials server-side)."""
+    req_id = cmd.get("req_id")
+    tf = cmd.get("tf")
+    if tf not in KLINE_TFS:
+        return {"type": "klines", "req_id": req_id, "ok": False, "error": f"unsupported tf {tf!r}"}
+    try:
+        limit = max(1, min(int(cmd.get("limit", 1000)), 1500))
+    except (TypeError, ValueError):
+        limit = 1000
+    loop = asyncio.get_running_loop()
+    try:
+        candles = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_chart_candles, SYMBOL, tf, limit), timeout=15
+        )
+    except Exception as e:
+        logger.warning(f"get_klines {tf} failed: {e}")
+        return {"type": "klines", "req_id": req_id, "ok": False, "tf": tf, "error": str(e)}
+    return {
+        "type": "klines", "req_id": req_id, "ok": True, "tf": tf,
+        "symbol": SYMBOL, "provider": VENUE.name, "candles": candles,
+    }
+
+
+async def _handle_set_provider(ws, cmd: Dict[str, Any]) -> None:
+    global _restart_to
+    req_id = cmd.get("req_id")
+    name = str(cmd.get("provider", "")).strip().lower()
+
+    async def reply(ok: bool, **extra):
+        await ws.send(json.dumps({"type": "provider_switch", "req_id": req_id, "ok": ok, "provider": name, **extra}))
+
+    if name not in VENUES:
+        await reply(False, error=f"unknown provider {name!r}")
+        return
+    if name == "oanda" and oanda_config() is None:
+        await reply(False, error="OANDA credentials missing: set OANDA_API_TOKEN and OANDA_ACCOUNT_ID in .env")
+        return
+    if name == VENUE.name:
+        await reply(True, restarting=False)
+        return
+    try:
+        save_provider_name(name)
+    except OSError as e:
+        await reply(False, error=f"could not persist provider: {e}")
+        return
+    logger.info(f"Provider switch requested: {VENUE.name} -> {name}; restarting bridge")
+    await reply(True, restarting=True)
+    _restart_to = name
+    if _restart_event is not None:
+        _restart_event.set()
 
 
 async def ws_server_handler(ws):
@@ -640,16 +770,31 @@ async def ws_server_handler(ws):
                         await ws.send(json.dumps({"type": "risk_config", "ok": True, "config": cfg.__dict__}))
                     except (ValueError, TypeError) as e:
                         await ws.send(json.dumps({"type": "risk_config", "ok": False, "error": str(e)}))
+                elif action == "get_klines":
+                    await ws.send(safe_json_dumps(await _klines_reply(cmd)))
+                elif action == "get_providers":
+                    await ws.send(safe_json_dumps({
+                        "type": "providers", "req_id": cmd.get("req_id"),
+                        "active": VENUE.name, "providers": providers_view(),
+                    }))
+                elif action == "set_provider":
+                    await _handle_set_provider(ws, cmd)
             except Exception as e:
                 logger.error(f"Error handling client command: {e}")
+    except websockets.exceptions.ConnectionClosed:
+        pass  # client vanished without a close frame (tab killed, bridge restart) — normal
     finally:
         CLIENTS.discard(ws)
         logger.info(f"Terminal disconnected. Active clients: {len(CLIENTS)}")
 
 
 async def main():
-    logger.info(f"Starting Institutional Market Microstructure Bridge on ws://0.0.0.0:{PORT}...")
-    server = await serve(ws_server_handler, "0.0.0.0", PORT)
+    global _restart_event
+    _restart_event = asyncio.Event()
+    logger.info(f"Starting Market Microstructure Bridge [{VENUE.label} · {SYMBOL}] on ws://{HOST}:{PORT}...")
+    if HOST not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(f"Bridge bound to {HOST}: control commands are unauthenticated — trusted networks only")
+    server = await serve(ws_server_handler, HOST, PORT, origins=ALLOWED_ORIGINS)
 
     # Register callbacks with provider
     provider.register_depth_callback(on_depth_update)
@@ -660,13 +805,31 @@ async def main():
     await provider.start()
     broadcaster = asyncio.create_task(broadcast_loop())
     engine_task = asyncio.create_task(hub.run())
+    serve_task = asyncio.create_task(server.serve_forever())
+    restart_wait = asyncio.create_task(_restart_event.wait())
 
     try:
-        await asyncio.gather(server.serve_forever(), broadcaster, engine_task)
+        # hub.run() may legitimately return (warm-up failure is reported in the v74
+        # frame), so only the server and a restart request end the bridge.
+        await asyncio.wait({serve_task, restart_wait}, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        await provider.stop()
-        broadcaster.cancel()
-        engine_task.cancel()
+        # Stop accepting / drop clients first so nobody reconnects to a dying process,
+        # then stop the venue stream with a bound (websocket close handshakes can stall).
+        server.close()
+        for t in (broadcaster, engine_task, serve_task, restart_wait):
+            t.cancel()
+        try:
+            await asyncio.wait_for(provider.stop(), timeout=5)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"provider stop did not finish cleanly: {e!r}")
+
+    if _restart_to:
+        # Don't exec in the middle of a ledger write from the engine thread.
+        hub.lock.acquire(timeout=10)
+        env = dict(os.environ, MARKET_PROVIDER=_restart_to)
+        logger.info(f"Re-executing bridge with MARKET_PROVIDER={_restart_to}")
+        logging.shutdown()
+        os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]], env)
 
 
 if __name__ == "__main__":
